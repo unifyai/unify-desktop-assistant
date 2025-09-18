@@ -65,6 +65,5 @@ fi
 pushd "$AGENT_DIR" >/dev/null
 npm install
 
-fi
 npx playwright@1.52.0 install --with-deps chromium
 popd >/dev/null
