@@ -1,0 +1,12 @@
+Package: unify-desktop-assistant
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Unify AI <support@unify.ai>
+Homepage: https://unify.ai/
+Depends: bash, curl, ca-certificates
+Description: Unify Desktop Assistant (Linux remote client and agent service)
+ Provides a CLI to install dependencies, start the client, and expose tunnels.
+
+

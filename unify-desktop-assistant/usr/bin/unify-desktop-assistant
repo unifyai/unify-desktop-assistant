@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="/opt/unify-desktop-assistant"
+
+usage() {
+  cat <<USAGE
+Usage: unify-desktop-assistant <command> [args]
+
+Commands:
+  install         Run dependency installation
+  start [key]     Start the remote client app (optionally pass UNIFY_KEY)
+  tunnel [args]   Start HTTPS tunnel for the agent service
+  liveview [args] Start HTTPS tunnel for live viewing (VNC proxy)
+
+Examples:
+  unify-desktop-assistant install
+  unify-desktop-assistant start "${UNIFY_KEY:-}"
+  unify-desktop-assistant tunnel
+  unify-desktop-assistant liveview
+USAGE
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  install)
+    exec bash "$APP_DIR/install.sh" "$@"
+    ;;
+  start)
+    exec bash "$APP_DIR/remote.sh" "$@"
+    ;;
+  tunnel)
+    exec bash "$APP_DIR/tunnel.sh" "$@"
+    ;;
+  liveview)
+    exec bash "$APP_DIR/liveview.sh" "$@"
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
+
+
