@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ensure we run from the directory of this script
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$BASE_DIR"
+
 # Install runtime dependencies used by linux.sh (x11vnc and websockify) and tools to fetch noVNC
 apt-get update
 apt-get install -y \
@@ -23,7 +27,7 @@ curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y nodejs
 
 # Install global TypeScript runner and Node deps for agent-service
-cd agent-service
+cd "$BASE_DIR/agent-service"
 
 # Prefer clean, lockfile-resolved install if lockfile exists
 npm install -g ts-node typescript
@@ -32,3 +36,5 @@ if [ -f package-lock.json ]; then
 else
   npm install
 fi
+
+
