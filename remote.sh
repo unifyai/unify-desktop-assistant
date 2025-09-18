@@ -101,8 +101,16 @@ echo "Done. Open: http://localhost:${NOVNC_PORT}/vnc.html"
 
 # Start magnitude agent-service (ts-node) like linux/remote.sh
 echo "Starting magnitude agent-service..."
-npx ts-node agent-service/src/index.ts &
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+AGENT_DIR="$SCRIPT_DIR/agent-service"
+if [[ ! -d "$AGENT_DIR" ]]; then
+  echo "Error: agent-service not found at $AGENT_DIR. Did you run 'unify-desktop-assistant install'?" >&2
+  exit 1
+fi
+pushd "$AGENT_DIR" >/dev/null
+npx ts-node src/index.ts &
 TS_PID=$!
+popd >/dev/null
 
 # Keep the script in the foreground to handle clean shutdown on Ctrl+C
 echo "Press Ctrl+C to stop."
