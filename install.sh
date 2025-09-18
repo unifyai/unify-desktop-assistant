@@ -57,13 +57,16 @@ npm install -g ts-node typescript
 
 echo "Installing agent-service npm dependencies..."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-pushd "$PROJECT_ROOT/agent-service" >/dev/null
+AGENT_DIR="$SCRIPT_DIR/agent-service"
+if [ ! -d "$AGENT_DIR" ]; then
+  echo "Error: agent-service not found at $AGENT_DIR" >&2
+  exit 1
+fi
+pushd "$AGENT_DIR" >/dev/null
 if [ -f package-lock.json ]; then
   npm ci
-  npx playwright@1.52.0 install --with-deps chromium
 else
   npm install
-  npx playwright@1.52.0 install --with-deps chromium
 fi
+npx playwright@1.52.0 install --with-deps chromium
 popd >/dev/null
