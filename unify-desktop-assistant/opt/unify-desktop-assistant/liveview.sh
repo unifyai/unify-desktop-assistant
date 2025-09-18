@@ -15,8 +15,7 @@ else
   echo "[tunnel] cloudflared is already installed: $(cloudflared --version | head -n1)"
 fi
 
-# Configure a named tunnel to forward localhost:3000 to a custom domain
-# Usage: TUNNEL_HOSTNAME=myapp.example.com TUNNEL_NAME=myapp bash tunnel.sh
+# Configure a named tunnel to forward localhost:6080 to a custom domain
 
 HOSTNAME="${TUNNEL_HOSTNAME:-${1:-}}"
 TUNNEL_NAME="${TUNNEL_NAME:-${2:-myapp}}"
@@ -50,7 +49,6 @@ if [ -z "$credentials_file" ]; then
   exit 1
 fi
 
-# Write config mapping hostname → localhost:3000
 cat > "$CF_DIR/config.yml" <<EOF
 tunnel: $TUNNEL_NAME
 credentials-file: $credentials_file
@@ -60,8 +58,9 @@ ingress:
   - service: http_status:404
 EOF
 
-# Route DNS (creates proxied CNAME)
 cloudflared tunnel route dns "$TUNNEL_NAME" "$HOSTNAME" || true
 
 echo "[tunnel] Running tunnel '$TUNNEL_NAME' for https://$HOSTNAME → http://localhost:6080/vnc.html?resize=scale&autoconnect=1&autoreconnect=1"
 exec cloudflared tunnel run "$TUNNEL_NAME"
+
+
