@@ -63,10 +63,8 @@ if [ ! -d "$AGENT_DIR" ]; then
   exit 1
 fi
 pushd "$AGENT_DIR" >/dev/null
-if [ -f package-lock.json ]; then
-  npm ci
-else
-  npm install
+npm install
+
 fi
 npx playwright@1.52.0 install --with-deps chromium
 popd >/dev/null
