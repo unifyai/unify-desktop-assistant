@@ -65,3 +65,5 @@ cloudflared tunnel route dns "$TUNNEL_NAME" "$HOSTNAME" || true
 
 echo "[tunnel] Running tunnel '$TUNNEL_NAME' for https://$HOSTNAME → http://localhost:3000"
 exec cloudflared tunnel run "$TUNNEL_NAME"
+
+
