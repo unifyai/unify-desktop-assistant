@@ -16,6 +16,18 @@
 
 `winget install --id=Python.Python.3 -e`
 
+## Installations
+
+### Download Chocolatey Package
+
+TODO
+
+`choco install unify-desktop-assistant -s -y .`
+
+`refreshenv`
+
+TODO
+
 ### Setup
 
 Watch this video for [local setup](https://www.loom.com/share/61a230c7d7314a109e3fc64061d8e315?sid=b80b1f19-c080-4431-a667-6ee1a0c350f1).
