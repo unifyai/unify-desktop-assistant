@@ -128,21 +128,27 @@ if (-not (Test-Path $cfDir)) {
 Write-Host "[tunnel] INFO: No hostname provided. Starting ad-hoc tunnel to http://localhost:$LocalPort ..."
 
 $logFile = Join-Path $env:TEMP ("trycloudflare_{0}.log" -f $LocalPort)
+$errFile = Join-Path $env:TEMP ("trycloudflare_{0}_err.log" -f $LocalPort)
 try { Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue } catch {}
+try { Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue } catch {}
 
-$cfProc = Start-Process -FilePath 'cloudflared' -ArgumentList @('tunnel','--url',("http://localhost:{0}" -f $LocalPort)) -RedirectStandardOutput $logFile -RedirectStandardError $logFile -WindowStyle Hidden -PassThru
+$cfProc = Start-Process -FilePath 'cloudflared' -ArgumentList @('tunnel','--url',("http://localhost:{0}" -f $LocalPort)) -RedirectStandardOutput $logFile -RedirectStandardError $errFile -WindowStyle Hidden -PassThru
 
 try {
   $url = $null
   for ($i=0; $i -lt 60; $i++) {
     Start-Sleep -Milliseconds 300
     try {
+      $content = $null
       if (Test-Path $logFile) {
         $content = Get-Content -LiteralPath $logFile -Raw -ErrorAction SilentlyContinue
-        if ($content) {
-          $m = [Regex]::Match($content,'https://[A-Za-z0-9\.-]+\.trycloudflare\.com')
-          if ($m.Success) { $url = $m.Value; break }
-        }
+      }
+      if (-not $content -and (Test-Path $errFile)) {
+        $content = Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue
+      }
+      if ($content) {
+        $m = [Regex]::Match($content,'https://[A-Za-z0-9\.-]+\.trycloudflare\.com')
+        if ($m.Success) { $url = $m.Value; break }
       }
     } catch {}
   }
