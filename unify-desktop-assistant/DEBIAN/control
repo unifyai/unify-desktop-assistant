@@ -3,7 +3,7 @@ Version: 1.0.0
 Section: utils
 Priority: optional
 Architecture: amd64
-Maintainer: Unify AI <support@unify.ai>
+Maintainer: Unify AI <hello@unify.ai>
 Homepage: https://unify.ai/
 Depends: bash, curl, ca-certificates
 Description: Unify Desktop Assistant (Linux remote client and agent service)
