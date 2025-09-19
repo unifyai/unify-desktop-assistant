@@ -154,25 +154,17 @@ function Install-AgentServiceDeps {
   }
 
   # Guard: local file dependency 'magnitude-core' only exists if packaged alongside '../magnitude'
-  $magnitudeCore = Join-Path (Join-Path $agentDir '..') 'magnitude\packages\magnitude-core\package.json'
-  if (-not (Test-Path $magnitudeCore)) {
-    Write-Warning "magnitude-core not found next to agent-service; skipping agent-service npm install."
-    return
-  }
+  # $magnitudeCore = Join-Path (Join-Path $agentDir '..') 'magnitude\packages\magnitude-core\package.json'
+  # if (-not (Test-Path $magnitudeCore)) {
+  #   Write-Warning "magnitude-core not found next to agent-service; skipping agent-service npm install."
+  #   return
+  # }
 
   Write-Host "Installing agent-service dependencies in $agentDir ..."
   Push-Location $agentDir
-  try {
-    if (Test-Path 'package-lock.json') {
-      npm ci | Out-Host
-      npx playwright@1.52.0 install --with-deps chromium | Out-Host
-    } else {
-      npm install | Out-Host
-      npx playwright@1.52.0 install --with-deps chromium | Out-Host
-    }
-  } finally {
-    Pop-Location
-  }
+  npm install | Out-Host
+  npx playwright@1.52.0 install --with-deps chromium | Out-Host
+  Pop-Location
 }
 
 
