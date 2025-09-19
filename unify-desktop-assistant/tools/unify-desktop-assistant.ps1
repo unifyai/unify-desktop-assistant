@@ -1,6 +1,6 @@
 param(
   [Parameter(Position=0)]
-  [ValidateSet('install','start','tunnel','liveview')]
+  [ValidateSet('install','start','tunnel','liveview','add-env','list-env','remove-env')]
   [string]$Command,
   [Parameter(ValueFromRemainingArguments=$true)]
   [string[]]$Rest
@@ -17,7 +17,7 @@ function Test-IsAdmin {
 }
 
 if (-not $Command) {
-  Write-Host "Usage: unify-desktop-assistant <install|start|tunnel|liveview> [args...]"
+  Write-Host "Usage: unify-desktop-assistant <install|start|tunnel|liveview|add-env|list-env|remove-env> [args...]"
   exit 1
 }
 
@@ -40,6 +40,17 @@ switch ($Command) {
   }
   'liveview' {
     & (Join-Path $toolsDir 'liveview.ps1') @Rest
+  }
+  'add-env' {
+    if ($Rest.Count -lt 2) { Write-Host "Usage: unify-desktop-assistant add-env <KEY> <VALUE>"; exit 1 }
+    & (Join-Path $toolsDir 'add-env.ps1') -Key $Rest[0] -Value ($Rest[1..($Rest.Count-1)] -join ' ')
+  }
+  'list-env' {
+    & (Join-Path $toolsDir 'list-env.ps1')
+  }
+  'remove-env' {
+    if ($Rest.Count -lt 1) { Write-Host "Usage: unify-desktop-assistant remove-env <KEY>"; exit 1 }
+    & (Join-Path $toolsDir 'remove-env.ps1') -Key $Rest[0]
   }
   default {
     Write-Host "Unknown command: $Command"
