@@ -14,6 +14,12 @@ if ([string]::IsNullOrWhiteSpace($TunnelName)) {
 }
 if (-not $LocalPort -or $LocalPort -eq 0) { $LocalPort = 3000 }
 
+# Unify API parameters (optional)
+$UnifyBaseUrl = if ($env:UNIFY_BASE_URL) { $env:UNIFY_BASE_URL } else { 'https://api.unify.ai/v0' }
+if ([string]::IsNullOrWhiteSpace($UnifyKey)) { $UnifyKey = $env:UNIFY_KEY }
+if ([string]::IsNullOrWhiteSpace($AssistantName)) { $AssistantName = $env:ASSISTANT_NAME }
+$script:AssistantId = $null
+
 function Ensure-Cloudflared {
   $cf = Get-Command cloudflared -ErrorAction SilentlyContinue
   if ($cf) {
@@ -64,6 +70,52 @@ ingress:
   return $configPath
 }
 
+function Get-AssistantId {
+  param(
+    [string]$AssistantName
+  )
+  if ([string]::IsNullOrWhiteSpace($UnifyKey) -or [string]::IsNullOrWhiteSpace($AssistantName)) { return $null }
+  try {
+    $headers = @{ Authorization = "Bearer $UnifyKey" }
+    $resp = Invoke-RestMethod -Method GET -Uri ("{0}/assistant" -f $UnifyBaseUrl) -Headers $headers -ErrorAction Stop
+  } catch {
+    return $null
+  }
+  if (-not $resp -or -not $resp.info) { return $null }
+  $target = $AssistantName.ToLower()
+  $matches = @()
+  foreach ($a in $resp.info) {
+    $first = if ($a.first_name) { $a.first_name } else { '' }
+    $last = if ($a.surname) { $a.surname } else { '' }
+    $full = ("{0} {1}" -f $first,$last).Trim().ToLower()
+    if ($full -eq $target) { $matches += $a }
+  }
+  if ($matches.Count -ne 1) { return $null }
+  $id = $matches[0].agent_id
+  if (-not $id) { return $null }
+  return [string]$id
+}
+
+function Patch-DesktopUrl {
+  param(
+    [string]$AssistantId,
+    [string]$Url
+  )
+  if ([string]::IsNullOrWhiteSpace($UnifyKey) -or [string]::IsNullOrWhiteSpace($AssistantId)) { return }
+  $headers = @{ Authorization = "Bearer $UnifyKey"; 'Content-Type' = 'application/json' }
+  $body = @{ desktop_url = $Url } | ConvertTo-Json -Compress
+  try { Invoke-RestMethod -Method Patch -Uri ("{0}/assistant/{1}/config" -f $UnifyBaseUrl,$AssistantId) -Headers $headers -Body $body -ErrorAction Stop | Out-Null } catch {}
+}
+
+function Clear-DesktopUrl {
+  if ([string]::IsNullOrWhiteSpace($UnifyKey)) { return }
+  if (-not $script:AssistantId) {
+    if ($AssistantName) { $script:AssistantId = Get-AssistantId -AssistantName $AssistantName }
+  }
+  if (-not $script:AssistantId) { return }
+  Patch-DesktopUrl -AssistantId $script:AssistantId -Url ""
+}
+
 Write-Host "[tunnel] Starting Cloudflare Tunnel setup..."
 Ensure-Cloudflared
 
@@ -74,7 +126,42 @@ if (-not (Test-Path $cfDir)) {
 
 # if ([string]::IsNullOrWhiteSpace($Hostname)) {
 Write-Host "[tunnel] INFO: No hostname provided. Starting ad-hoc tunnel to http://localhost:$LocalPort ..."
-cloudflared tunnel --url "http://localhost:$LocalPort"
+
+$logFile = Join-Path $env:TEMP ("trycloudflare_{0}.log" -f $LocalPort)
+try { Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue } catch {}
+
+$cfProc = Start-Process -FilePath 'cloudflared' -ArgumentList @('tunnel','--url',("http://localhost:{0}" -f $LocalPort)) -RedirectStandardOutput $logFile -RedirectStandardError $logFile -WindowStyle Hidden -PassThru
+
+try {
+  $url = $null
+  for ($i=0; $i -lt 60; $i++) {
+    Start-Sleep -Milliseconds 300
+    try {
+      if (Test-Path $logFile) {
+        $content = Get-Content -LiteralPath $logFile -Raw -ErrorAction SilentlyContinue
+        if ($content) {
+          $m = [Regex]::Match($content,'https://[A-Za-z0-9\.-]+\.trycloudflare\.com')
+          if ($m.Success) { $url = $m.Value; break }
+        }
+      }
+    } catch {}
+  }
+  if ($url) {
+    Write-Host "[tunnel] Public URL: $url"
+    if ($AssistantName -and $UnifyKey) {
+      $script:AssistantId = Get-AssistantId -AssistantName $AssistantName
+      if ($script:AssistantId) { Patch-DesktopUrl -AssistantId $script:AssistantId -Url $url }
+    }
+  } else {
+    Write-Host "[tunnel] Waiting for public URL... check logs: $logFile"
+  }
+
+  Wait-Process -Id $cfProc.Id
+} finally {
+  Write-Host "[tunnel] Cleaning up..."
+  try { if ($cfProc -and -not $cfProc.HasExited) { Stop-Process -Id $cfProc.Id -Force -ErrorAction SilentlyContinue } } catch {}
+  Clear-DesktopUrl
+}
 #   exit $LASTEXITCODE
 # }
 
