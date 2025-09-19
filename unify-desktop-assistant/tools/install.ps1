@@ -124,6 +124,34 @@ function Install-AgentServiceDeps {
     return
   }
 
+  # --- Link local magnitude (Unity fork) before installing agent-service deps ---
+  $magDir = Join-Path $PSScriptRoot 'magnitude'
+  if (-not (Test-Path $magDir)) {
+    Write-Host "Cloning unifyai/magnitude into $magDir ..."
+    git clone https://github.com/unifyai/magnitude.git $magDir
+  }
+
+  Write-Host "Switching unifyai/magnitude to 'unity-modifications' branch..."
+  Push-Location $magDir
+  try { git fetch origin unity-modifications } catch { Write-Warning $_ }
+  try { git checkout -B unity-modifications origin/unity-modifications } catch { try { git checkout unity-modifications } catch { Write-Warning $_ } }
+  Pop-Location
+
+  # Ensure Bun is installed for building magnitude-core
+  $bunCmd = Get-Command bun -ErrorAction SilentlyContinue
+  if (-not $bunCmd) {
+    Write-Host "Installing Bun (https://bun.sh) ..."
+    try { iex "& { $(irm https://bun.sh/install.ps1) }" } catch { Write-Warning "Bun install script failed. $_" }
+    $bunCmd = Get-Command bun -ErrorAction SilentlyContinue
+  }
+  $bunPath = if ($bunCmd) { $bunCmd.Path } elseif (Test-Path "$env:USERPROFILE\.bun\bin\bun.exe") { "$env:USERPROFILE\.bun\bin\bun.exe" } else { 'bun' }
+
+  Write-Host "Installing and building magnitude-core with Bun..."
+  Push-Location (Join-Path $magDir 'packages/magnitude-core')
+  & $bunPath install
+  npm run build
+  Pop-Location
+
   Write-Host "Installing agent-service dependencies in $agentDir ..."
   Push-Location $agentDir
   npm install
