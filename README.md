@@ -56,6 +56,12 @@ a. For testing
 
 - Start the tunnel. A URL for testing will be provided.
 
+`$Env:UNIFY_BASE_URL='https://api.unify.ai/v0'`
+
+`$Env:UNIFY_KEY='sk-...'`
+
+`$Env:ASSISTANT_NAME='First Last'`
+
 `unify-desktop-assistant tunnel`
 
 b. For production - WIP
