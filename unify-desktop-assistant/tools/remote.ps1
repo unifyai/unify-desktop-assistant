@@ -61,11 +61,14 @@ Write-Host "Remote desktop available at http://localhost:6080/vnc.html"
 try {
   $agentRan = $false
   if (Get-Command npx -ErrorAction SilentlyContinue) {
+    Push-Location $PSScriptRoot
     try {
       & cmd.exe /c "npx --yes ts-node agent-service/src/index.ts"
       $agentRan = $true
     } catch {
       Write-Warning "Agent-service exited with error. $_"
+    } finally {
+      Pop-Location
     }
   } else {
     Write-Warning "'npx' not found. Skipping agent-service startup."

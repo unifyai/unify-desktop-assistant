@@ -146,13 +146,20 @@ function Install-AgentServiceDeps {
     Write-Warning "Global install of ts-node/typescript failed. Continuing with project install. $_"
   }
 
-  # Resolve repo root and agent-service directory relative to this script (desktop/windows/ -> repo root)
-  $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-  $agentDir = Join-Path $repoRoot 'agent-service'
+  # Resolve agent-service directory relative to this package's tools folder
+  $agentDir = Join-Path $PSScriptRoot 'agent-service'
   if (-not (Test-Path (Join-Path $agentDir 'package.json'))) {
     Write-Warning "agent-service directory not found at $agentDir or package.json missing. Skipping npm install."
     return
   }
+
+  # Guard: local file dependency 'magnitude-core' only exists if packaged alongside '../magnitude'
+  $magnitudeCore = Join-Path (Join-Path $agentDir '..') 'magnitude\packages\magnitude-core\package.json'
+  if (-not (Test-Path $magnitudeCore)) {
+    Write-Warning "magnitude-core not found next to agent-service; skipping agent-service npm install."
+    return
+  }
+
   Write-Host "Installing agent-service dependencies in $agentDir ..."
   Push-Location $agentDir
   try {

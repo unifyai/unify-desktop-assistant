@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>unify-desktop-assistant</id>
+    <version>0.1.0</version>
+    <title>Unify Desktop Assistant</title>
+    <authors>Unify</authors>
+    <owners>Unify</owners>
+    <projectUrl>https://github.com/unifyai/unify-desktop-assistant</projectUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <summary>CLI to install/start Unify Desktop Assistant and tunnels</summary>
+    <description>
+      Installs TightVNC, noVNC, websockify, and prerequisites; starts the client app,
+      launches tunnels, and exposes a live view. Provides the command 'unify-desktop-assistant'
+      with subcommands: install, start, tunnel, liveview.
+    </description>
+    <tags>unify desktop assistant vnc novnc tunnel cloudflared</tags>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>
+
+
+
