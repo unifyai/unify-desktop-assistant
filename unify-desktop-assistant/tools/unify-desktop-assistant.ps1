@@ -10,6 +10,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $toolsDir = $PSScriptRoot
 
+if (-not $Rest) { $Rest = @() }
+
 function Test-IsAdmin {
   $wi = [Security.Principal.WindowsIdentity]::GetCurrent()
   $wp = [Security.Principal.WindowsPrincipal] $wi
@@ -23,13 +25,20 @@ if (-not $Command) {
 
 switch ($Command) {
   'install' {
+    $installScript = Join-Path $toolsDir 'install.ps1'
+    $argRest = if ($Rest.Count -gt 0) { ' ' + ($Rest -join ' ') } else { '' }
+
     if (-not (Test-IsAdmin)) {
-      $cmd = 'unify-desktop-assistant install'
-      if ($Rest -and $Rest.Count -gt 0) { $cmd = $cmd + ' ' + ($Rest -join ' ') }
-      Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command $cmd" -Verb RunAs -Wait
-      exit $LASTEXITCODE
+      # Relaunch as admin
+      $p = Start-Process -FilePath "powershell.exe" `
+        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$installScript`"$argRest" `
+        -WorkingDirectory $toolsDir `
+        -Verb RunAs `
+        -Wait -PassThru
+      exit $p.ExitCode
     }
-    & (Join-Path $toolsDir 'install.ps1') @Rest
+
+    & $installScript @Rest
   }
   'start' {
     Push-Location $toolsDir
@@ -57,7 +66,3 @@ switch ($Command) {
     exit 1
   }
 }
-
-
-
-
