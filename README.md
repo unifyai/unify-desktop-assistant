@@ -24,7 +24,7 @@ Watch this video for [local setup](https://www.loom.com/share/c3ad55e541634b478f
 
 `unify-desktop-assistant add-env UNIFY_KEY <your-key-value>`
 
-`unify-desktop-assistant add-env ANTHROPIC_API_KEY <your-key-value> `
+`unify-desktop-assistant add-env ANTHROPIC_API_KEY <your-key-value>`
 
 `unify-desktop-assistant install`
 
@@ -37,6 +37,12 @@ Watch this video for [local setup](https://www.loom.com/share/c3ad55e541634b478f
 a. For testing
 
 - Start the tunnel. A URL for testing will be provided.
+
+`export UNIFY_BASE_URL=https://api.unify.ai/v0`
+
+`export UNIFY_KEY=<your-key-value>`
+
+`export ANTHROPIC_API_KEY=<your-key-value>`
 
 `unify-desktop-assistant tunnel`
 
