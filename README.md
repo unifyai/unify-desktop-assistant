@@ -22,6 +22,12 @@ Watch this video for [local setup](https://www.loom.com/share/c6db63fa38d54ed8ac
 
 1. Install the required package
 
+`unify-desktop-assistant add-env UNIFY_BASE_URL https://api.unify.ai/v0`
+
+`unify-desktop-assistant add-env UNIFY_KEY <your-key-value>`
+
+`unify-desktop-assistant add-env ANTHROPIC_API_KEY <your-key-value>`
+
 `unify-desktop-assistant install`
 
 2. Create a user profile for the agent with the following details:
@@ -39,6 +45,12 @@ Password: `<UNIFY_KEY>`
 a. For testing
 
 - Start the tunnel. A URL for testing will be provided.
+
+`export UNIFY_BASE_URL=https://api.unify.ai/v0`
+
+`export UNIFY_KEY=<your-key-value>`
+
+`export ASSISTANT_NAME="<first> <last>"`
 
 `unify-desktop-assistant tunnel`
 

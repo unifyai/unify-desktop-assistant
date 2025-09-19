@@ -9,6 +9,131 @@ LOCAL_PORT=3000
 HOSTNAME="${TUNNEL_HOSTNAME:-${1:-}}"
 TUNNEL_NAME="${TUNNEL_NAME:-${2:-myapp}}"
 CF_DIR="$HOME/.cloudflared"
+UNIFY_BASE_URL="${UNIFY_BASE_URL:-https://api.unify.ai/v0}"
+
+# Optional: provide these to log the discovered URL to Unify backend
+# UNIFY_KEY   → API key for auth (Bearer)
+# ASSISTANT_NAME → Full name to match: "First Last"
+
+# Cached assistant id for cleanup
+ASSISTANT_ID=""
+
+ensure_jq() {
+  if command -v jq >/dev/null 2>&1; then return 0; fi
+  echo "[tunnel] 'jq' not found. Attempting to install via Homebrew..." >&2
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "[tunnel] Error: Homebrew not found; cannot install 'jq'. Skipping Unify logging." >&2
+    return 1
+  fi
+  brew update >/dev/null 2>&1 || true
+  brew install jq >/dev/null 2>&1 || true
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "[tunnel] Error: Failed to install 'jq'. Skipping Unify logging." >&2
+    return 1
+  fi
+}
+
+log_url_to_unify() {
+  url_to_log="$1"
+  if [[ -z "${UNIFY_KEY:-}" || -z "${ASSISTANT_NAME:-}" ]]; then
+    return 0
+  fi
+  if ! ensure_jq; then
+    return 0
+  fi
+
+  echo "[tunnel] Logging URL to Unify for assistant '${ASSISTANT_NAME}'..."
+
+  # List assistants (capture status)
+  list_file="/tmp/unify_assistants_list.json"
+  http_list=$(curl -sS -o "$list_file" -w "%{http_code}" -H "Authorization: Bearer ${UNIFY_KEY}" "${UNIFY_BASE_URL}/assistant" || true)
+  if [[ "$http_list" != "200" ]]; then
+    echo "[tunnel] WARNING: Assistants list returned HTTP $http_list; skipping log." >&2
+    return 0
+  fi
+  list_json=$(cat "$list_file" 2>/dev/null || echo '')
+  if [[ -z "$list_json" ]]; then
+    echo "[tunnel] WARNING: Empty response from assistants list; skipping log." >&2
+    return 0
+  fi
+
+  # Match assistant by full name (case-insensitive)
+  ids=$(echo "$list_json" | jq -r --arg name "${ASSISTANT_NAME}" '((.info // [])[] | select((((.first_name // "") + " " + (.surname // "")) | ascii_downcase) == ($name | ascii_downcase)) | .agent_id) // empty' 2>/dev/null | sed '/^null$/d' || true)
+
+  if [[ -z "$ids" ]]; then
+    echo "[tunnel] WARNING: No assistant matched name '${ASSISTANT_NAME}'." >&2
+    return 0
+  fi
+  count=$(printf '%s\n' "$ids" | grep -c . || true)
+  if (( count > 1 )); then
+    echo "[tunnel] WARNING: Multiple assistants matched name '${ASSISTANT_NAME}'." >&2
+    return 0
+  fi
+  assistant_id="$(printf '%s\n' "$ids" | head -n1)"
+  if [[ -z "$assistant_id" ]]; then
+    echo "[tunnel] WARNING: Matched assistant has empty id; skipping." >&2
+    return 0
+  fi
+
+  # Cache for cleanup
+  ASSISTANT_ID="$assistant_id"
+
+  # Patch desktop_url
+  payload=$(jq -n --arg url "$url_to_log" '{desktop_url: $url}')
+  http_code=$(curl -sS -o /tmp/unify_patch_resp.json -w "%{http_code}" \
+    -X PATCH \
+    -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer ${UNIFY_KEY}" \
+    -d "$payload" \
+    "${UNIFY_BASE_URL}/assistant/${assistant_id}/config" || true)
+
+  if [[ "$http_code" != "200" ]]; then
+    echo "[tunnel] WARNING: Failed to update assistant (HTTP $http_code)." >&2
+  else
+    echo "[tunnel] Updated assistant ${assistant_id} desktop_url → ${url_to_log}"
+  fi
+}
+
+clear_url_in_unify() {
+  # Only attempt if creds present
+  if [[ -z "${UNIFY_KEY:-}" || -z "${ASSISTANT_NAME:-}" ]]; then
+    return 0
+  fi
+  if ! ensure_jq; then
+    return 0
+  fi
+
+  # Resolve assistant id if missing
+  if [[ -z "$ASSISTANT_ID" ]]; then
+    list_file="/tmp/unify_assistants_list.json"
+    http_list=$(curl -sS -o "$list_file" -w "%{http_code}" -H "Authorization: Bearer ${UNIFY_KEY}" "${UNIFY_BASE_URL}/assistant" || true)
+    if [[ "$http_list" != "200" ]]; then
+      return 0
+    fi
+    list_json=$(cat "$list_file" 2>/dev/null || echo '')
+    if [[ -z "$list_json" ]]; then
+      return 0
+    fi
+    ids=$(echo "$list_json" | jq -r --arg name "${ASSISTANT_NAME}" '((.info // [])[] | select((((.first_name // "") + " " + (.surname // "")) | ascii_downcase) == ($name | ascii_downcase)) | .agent_id) // empty' 2>/dev/null | sed '/^null$/d' || true)
+    count=$(printf '%s\n' "$ids" | grep -c . || true)
+    if (( count != 1 )); then
+      return 0
+    fi
+    ASSISTANT_ID="$(printf '%s\n' "$ids" | head -n1)"
+  fi
+
+  if [[ -z "$ASSISTANT_ID" ]]; then
+    return 0
+  fi
+
+  payload='{"desktop_url":""}'
+  curl -sS -o /dev/null -w "%{http_code}" \
+    -X PATCH \
+    -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer ${UNIFY_KEY}" \
+    -d "$payload" \
+    "${UNIFY_BASE_URL}/assistant/${ASSISTANT_ID}/config" >/dev/null 2>&1 || true
+}
 
 if [[ -z "$HOSTNAME" ]]; then
   echo "[tunnel] Target: http://localhost:${LOCAL_PORT} (ephemeral)"
@@ -43,6 +168,8 @@ if [[ -z "$HOSTNAME" ]]; then
         kill -9 "$CF_PID" 2>/dev/null || true
       fi
     fi
+    # Clear desktop_url on cleanup (best-effort)
+    clear_url_in_unify || true
   }
   trap cleanup INT TERM EXIT
 
@@ -59,7 +186,7 @@ if [[ -z "$HOSTNAME" ]]; then
   set -e
 
   # Try to extract the URL quickly
-  tries=20
+  tries=30
   url=""
   while (( tries-- > 0 )); do
     if grep -Eo 'https://[a-zA-Z0-9.-]+trycloudflare\.com' "$LOG_FILE" >/dev/null 2>&1; then
@@ -76,6 +203,7 @@ if [[ -z "$HOSTNAME" ]]; then
 
   if [[ -n "$url" ]]; then
     echo "[tunnel] Public URL: $url"
+    log_url_to_unify "$url"
   else
     echo "[tunnel] Waiting for public URL... check logs: $LOG_FILE"
   fi
