@@ -1,0 +1,77 @@
+name: release-choco
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  pack-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is on win branch
+        id: check
+        shell: bash
+        run: |
+          git fetch origin win
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/win; then
+            echo "on_win=true" >> "$GITHUB_OUTPUT"
+            echo "Tag commit is on 'win' branch"
+          else
+            echo "on_win=false" >> "$GITHUB_OUTPUT"
+            echo "Tag commit is NOT on 'win' branch; skipping build"
+          fi
+
+      - name: Set version from tag
+        id: ver
+        if: steps.check.outputs.on_win == 'true'
+        shell: bash
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          VER="${TAG#v}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Will build version $VER"
+
+      - name: Inject version into nuspec
+        if: steps.check.outputs.on_win == 'true'
+        shell: pwsh
+        working-directory: unify-desktop-assistant/unify-desktop-assistant
+        run: |
+          $nuspec = 'unify-desktop-assistant.nuspec'
+          $ver = '${{ steps.ver.outputs.version }}'
+          [xml]$xml = Get-Content $nuspec
+          $xml.package.metadata.version = $ver
+          $xml.Save($nuspec)
+          Write-Host "Version set to $ver"
+
+      - name: choco pack
+        if: steps.check.outputs.on_win == 'true'
+        shell: pwsh
+        working-directory: unify-desktop-assistant/unify-desktop-assistant
+        run: |
+          choco pack | Write-Host
+
+      - name: Get nupkg path
+        if: steps.check.outputs.on_win == 'true'
+        id: pkg
+        shell: pwsh
+        working-directory: unify-desktop-assistant/unify-desktop-assistant
+        run: |
+          $nupkg = Get-ChildItem -Filter 'unify-desktop-assistant.*.nupkg' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $nupkg) { Write-Error 'No nupkg produced'; exit 1 }
+          echo "path=$($nupkg.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload to GitHub Release
+        if: steps.check.outputs.on_win == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
