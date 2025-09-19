@@ -39,6 +39,8 @@ jobs:
       - name: Build .deb
         if: steps.branch_check.outputs.proceed == 'true'
         run: |
+          chmod 0755 unify-desktop-assistant/usr/bin/unify-desktop-assistant
+          chmod 0755 unify-desktop-assistant/opt/unify-desktop-assistant/*.sh
           dpkg-deb --build unify-desktop-assistant
           sha256sum unify-desktop-assistant.deb > SHA256SUMS
 
