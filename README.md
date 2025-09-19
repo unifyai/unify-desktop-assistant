@@ -22,7 +22,7 @@
 
 TODO
 
-`choco install unify-desktop-assistant -s -y .`
+`choco install unify-desktop-assistant -y -s .`
 
 `refreshenv`
 
@@ -43,6 +43,8 @@ Watch this video for [local setup](https://www.loom.com/share/61a230c7d7314a109e
 `unify-desktop-assistant install`
 
 - When prompted by a TightVNC popup window, set/change primary password to your Unify API key.
+
+- Click "Apply", then click "OK".
 
 2. Start the remote client app.
 
