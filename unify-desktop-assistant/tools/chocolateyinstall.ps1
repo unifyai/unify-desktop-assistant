@@ -1,12 +1,16 @@
-$ErrorActionPreference = 'Stop'
-$toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$toolsDir   = "$(Split-Path -Parent $MyInvocation.MyCommand.Definition)"
+$mainScript = Join-Path $toolsDir 'unify-desktop-assistant.ps1'
 
-# Unblock all shipped scripts/binaries
-Get-ChildItem $toolsDir -Recurse -Include *.ps1,*.psm1,*.cmd,*.exe,*.dll -ErrorAction SilentlyContinue | ForEach-Object {
-  try { Unblock-File -Path $_.FullName } catch {}
+# Ensure the dispatcher exists
+if (!(Test-Path $mainScript)) {
+    throw "Dispatcher script unify-desktop-assistant.ps1 not found in tools directory."
 }
 
-# Create PATH shim for the dispatcher via a cmd wrapper for reliability
-Install-BinFile -Name 'unify-desktop-assistant' -Path (Join-Path $toolsDir 'unify-desktop-assistant.cmd')
+# Create batch shim for Chocolatey to place in PATH
+$shimPath = Join-Path $toolsDir 'unify-desktop-assistant.bat'
+$shim = @"
+@echo off
+powershell -NoProfile -ExecutionPolicy Bypass -File "%mainScript%" %*
+"@
 
-
+Set-Content -Path $shimPath -Value $shim -Encoding ASCII
