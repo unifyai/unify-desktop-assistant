@@ -27,6 +27,15 @@ mkdir -p /opt/novnc && \
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y nodejs
 
+# Ensure pnpm is available for Turborepo (magnitude monorepo)
+if command -v corepack >/dev/null 2>&1; then
+  corepack enable >/dev/null 2>&1 || true
+  corepack prepare pnpm@latest --activate >/dev/null 2>&1 || true
+fi
+if ! command -v pnpm >/dev/null 2>&1; then
+  npm install -g pnpm
+fi
+
 # Link local magnitude (Unity fork) before installing agent-service deps
 MAG_DIR="$BASE_DIR/magnitude"
 if [ ! -d "$MAG_DIR" ]; then
