@@ -6,7 +6,7 @@ Get-ChildItem $toolsDir -Recurse -Include *.ps1,*.psm1,*.cmd,*.exe,*.dll -ErrorA
   try { Unblock-File -Path $_.FullName } catch {}
 }
 
-# Create PATH shim for the dispatcher
-Install-BinFile -Name 'unify-desktop-assistant' -Path (Join-Path $toolsDir 'unify-desktop-assistant.ps1')
+# Create PATH shim for the dispatcher via a cmd wrapper for reliability
+Install-BinFile -Name 'unify-desktop-assistant' -Path (Join-Path $toolsDir 'unify-desktop-assistant.cmd')
 
 
