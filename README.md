@@ -4,9 +4,19 @@
 
 ### Download Debian Package
 
-TODO
+1. [Download](https://github.com/unifyai/unify-desktop-assistant/releases/latest/download/unify-desktop-assistant.deb) the `.deb` binary from GitHub.
+
+`https://github.com/unifyai/unify-desktop-assistant/releases/latest/download/unify-desktop-assistant.deb`
+
+2. Locate the download and install the Debian package.
+
+`sudo dpkg -i unify-desktop-assistant.deb`
+
+3. Proceed to local setup for starting the remote client.
 
 ### Local Setup
+
+Watch this video for [local setup](https://www.loom.com/share/c3ad55e541634b478f50e0660d4e1017?sid=c1653138-dc7e-476a-b31a-5d4908e2a029).
 
 1. Add the required environment variables, then install the required package
 
