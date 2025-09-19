@@ -1,0 +1,57 @@
+name: Release Debian package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish .deb (tags on ubuntu only)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure dpkg tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev
+
+      - name: Verify tag commit is contained in ubuntu branch
+        id: branch_check
+        run: |
+          git fetch origin ubuntu --depth=1
+          TAG_SHA="${GITHUB_SHA}"
+          if git branch --remotes --contains "$TAG_SHA" | grep -q 'origin/ubuntu'; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "Tag commit is on ubuntu branch. Proceeding."
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "Tag commit is NOT on ubuntu branch. Skipping build and release."
+          fi
+
+      - name: Build .deb
+        if: steps.branch_check.outputs.proceed == 'true'
+        run: |
+          dpkg-deb --build unify-desktop-assistant
+          sha256sum unify-desktop-assistant.deb > SHA256SUMS
+
+      - name: Publish GitHub Release
+        if: steps.branch_check.outputs.proceed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            unify-desktop-assistant.deb
+            SHA256SUMS
+          name: Unify Desktop Assistant ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
+
