@@ -1,12 +1,18 @@
 $ErrorActionPreference = 'Stop'
 $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 
-# Unblock all shipped scripts/binaries
-Get-ChildItem $toolsDir -Recurse -Include *.ps1,*.psm1,*.cmd,*.exe,*.dll -ErrorAction SilentlyContinue | ForEach-Object {
-  try { Unblock-File -Path $_.FullName } catch {}
-}
+Write-Host "Installing Unify Desktop Assistant..."
 
-# Create PATH shim for the dispatcher via a cmd wrapper for reliability
+# Example: install files (replace with your real installer/archive)
+# Install-ChocolateyZipPackage 'unify-desktop-assistant' 'https://example.com/archive.zip' $toolsDir
+
+# Register the dispatcher (so `unify-desktop-assistant` works in PATH)
 Install-BinFile -Name 'unify-desktop-assistant' -Path (Join-Path $toolsDir 'unify-desktop-assistant.cmd')
 
+# Optionally run custom setup
+# $installScript = Join-Path $toolsDir 'install.ps1'
+# if (Test-Path $installScript) {
+#     & $installScript
+# }
 
+Write-Host "Unify Desktop Assistant installation complete."
