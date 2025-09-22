@@ -47,7 +47,7 @@ jobs:
       - name: Inject version into nuspec
         if: steps.check.outputs.on_ubuntu == 'true'
         shell: pwsh
-        working-directory: unify-desktop-assistant/unify-desktop-assistant
+        working-directory: unify-desktop-assistant
         run: |
           $nuspec = 'unify-desktop-assistant.nuspec'
           $ver = '${{ steps.ver.outputs.version }}'
@@ -59,7 +59,7 @@ jobs:
       - name: choco pack
         if: steps.check.outputs.on_ubuntu == 'true'
         shell: pwsh
-        working-directory: unify-desktop-assistant/unify-desktop-assistant
+        working-directory: unify-desktop-assistant
         run: |
           choco pack | Write-Host
 
@@ -67,7 +67,7 @@ jobs:
         if: steps.check.outputs.on_ubuntu == 'true'
         id: pkg
         shell: pwsh
-        working-directory: unify-desktop-assistant/unify-desktop-assistant
+        working-directory: unify-desktop-assistant
         run: |
           $nupkg = Get-ChildItem -Filter 'unify-desktop-assistant.*.nupkg' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $nupkg) { Write-Error 'No nupkg produced'; exit 1 }
