@@ -22,7 +22,11 @@
 
 1. Download the choco package from the latest GitHub Release.
 
-`choco install unify-desktop-assistant --source="'https://github.com/unifyai/unify-desktop-assistant/releases/latest/download'"`
+```powershell
+Invoke-WebRequest -Uri "https://github.com/unifyai/unify-desktop-assistant/releases/latest/download/unify-desktop-assistant.nupkg" -OutFile "unify-desktop-assistant.nupkg"
+
+choco install unify-desktop-assistant -s . --force
+```
 
 `refreshenv`
 
