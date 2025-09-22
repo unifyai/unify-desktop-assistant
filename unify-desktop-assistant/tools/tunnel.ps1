@@ -14,10 +14,10 @@ if ([string]::IsNullOrWhiteSpace($TunnelName)) {
 }
 if (-not $LocalPort -or $LocalPort -eq 0) { $LocalPort = 3000 }
 
-# Unify API parameters (optional)
-$UnifyBaseUrl = if ($env:UNIFY_BASE_URL) { $env:UNIFY_BASE_URL } else { 'https://api.unify.ai/v0' }
-if ([string]::IsNullOrWhiteSpace($UnifyKey)) { $UnifyKey = $env:UNIFY_KEY }
-if ([string]::IsNullOrWhiteSpace($AssistantName)) { $AssistantName = $env:ASSISTANT_NAME }
+# Unify API parameters (read directly from environment)
+$UnifyBaseUrl = $env:UnifyBaseUrl
+$UnifyKey = $env:UnifyKey
+$AssistantName = $env:AssistantName
 $script:AssistantId = $null
 
 function Ensure-Cloudflared {
