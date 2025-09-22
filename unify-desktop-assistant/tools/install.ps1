@@ -101,20 +101,20 @@ function Install-NativeBuildPrereqs {
   try {
     choco install visualstudio2022buildtools -y --no-progress --package-parameters '--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --includeOptional'
   } catch { Write-Warning "Build Tools install encountered an issue (may already be installed). $_" }
-  try { choco install windows-sdk-10 -y --no-progress } catch { Write-Warning "Windows 10 SDK install failed or already present. $_" }
+  # try { choco install windows-sdk-10 -y --no-progress } catch { Write-Warning "Windows 10 SDK install failed or already present. $_" }
 
-  $npm = Get-Command npm -ErrorAction SilentlyContinue
-  if ($npm) {
-    try { npm config set msvs_version 2022 } catch { Write-Warning "Failed to set npm msvs_version. $_" }
-  }
+  # $npm = Get-Command npm -ErrorAction SilentlyContinue
+  # if ($npm) {
+  #   try { npm config set msvs_version 2022 } catch { Write-Warning "Failed to set npm msvs_version. $_" }
+  # }
 }
 
 function Install-AgentServiceDeps {
-  $npm = Get-Command npm -ErrorAction SilentlyContinue
-  if (-not $npm) { Write-Warning "npm not found; skipping agent-service dependency install."; return }
+  # $npm = Get-Command npm -ErrorAction SilentlyContinue
+  # if (-not $npm) { Write-Warning "npm not found; skipping agent-service dependency install."; return }
 
   Write-Host "Installing global TypeScript tools (ts-node, typescript)..."
-  try { npm install -g ts-node typescript } catch {
+  try { & "npm.cmd" install -g ts-node typescript } catch {
     Write-Warning "Global install of ts-node/typescript failed. Continuing with project install. $_"
   }
 
@@ -149,13 +149,13 @@ function Install-AgentServiceDeps {
   Write-Host "Installing and building magnitude-core with Bun..."
   Push-Location (Join-Path $magDir 'packages/magnitude-core')
   & $bunPath install
-  npm run build
+  & "npm.cmd" run build
   Pop-Location
 
   Write-Host "Installing agent-service dependencies in $agentDir ..."
   Push-Location $agentDir
-  npm install
-  npx playwright@1.52.0 install --with-deps chromium
+  & "npm.cmd" install
+  & "npx.cmd" playwright@1.52.0 install --with-deps chromium
   Pop-Location
 }
 
