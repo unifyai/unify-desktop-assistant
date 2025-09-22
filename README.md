@@ -20,25 +20,29 @@
 
 ### Download Chocolatey Package
 
-TODO
+1. Download the choco package from the latest GitHub Release.
 
-`choco install unify-desktop-assistant -y -s .`
+`choco install unify-desktop-assistant --source="'https://github.com/unifyai/unify-desktop-assistant/releases/latest/download'"`
 
 `refreshenv`
 
-TODO
+2. Proceed to local setup.
 
-### Setup
+### Local Setup
 
 Watch this video for [local setup](https://www.loom.com/share/61a230c7d7314a109e3fc64061d8e315?sid=b80b1f19-c080-4431-a667-6ee1a0c350f1).
 
-1. Install the required package through PowerShell in "Run as Administrator" mode.
+1. Open PowerShell in "Run as Administrator" mode, then add the required environment variables.
 
 `unify-desktop-assistant add-env UNIFY_BASE_URL https://api.unify.ai/v0`
 
 `unify-desktop-assistant add-env UNIFY_KEY <your-key-value>`
 
 `unify-desktop-assistant add-env ANTHROPIC_API_KEY <your-key-value>`
+
+`unify-desktop-assistant add-env ASSISTANT_NAME <first> <last>`
+
+2. Install the required packages.
 
 `unify-desktop-assistant install`
 
@@ -55,12 +59,6 @@ Watch this video for [local setup](https://www.loom.com/share/61a230c7d7314a109e
 a. For testing
 
 - Start the tunnel. A URL for testing will be provided.
-
-`$Env:UNIFY_BASE_URL='https://api.unify.ai/v0'`
-
-`$Env:UNIFY_KEY='sk-...'`
-
-`$Env:ASSISTANT_NAME='First Last'`
 
 `unify-desktop-assistant tunnel`
 
