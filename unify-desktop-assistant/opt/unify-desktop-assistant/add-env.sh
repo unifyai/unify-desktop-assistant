@@ -5,10 +5,11 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$BASE_DIR/agent-service/.env"
 
 KEY="${1:-}"
-VALUE="${2:-}"
+shift || true
+VALUE="$*"
 
 if [[ -z "$KEY" || -z "$VALUE" ]]; then
-  echo "Usage: add-env <KEY> <VALUE>" >&2
+  echo "Usage: add-env <KEY> <VALUE...>" >&2
   exit 1
 fi
 
@@ -22,8 +23,10 @@ if grep -qE "^${KEY}=" "$ENV_FILE"; then
   mv "$tmpfile" "$ENV_FILE"
 fi
 
-# Append new entry (escape newlines)
-printf "%s=%s\n" "$KEY" "$VALUE" >> "$ENV_FILE"
+# Append new entry, shell-escape VALUE so sourcing works (handles spaces, quotes)
+printf "%s=%q\n" "$KEY" "$VALUE" >> "$ENV_FILE"
 echo "Saved $KEY to $ENV_FILE"
 
-
+# Export to current environment for this process and its children
+export "$KEY=$VALUE"
+echo "Exported $KEY to environment"

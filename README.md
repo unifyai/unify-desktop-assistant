@@ -18,33 +18,37 @@
 
 Watch this video for [local setup](https://www.loom.com/share/c3ad55e541634b478f50e0660d4e1017?sid=c1653138-dc7e-476a-b31a-5d4908e2a029).
 
-1. Add the required environment variables, then install the required package
+1. Add the required environment variables.
 
-`unify-desktop-assistant add-env UNIFY_BASE_URL https://api.unify.ai/v0`
+`sudo unify-desktop-assistant add-env UNIFY_BASE_URL https://api.unify.ai/v0`
 
-`unify-desktop-assistant add-env UNIFY_KEY <your-key-value>`
+`sudo unify-desktop-assistant add-env UNIFY_KEY <your-key-value>`
 
-`unify-desktop-assistant add-env ANTHROPIC_API_KEY <your-key-value>`
+`sudo unify-desktop-assistant add-env ANTHROPIC_API_KEY <your-key-value>`
 
-`unify-desktop-assistant install`
+`sudo unify-desktop-assistant add-env ASSISTANT_NAME <first> <last>`
 
-2. Start the remote client app.
+```bash
+set -a
+source /opt/unify-desktop-assistant/agent-service/.env
+set +a
+```
 
-`unify-desktop-assistant start "$UNIFY_KEY"`
+2. Install the dependencies
 
-3. Tunnel the service to HTTPS.
+`sudo unify-desktop-assistant install`
+
+3. Start the remote client app.
+
+`sudo unify-desktop-assistant start "$UNIFY_KEY"`
+
+4. Tunnel the service to HTTPS.
 
 a. For testing
 
 - Start the tunnel. A URL for testing will be provided.
 
-`export UNIFY_BASE_URL=https://api.unify.ai/v0`
-
-`export UNIFY_KEY=<your-key-value>`
-
-`export ANTHROPIC_API_KEY=<your-key-value>`
-
-`unify-desktop-assistant tunnel`
+`sudo unify-desktop-assistant tunnel`
 
 b. For production - WIP
 

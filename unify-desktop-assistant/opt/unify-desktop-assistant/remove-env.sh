@@ -21,4 +21,6 @@ mv "$tmpfile" "$ENV_FILE"
 
 echo "Removed $KEY from $ENV_FILE (if present)"
 
-
+# Remove from environment
+unset "$KEY"
+echo "Unset $KEY from environment"
