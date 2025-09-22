@@ -20,7 +20,7 @@
 
 Watch this video for [local setup](https://www.loom.com/share/c6db63fa38d54ed8ac9591dec5ab1d8a?sid=ee5d12ed-3106-41fd-9f24-5ffd70a50fba).
 
-1. Install the required package
+1. Add the required environment variables.
 
 `unify-desktop-assistant add-env UNIFY_BASE_URL https://api.unify.ai/v0`
 
@@ -28,29 +28,33 @@ Watch this video for [local setup](https://www.loom.com/share/c6db63fa38d54ed8ac
 
 `unify-desktop-assistant add-env ANTHROPIC_API_KEY <your-key-value>`
 
+`unify-desktop-assistant add-env ASSISTANT_NAME <first> <last>`
+
+```bash
+set -a
+source "$(brew --prefix unifyai/unifyai/unify-desktop-assistant)/libexec/agent-service/.env"
+set +a
+```
+
+2. Install the required dependencies.
+
 `unify-desktop-assistant install`
 
-2. Create a user profile for the agent with the following details:
+3. Create a user profile for the agent with the following details:
 
 Username: `<AGENT_NAME_FIRST_LAST>`
 
 Password: `<UNIFY_KEY>`
 
-3. Start the remote client app.
+4. Start the remote client app.
 
 `unify-desktop-assistant start`
 
-4. Tunnel the service to HTTPS.
+5. Tunnel the service to HTTPS.
 
 a. For testing
 
 - Start the tunnel. A URL for testing will be provided.
-
-`export UNIFY_BASE_URL=https://api.unify.ai/v0`
-
-`export UNIFY_KEY=<your-key-value>`
-
-`export ASSISTANT_NAME="<first> <last>"`
 
 `unify-desktop-assistant tunnel`
 
