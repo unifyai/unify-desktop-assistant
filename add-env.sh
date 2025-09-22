@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: unify-desktop-assistant add-env <KEY> <VALUE>" >&2
+  echo "Usage: unify-desktop-assistant add-env <KEY> <VALUE...>" >&2
 }
 
 if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
@@ -45,6 +45,7 @@ else
   esc="${VALUE//\\/\\\\}"
   esc="${esc//\"/\\\"}"
   esc="${esc//\$/\\$}"
+  esc="${esc//\`/\\\`}"
   OUT_VALUE="\"$esc\""
 fi
 
@@ -61,4 +62,3 @@ awk -v key="$KEY" -v newline="$NEW_LINE" '
 mv "$tmp_file" "$ENV_FILE"
 
 echo "Set $KEY in $ENV_FILE"
-
