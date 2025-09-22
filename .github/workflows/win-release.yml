@@ -63,22 +63,22 @@ jobs:
         run: |
           choco pack | Write-Host
 
-      - name: Get nupkg path
+      - name: Copy fixed name nupkg
         if: steps.check.outputs.on_ubuntu == 'true'
-        id: pkg
         shell: pwsh
         working-directory: unify-desktop-assistant
         run: |
           $nupkg = Get-ChildItem -Filter 'unify-desktop-assistant.*.nupkg' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $nupkg) { Write-Error 'No nupkg produced'; exit 1 }
-          echo "path=$($nupkg.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Copy-Item $nupkg.FullName "unify-desktop-assistant.nupkg" -Force
+          Write-Host "Copied $($nupkg.Name) to unify-desktop-assistant.nupkg"
 
       - name: Upload to GitHub Release
         if: steps.check.outputs.on_ubuntu == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.pkg.outputs.path }}
+          files: |
+            ${{ steps.pkg.outputs.path }}
+            unify-desktop-assistant/unify-desktop-assistant.nupkg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-
