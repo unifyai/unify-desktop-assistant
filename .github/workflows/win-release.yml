@@ -14,22 +14,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify tag is on win branch
+      - name: Verify tag is on ubuntu branch
         id: check
         shell: bash
         run: |
-          git fetch origin win
-          if git merge-base --is-ancestor "$GITHUB_SHA" origin/win; then
-            echo "on_win=true" >> "$GITHUB_OUTPUT"
-            echo "Tag commit is on 'win' branch"
+          git fetch origin ubuntu
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/ubuntu; then
+            echo "on_ubuntu=true" >> "$GITHUB_OUTPUT"
+            echo "Tag commit is on 'ubuntu' branch"
           else
-            echo "on_win=false" >> "$GITHUB_OUTPUT"
-            echo "Tag commit is NOT on 'win' branch; skipping build"
+            echo "on_ubuntu=false" >> "$GITHUB_OUTPUT"
+            echo "Tag commit is NOT on 'ubuntu' branch; skipping build"
           fi
 
       - name: Set version from tag
         id: ver
-        if: steps.check.outputs.on_win == 'true'
+        if: steps.check.outputs.on_ubuntu == 'true'
         shell: bash
         run: |
           TAG="$GITHUB_REF_NAME"
@@ -37,8 +37,15 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "Will build version $VER"
 
+      - name: Checkout win branch for packaging
+        if: steps.check.outputs.on_ubuntu == 'true'
+        shell: bash
+        run: |
+          git fetch origin win
+          git checkout -B win origin/win
+
       - name: Inject version into nuspec
-        if: steps.check.outputs.on_win == 'true'
+        if: steps.check.outputs.on_ubuntu == 'true'
         shell: pwsh
         working-directory: unify-desktop-assistant/unify-desktop-assistant
         run: |
@@ -50,14 +57,14 @@ jobs:
           Write-Host "Version set to $ver"
 
       - name: choco pack
-        if: steps.check.outputs.on_win == 'true'
+        if: steps.check.outputs.on_ubuntu == 'true'
         shell: pwsh
         working-directory: unify-desktop-assistant/unify-desktop-assistant
         run: |
           choco pack | Write-Host
 
       - name: Get nupkg path
-        if: steps.check.outputs.on_win == 'true'
+        if: steps.check.outputs.on_ubuntu == 'true'
         id: pkg
         shell: pwsh
         working-directory: unify-desktop-assistant/unify-desktop-assistant
@@ -67,7 +74,7 @@ jobs:
           echo "path=$($nupkg.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Upload to GitHub Release
-        if: steps.check.outputs.on_win == 'true'
+        if: steps.check.outputs.on_ubuntu == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.pkg.outputs.path }}
