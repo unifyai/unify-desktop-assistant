@@ -4,13 +4,10 @@ set -euo pipefail
 # Use the existing desktop display (default to :0 if not set)
 DISPLAY="${DISPLAY:-:0}"
 
-# Export UNIFY_KEY from first argument if provided, otherwise require env var
-if [[ ${1:-} != "" ]]; then
-UNIFY_KEY="$1"
-fi
+# Require UNIFY_KEY from environment
 export UNIFY_KEY
 if [[ -z "${UNIFY_KEY:-}" ]]; then
-echo "Error: UNIFY_KEY not provided. Pass as first argument or set env UNIFY_KEY." >&2
+echo "Error: UNIFY_KEY not set in environment." >&2
 exit 1
 fi
 
