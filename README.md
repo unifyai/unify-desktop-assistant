@@ -25,7 +25,7 @@
 ```powershell
 Invoke-WebRequest -Uri "https://github.com/unifyai/unify-desktop-assistant/releases/latest/download/unify-desktop-assistant.nupkg" -OutFile "unify-desktop-assistant.nupkg"
 
-choco install unify-desktop-assistant -s . --force
+choco install unify-desktop-assistant -y -s . --force
 ```
 
 `refreshenv`
