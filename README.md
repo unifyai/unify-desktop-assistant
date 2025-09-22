@@ -40,7 +40,7 @@ set +a
 
 3. Start the remote client app.
 
-`sudo unify-desktop-assistant start "$UNIFY_KEY"`
+`sudo unify-desktop-assistant start $UNIFY_KEY`
 
 4. Tunnel the service to HTTPS.
 
