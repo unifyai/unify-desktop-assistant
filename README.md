@@ -50,7 +50,9 @@ Password: `<UNIFY_KEY>`
 
 `unify-desktop-assistant start`
 
-5. Tunnel the service to HTTPS.
+### HTTPS Tunnel
+
+1. If there isn't a default and secure external IP for controls, tunnel the service to HTTPS.
 
 a. For testing
 
