@@ -42,7 +42,9 @@ set +a
 
 `sudo unify-desktop-assistant start`
 
-4. Tunnel the service to HTTPS.
+### HTTPS Tunnel
+
+1. If there isn't a default and secure external IP for controls, tunnel the service to HTTPS.
 
 a. For testing
 
