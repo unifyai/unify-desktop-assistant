@@ -7,6 +7,8 @@ on:
         description: "Comma-separated branches to update (defaults to ubuntu,macos,win)"
         required: false
         default: "ubuntu,macos,win"
+  schedule:
+    - cron: '0 0 */5 * *'
 
 permissions:
   contents: write
@@ -21,6 +23,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Fetch all branches
+        shell: bash
+        run: |
+          git fetch --all --prune
+
       - name: Parse branches input
         id: parse
         shell: bash
@@ -32,7 +39,7 @@ jobs:
           fi
           # Normalize and output as newline-separated list for matrix-like loop
           echo "branches<<EOF" >> $GITHUB_OUTPUT
-          echo "$BRANCHES_INPUT" | tr ',' '\n' | sed 's/\s//g' | grep -v '^$' >> $GITHUB_OUTPUT || true
+          echo "$BRANCHES_INPUT" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -v '^$' >> $GITHUB_OUTPUT || true
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Ensure git user
@@ -61,11 +68,28 @@ jobs:
             echo "Cloning unifyai/unity@main into $TMPDIR"
             git clone --depth 1 --branch main https://github.com/unifyai/unity.git "$TMPDIR/unity"
 
-            # 2) Copy agent-service from unity into current repo
+            # 2) Determine destination path per branch and copy agent-service
+            case "$BRANCH" in
+              macos)
+                DEST_DIR="agent-service"
+                ;;
+              win)
+                DEST_DIR="unify-desktop-assistant/tools/agent-service"
+                ;;
+              ubuntu)
+                DEST_DIR="unify-desktop-assistant/opt/unify-desktop-assistant/agent-service"
+                ;;
+              *)
+                echo "Unknown branch $BRANCH; skipping"
+                rm -rf "$TMPDIR"
+                continue
+                ;;
+            esac
+
             if [ -d "$TMPDIR/unity/agent-service" ]; then
-              rm -rf agent-service
-              mkdir -p agent-service
-              cp -a "$TMPDIR/unity/agent-service/." agent-service/
+              rm -rf "$DEST_DIR"
+              mkdir -p "$DEST_DIR"
+              cp -a "$TMPDIR/unity/agent-service/." "$DEST_DIR"/
             else
               echo "agent-service not found in unifyai/unity; skipping branch $BRANCH"
               rm -rf "$TMPDIR"
@@ -74,10 +98,10 @@ jobs:
 
             rm -rf "$TMPDIR"
 
-            # 3) Add and commit only if changes exist inside agent-service
-            git add -N agent-service >/dev/null 2>&1 || true
-            if ! git diff --quiet --exit-code -- agent-service; then
-              git add agent-service
+            # 3) Add and commit only if changes exist inside destination path
+            git add -N "$DEST_DIR" >/dev/null 2>&1 || true
+            if ! git diff --quiet --exit-code -- "$DEST_DIR"; then
+              git add "$DEST_DIR"
               COMMIT_MSG="chore(agent-service): sync from unifyai/unity@main"
               git commit -m "$COMMIT_MSG"
               echo "Committed updates on $BRANCH"
@@ -86,8 +110,8 @@ jobs:
             else
               echo "No changes detected for $BRANCH; skipping commit"
               # Ensure clean index
-              git restore --staged agent-service || true
-              git checkout -- agent-service || true
+              git restore --staged "$DEST_DIR" || true
+              git checkout -- "$DEST_DIR" || true
             fi
 
           done < <(echo "${{ steps.parse.outputs.branches }}")
