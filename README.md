@@ -54,11 +54,13 @@ Watch this video for [local setup](https://www.loom.com/share/61a230c7d7314a109e
 
 - Click "Apply", then click "OK".
 
-2. Start the remote client app.
+3. Start the remote client app.
 
 `unify-desktop-assistant start`
 
-3. Tunnel the service to HTTPS.
+### HTTPS Tunnel
+
+1. If there isn't a default and secure external IP for controls, tunnel the service to HTTPS.
 
 a. For testing
 
