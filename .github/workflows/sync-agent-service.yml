@@ -1,0 +1,95 @@
+name: Sync agent-service from unifyai/unity
+
+on:
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: "Comma-separated branches to update (defaults to ubuntu,macos,win)"
+        required: false
+        default: "ubuntu,macos,win"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse branches input
+        id: parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCHES_INPUT="${{ github.event.inputs.branches }}"
+          if [ -z "${BRANCHES_INPUT}" ]; then
+            BRANCHES_INPUT="ubuntu,macos,win"
+          fi
+          # Normalize and output as newline-separated list for matrix-like loop
+          echo "branches<<EOF" >> $GITHUB_OUTPUT
+          echo "$BRANCHES_INPUT" | tr ',' '\n' | sed 's/\s//g' | grep -v '^$' >> $GITHUB_OUTPUT || true
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Ensure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync loop
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r BRANCH; do
+            [ -z "$BRANCH" ] && continue
+            echo "=== Processing branch: $BRANCH ==="
+
+            # 0) Checkout the branch (create local tracking if necessary)
+            if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+              git switch "$BRANCH"
+            else
+              git switch -c "$BRANCH" --track "origin/$BRANCH" || git switch -c "$BRANCH"
+            fi
+
+            # 1) Pull unifyai/unity main separately into a temp dir
+            TMPDIR=$(mktemp -d)
+            echo "Cloning unifyai/unity@main into $TMPDIR"
+            git clone --depth 1 --branch main https://github.com/unifyai/unity.git "$TMPDIR/unity"
+
+            # 2) Copy agent-service from unity into current repo
+            if [ -d "$TMPDIR/unity/agent-service" ]; then
+              rm -rf agent-service
+              mkdir -p agent-service
+              cp -a "$TMPDIR/unity/agent-service/." agent-service/
+            else
+              echo "agent-service not found in unifyai/unity; skipping branch $BRANCH"
+              rm -rf "$TMPDIR"
+              continue
+            fi
+
+            rm -rf "$TMPDIR"
+
+            # 3) Add and commit only if changes exist inside agent-service
+            git add -N agent-service >/dev/null 2>&1 || true
+            if ! git diff --quiet --exit-code -- agent-service; then
+              git add agent-service
+              COMMIT_MSG="chore(agent-service): sync from unifyai/unity@main"
+              git commit -m "$COMMIT_MSG"
+              echo "Committed updates on $BRANCH"
+              # 4) Push
+              git push origin "$BRANCH"
+            else
+              echo "No changes detected for $BRANCH; skipping commit"
+              # Ensure clean index
+              git restore --staged agent-service || true
+              git checkout -- agent-service || true
+            fi
+
+          done < <(echo "${{ steps.parse.outputs.branches }}")
+
+
