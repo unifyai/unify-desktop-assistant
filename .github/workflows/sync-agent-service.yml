@@ -28,6 +28,15 @@ jobs:
         run: |
           git fetch --all --prune
 
+      - name: Checkout unity repository (same org)
+        uses: actions/checkout@v4
+        with:
+          repository: unifyai/unity
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: _unity
+          fetch-depth: 1
+
       - name: Parse branches input
         id: parse
         shell: bash
@@ -63,10 +72,9 @@ jobs:
               git switch -c "$BRANCH" --track "origin/$BRANCH" || git switch -c "$BRANCH"
             fi
 
-            # 1) Pull unifyai/unity main separately into a temp dir
-            TMPDIR=$(mktemp -d)
-            echo "Cloning unifyai/unity@main into $TMPDIR"
-            git clone --depth 1 --branch main https://github.com/unifyai/unity.git "$TMPDIR/unity"
+            # 1) Use the already-checked-out unity repository
+            UNITY_DIR="_unity"
+            echo "Using unity sources from $UNITY_DIR"
 
             # 2) Determine destination path per branch and copy agent-service
             case "$BRANCH" in
@@ -86,17 +94,14 @@ jobs:
                 ;;
             esac
 
-            if [ -d "$TMPDIR/unity/agent-service" ]; then
+            if [ -d "$UNITY_DIR/agent-service" ]; then
               rm -rf "$DEST_DIR"
               mkdir -p "$DEST_DIR"
-              cp -a "$TMPDIR/unity/agent-service/." "$DEST_DIR"/
+              cp -a "$UNITY_DIR/agent-service/." "$DEST_DIR"/
             else
               echo "agent-service not found in unifyai/unity; skipping branch $BRANCH"
-              rm -rf "$TMPDIR"
               continue
             fi
-
-            rm -rf "$TMPDIR"
 
             # 3) Add and commit only if changes exist inside destination path
             git add -N "$DEST_DIR" >/dev/null 2>&1 || true
