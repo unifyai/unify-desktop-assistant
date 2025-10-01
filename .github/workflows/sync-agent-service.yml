@@ -8,7 +8,7 @@ on:
         required: false
         default: "ubuntu,macos,win"
   schedule:
-    - cron: '0 0 */5 * *'
+    - cron: '0 0 * * *'
 
 permissions:
   contents: write
