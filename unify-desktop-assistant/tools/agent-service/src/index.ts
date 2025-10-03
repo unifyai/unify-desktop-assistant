@@ -441,17 +441,18 @@ app.post('/extract', isAgentReady, async (req: Request, res: Response) => {
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const zodSchema = schema ? jsonSchemaToZod(schema) : z.string();
-      const extractFn = (browserAgent as unknown as { extract: (i: unknown, s: ZodTypeAny) => Promise<unknown> }).extract;
-      const dataUnknown: unknown = await extractFn(instructions, zodSchema as ZodTypeAny);
-      const data = dataUnknown as z.infer<typeof zodSchema>;
+      const zodSchema: ZodTypeAny = schema ? jsonSchemaToZod(schema) : z.string();
+      const extractFn = (browserAgent as unknown as { extract: (i: string, s: ZodTypeAny) => Promise<unknown> }).extract;
+      const dataUnknown: unknown = await extractFn(instructions, zodSchema);
+
       // If successful, send the response and exit the loop
-      return res.json({ data });
+      return res.json({ data: dataUnknown });
     } catch (err: unknown) {
       lastError = err;
-      // Check if the error is related to the LLM returning invalid JSON
-      if (err instanceof Error && err.message.includes('HTTP body is not JSON')) {
-        console.warn(`Attempt ${attempt} failed with a transient error. Retrying in ${attempt}s...`);
+      // Check if the error is related to the LLM returning invalid JSON.
+      // Added a check for "Unexpected token" which can also indicate a JSON parsing issue.
+      if (err instanceof Error && (err.message.includes('HTTP body is not JSON') || err.message.includes('Unexpected token'))) {
+        console.warn(`Attempt ${attempt} failed with a transient JSON parsing error. Retrying in ${attempt}s...`);
         await sleep(attempt * 1000); // Wait a bit longer each time
       } else {
         // If it's a different error, fail immediately
@@ -471,11 +472,10 @@ app.post('/query', isAgentReady, async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'bad_request', message: 'Query is required.' });
   }
   try {
-    const zodSchema = schema ? jsonSchemaToZod(schema) : z.any();
+    const zodSchema: ZodTypeAny = schema ? jsonSchemaToZod(schema) : z.any();
     const queryFn = (browserAgent as unknown as { query: (q: unknown, s: ZodTypeAny) => Promise<unknown> }).query;
-    const dataUnknown: unknown = await queryFn(query, zodSchema as ZodTypeAny);
-    const data = dataUnknown as z.infer<typeof zodSchema>;
-    res.json({ data });
+    const dataUnknown: unknown = await queryFn(query, zodSchema);
+    res.json({ data: dataUnknown });
   } catch (err) {
     handleAgentError(err, res);
   }
