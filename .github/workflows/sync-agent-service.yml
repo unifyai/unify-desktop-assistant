@@ -33,7 +33,7 @@ jobs:
         with:
           repository: unifyai/unity
           ref: main
-          token: ${{ secrets.UNITY_WORKFLOW_TOKEN }}
+          token: ${{ secrets.CLONE_TOKEN }}
           path: _unity
           fetch-depth: 1
 
