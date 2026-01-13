@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       branches:
-        description: "Comma-separated branches to update (defaults to ubuntu,macos,win)"
+        description: "Comma-separated branches to update (defaults to ubuntu,macos,win,agent-service)"
         required: false
-        default: "ubuntu,macos,win"
+        default: "ubuntu,macos,win,agent-service"
   schedule:
     - cron: '0 0 * * *'
 
@@ -44,7 +44,7 @@ jobs:
           set -euo pipefail
           BRANCHES_INPUT="${{ github.event.inputs.branches }}"
           if [ -z "${BRANCHES_INPUT}" ]; then
-            BRANCHES_INPUT="ubuntu,macos,win"
+            BRANCHES_INPUT="ubuntu,macos,win,agent-service"
           fi
           # Normalize and output as newline-separated list for matrix-like loop
           echo "branches<<EOF" >> $GITHUB_OUTPUT
@@ -78,7 +78,7 @@ jobs:
 
             # 2) Determine destination path per branch and copy agent-service
             case "$BRANCH" in
-              macos)
+              macos|agent-service)
                 DEST_DIR="agent-service"
                 ;;
               win)
