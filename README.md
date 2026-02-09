@@ -1,94 +1,171 @@
-# Windows Remote Client
+# Unify Desktop Assistant for Windows
+
+A CLI tool to set up a Windows machine as a remote-controllable AI assistant workstation.
+
+## Quick Start
 
 ### Prerequisites
 
-1. PowerShell
+- Windows 10/11 or Windows Server
+- PowerShell (Run as Administrator)
 
-2. Chocolatey
-
-`winget install --id=Chocolatey.Chocolatey -e`
-
-3. Git
-
-`winget install --id=Git.Git -e --source winget`
-
-4. Python 3 (for websockify)
-
-`winget install --id=Python.Python.3 -e`
-
-## Installations
-
-### Download Chocolatey Package
-
-1. Download the choco package from the latest GitHub Release.
+### Option 1: Install via Chocolatey Package
 
 ```powershell
+# Download the package
 Invoke-WebRequest -Uri "https://github.com/unifyai/unify-desktop-assistant/releases/latest/download/unify-desktop-assistant.nupkg" -OutFile "unify-desktop-assistant.nupkg"
 
+# Install
 choco install unify-desktop-assistant -y -s . --force
+refreshenv
+
+# Setup and start (single command)
+unify-desktop-assistant setup -UnifyKey <your-unify-key>
 ```
 
-`refreshenv`
+### Option 2: Run Directly from Source
 
-2. Proceed to local setup.
+```powershell
+# Clone the repo
+git clone https://github.com/unifyai/unify-desktop-assistant.git
+cd unify-desktop-assistant/unify-desktop-assistant/tools
 
-### Local Setup
+# Run setup
+.\setup.ps1 -UnifyKey <your-unify-key>
+```
 
-Watch this video for [local setup](https://www.loom.com/share/61a230c7d7314a109e3fc64061d8e315?sid=b80b1f19-c080-4431-a667-6ee1a0c350f1).
+## Usage
 
-1. Open PowerShell in "Run as Administrator" mode, then add the required environment variables.
+### Setup & Start Services
 
-`unify-desktop-assistant add-env UNIFY_BASE_URL https://api.unify.ai/v0`
+```powershell
+# Install everything and start services
+unify-desktop-assistant setup -UnifyKey <your-key>
 
-`unify-desktop-assistant add-env UNIFY_KEY <your-key-value>`
+# With custom Orchestra URL
+unify-desktop-assistant setup -UnifyKey <your-key> -OrchestraUrl https://api.unify.ai/v0
 
-`unify-desktop-assistant add-env ANTHROPIC_API_KEY <your-key-value>`
+# Force reinstall (bypasses fast mode)
+unify-desktop-assistant setup -UnifyKey <your-key> -Force
+```
 
-`unify-desktop-assistant add-env ASSISTANT_NAME <first> <last>`
+### Stop Services
 
-2. Install the required packages.
+```powershell
+unify-desktop-assistant stop
+```
 
-`unify-desktop-assistant install`
+### Access URLs (Localhost)
 
-- When prompted by a TightVNC popup window, set/change primary password to your Unify API key.
+After setup completes:
 
-- Click "Apply", then click "OK".
+| Service | URL |
+|---------|-----|
+| Desktop (noVNC) | `http://localhost:6080/custom.html?password=<your-key>` |
+| Agent Service API | `http://localhost:3000` |
 
-3. Start the remote client app.
+## What Gets Installed
 
-`unify-desktop-assistant start`
+The `setup` command automatically installs and configures:
 
-### HTTPS Tunnel
+- **Chocolatey** - Package manager
+- **Git** - For cloning repositories
+- **Python 3.12** - For websockify
+- **Node.js LTS** - For agent service
+- **Bun** - For faster builds (optional)
+- **TightVNC** - VNC server (port 5900)
+- **noVNC** - Web-based VNC client (port 6080)
+- **websockify** - WebSocket to VNC proxy
+- **Magnitude** - Browser automation framework
+- **Agent Service** - AI agent API service (port 3000)
 
-1. If there isn't a default and secure external IP for controls, tunnel the service to HTTPS.
+## Configuration
 
-a. For testing
+The setup script creates a minimal `.env` file in `agent-service/`:
 
-- Start the tunnel. A URL for testing will be provided.
+```
+UNIFY_KEY=<your-key>
+ORCHESTRA_URL=https://api.unify.ai/v0
+```
 
-`unify-desktop-assistant tunnel`
+## Services Auto-Start
 
-b. For production - WIP
+The setup creates Windows scheduled tasks for auto-start on logon:
+- `UnifyWebsockify` - Starts websockify
+- `UnifyAgentService` - Starts agent service
 
-- Login to Cloudflare. This is a one time step.
+## Optional: HTTPS Tunnels (Cloudflare)
 
-`cloudflared tunnel login`
+For remote access without setting up your own domain:
 
-- Start the tunnel - TODO
+```powershell
+# Tunnel Agent Service (port 3000)
+unify-desktop-assistant tunnel
 
-`unify-desktop-assistant tunnel -Hostname your.domain.com -TunnelName myapp -LocalPort 6080`
+# Tunnel VNC viewer (port 6080)
+unify-desktop-assistant liveview
+```
 
-### Live Remote Viewing and Controls
+Access via the Cloudflare URL provided.
 
-1. Tunnel the remote view.
+## Architecture
 
-`unify-desktop-assistant liveview`
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Windows Desktop                          │
+│                                                              │
+│  ┌─────────────┐     ┌─────────────┐     ┌───────────────┐  │
+│  │  TightVNC   │────▶│ websockify  │────▶│ noVNC (6080)  │  │
+│  │   (5900)    │     │             │     │ HTML5 Viewer  │  │
+│  └─────────────┘     └─────────────┘     └───────────────┘  │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │            Agent Service (Express, port 3000)           ││
+│  │   ┌───────────────────────────────────────────────────┐ ││
+│  │   │  Magnitude BrowserAgent (Playwright + LLM)        │ ││
+│  │   └───────────────────────────────────────────────────┘ ││
+│  └─────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
+```
 
-2. View and control the desktop through the URL below. When prompted for password, input your Unify API key.
+## Troubleshooting
 
-`<cloudflared-url>/vnc.html?resize=scale&autoreconnect=1&autoconnect=1`
+### TightVNC Password
 
-### Troubleshooting
+When first installing TightVNC, a configuration dialog appears. Set the primary password to your Unify API key.
 
-- Make sure `ANTHROPIC_API_KEY`, `UNIFY_BASE_URL` and `UNIFY_KEY` are in your `.env` file when starting the Docker container.
-- When running with Actor, make sure `UNIFY_KEY` and at least `ASSISTANT_EMAIL=unity.agent@unity.ai` are present in your unity `.env` for the magnitude server auth to work.
+### Services Not Starting
+
+Check if ports are already in use:
+```powershell
+Get-NetTCPConnection -LocalPort 5900,6080,3000 -State Listen
+```
+
+### View Logs
+
+Agent service logs are saved to:
+```
+tools\agent-service\agent.log
+```
+
+### Manual Service Start
+
+```powershell
+# Start websockify manually
+cd tools\novnc
+.\start-websockify.bat
+
+# Start agent service manually
+cd tools\agent-service
+npx ts-node src/index.ts
+```
+
+## Legacy Commands (Deprecated)
+
+These commands still work but are superseded by `setup`:
+
+```powershell
+unify-desktop-assistant install    # Use 'setup' instead
+unify-desktop-assistant start      # Use 'setup' instead
+unify-desktop-assistant add-env    # Use 'setup -UnifyKey' instead
+```
