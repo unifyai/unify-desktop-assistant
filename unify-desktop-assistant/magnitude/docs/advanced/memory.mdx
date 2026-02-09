@@ -1,0 +1,55 @@
+---
+title: Memory and Prompt Caching
+description: "Configure memory settings and prompt caching optimizations"
+icon: brain
+---
+
+## Prompt caching
+
+By default, when Anthropic models are used, Magnitude will automatically utilize Anthropic's [prompt caching feature](https://www.anthropic.com/news/prompt-caching) to save on token costs as much as possible.
+
+By using prompt caching - Magnitude will use typically around 40% less tokens compared to uncached. The effects of prompt caching compound with longer tasks.
+
+## Configuring prompt caching
+
+If you would for whatever reason like to explicitly disable prompt caching, you can do so:
+```ts
+const cachedAgent = await startBrowserAgent({
+	url: 'https://magnitasks.com',
+	llm: {
+		provider: 'claude-code',
+		options: {
+			model: 'claude-sonnet-4-20250514',
+			promptCaching: false
+		}
+	}
+});
+```
+Otherwise, prompt caching will be enabled by default with `anthropic` or `claude-code` providers.
+
+<Warning>Note that prompt caching is not available on Bedrock.</Warning>
+
+## Configuring retained screenshots
+
+By default, Magnitude will retain 1 screenshot plus any screenshots that were included in a previous cache write.
+
+If your task requires complicated interactions and you want to ensure the agent retains more screenshots in working memory, you can increase the `minScreenshots` option:
+```ts
+const cachedAgent = await startBrowserAgent({
+	url: 'https://magnitasks.com',
+	llm: {
+		provider: 'claude-code',
+		options: {
+			model: 'claude-sonnet-4-20250514'
+		}
+	},
+	minScreenshots: 3,
+});
+```
+
+
+## How Magnitude's memory works
+
+Anthropic provides 4 cache control messages at a time. The Magnitude agent will use one cache control on the system prompt so that it is always cached, and then cycle the other 3 with prompt cache writes and reads to optimize on screenshot tokens during the task.
+
+In addition - Magnitude only keeps one screenshot unless already cached, plus the last 20 thoughts from the agent. This means that context length will grow roughly linearly with task complexity, and is extremely performant compared to other computer use agent implementations which do not implement sliding-window memory or prompt caching.

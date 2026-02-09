@@ -1,0 +1,64 @@
+---
+title: 'Testing Setup'
+description: 'Set up a Magnitude project and run an example'
+icon: list-checks
+---
+
+## Setup
+
+<Steps>
+  <Step title="Install our test library">
+    ```sh
+    npm install --save-dev magnitude-test
+    ```
+    > or see our [demo repo](https://github.com/magnitudedev/magnitude-demo-repo) if you don't have a project to try it on
+  </Step>
+  <Step title="Initialize Magnitude">
+    ```sh
+    npx magnitude init
+    ```
+    This will create a basic tests directory `tests/magnitude` with:
+    - `magnitude.config.ts`: Magnitude test configuration file
+    - `example.mag.ts`: An example test file
+  </Step>
+  <Step title="Configure LLM">
+    The easiest way to set up an LLM for Magnitude is to set the `ANTHROPIC_API_KEY` environment variable. Sonnet 4 will be used by default. See [LLM Configuration](/customizing/llm-configuration) for more details.
+  </Step>
+</Steps>
+
+🚀 Now you're ready to run tests!
+
+
+## Running tests
+
+**Run your Magnitude tests with:**
+```sh
+npx magnitude
+```
+
+This will run all Magnitude test files discovered with the `*.mag.ts` pattern. If the agent finds a problem with your app, it will tell you what happened and describe the bug!
+
+> To run many tests in parallel, add `-w <workers>`
+
+To learn more about different options for running tests see [here](/testing/running-tests).
+
+
+## Building test cases
+
+Now that you've got Magnitude set up, you can create real test cases for your app. Here's an example for a general idea:
+```ts
+import { test } from 'magnitude-test';
+
+test('can log in and create company', async (agent) => {
+    await agent.act('Log in to the app', {
+        data: { username: 'test-user@magnitude.run', password: 'test' }
+    });
+    await agent.check('Can see dashboard');
+    await agent.act('Create a new company', { data: 'Make up the first 2 values and use defaults for the rest' });
+    await agent.check('Company added successfully');
+});
+```
+
+Acts, checks, and data are all natural language. Think of it like you're describing how to test a particular flow to a co-worker - what steps they need to take, what they should check for, and what test data to use.
+
+For more information on how to build test cases see <a href="https://docs.magnitude.run/core-concepts/building-test-cases" target="_blank">our docs.</a>

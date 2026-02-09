@@ -1,0 +1,72 @@
+---
+title: Compatible LLMs
+description: "Visually grounded LLMs compatible with Magnitude"
+icon: brain-circuit
+---
+
+Magnitude requires an LLM than is both:
+1. Very good at instruction following and planning
+2. Is **visually grounded**, meaning it understands precise coordinates in an image to interact with the browser accurately.
+
+Very few LLMs meet this criteria, which is why we recommend **Claude Sonnet 4**, which has strong reasoning abilities and is grounded.
+To use Sonnet, simply set `ANTHROPIC_API_KEY` in your environment.
+
+<Info> You can also choose a specific Claude model by configuring an [Anthropic](/reference/llm-providers#anthropic) or [Bedrock](/reference/llm-providers#aws-bedrock) client. </Info>
+
+
+<Warning> Most LLMs are NOT grounded, for example models from OpenAI, Gemini, or Llama. </Warning>
+
+
+## Other compatible models
+
+If you are looking for a cheaper / open source alternative with comparable performance we recommend **Qwen 2.5 VL 72B**.
+
+Here's an example of how you could configure Magnitude to use Qwen via OpenRouter:
+
+<Tabs>
+  <Tab title="Automations">
+    ```typescript
+    const agent = await startBrowserAgent({
+        url: "https://google.com",
+        llm: {
+            provider: 'openai-generic',
+            options: {
+                baseUrl: 'https://openrouter.ai/api/v1',
+                model: 'qwen/qwen2.5-vl-72b-instruct',
+                apiKey: process.env.OPENROUTER_API_KEY
+            }
+        }
+    });
+    ```
+  </Tab>
+  <Tab title="Test Runner">
+    ```typescript magnitude.config.ts
+    export default {
+        url: "http://localhost:5173",
+        llm: {
+            provider: 'openai-generic',
+            options: {
+                baseUrl: 'https://openrouter.ai/api/v1',
+                model: 'qwen/qwen2.5-vl-72b-instruct',
+                apiKey: process.env.OPENROUTER_API_KEY
+            }
+        }
+    } satisfies MagnitudeConfig;
+    ```
+  </Tab>
+</Tabs>
+
+
+
+
+For instructions on configuring LLMs with various providers, see [LLM Providers](/reference/llm-providers).
+
+<Accordion title="More compatible models">
+Other visually grounded models in the 32B-72B parameter range may be appropriate for Magnitude, depending on the LLM and your test case complexity. Some of these include:
+
+- [Qwen2.5-VL-32B](https://huggingface.co/Qwen/Qwen2.5-VL-32B-Instruct)
+- [UI-TARS-72B](https://huggingface.co/ByteDance-Seed/UI-TARS-72B-DPO)
+- [Molmo-72B](https://huggingface.co/allenai/Molmo-72B-0924)
+
+<Warning>These models are mostly untested with Magnitude, they may not be suitable for running tests. If any of these LLMs are struggling to follow instructions or have issues with accuracy, please try a recommended model instead.</Warning>
+</Accordion>

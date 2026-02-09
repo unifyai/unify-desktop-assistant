@@ -1,0 +1,69 @@
+---
+title: Agent Options
+description: "Configure the Magnitude agent and browser"
+icon: brain-cog
+---
+
+Magnitude can be customized by passing in options when you start a browser agent:
+```ts
+await startBrowserAgent({
+    // Starting URL for agent
+    url: "https://google.com", 
+    // Show thoughts and actions
+    narrate: true,
+    // LLM configuration
+    llm: {
+        provider: 'anthropic',
+        options: {
+            model: 'claude-sonnet-4-20250514',
+            apiKey: process.env.ANTHROPIC_API_KEY
+        }
+    },
+    // Any system instructions specific to your agent or website
+    prompt: 'Prefer mouse to keyboard when filling out form fields'
+});
+```
+
+<Warning>Only some LLMs are compatible with Magnitude - see [compatible LLMs](/core-concepts/compatible-llms) for details.</Warning>
+
+<Info>For information on configuring the test runner instead see [Configure Test Runner](/testing/test-configuration)</Info>
+
+
+## Browser Options
+
+Various browser options can also be passed, such as browser launch options or context options:
+
+```ts
+const agent = await startBrowserAgent({
+    url: "https://google.com", 
+    browser: {
+        // Configured launched browser:
+        launchOptions: {
+            // chromium launch options, for example enabling CDP
+            args: ["--remote-debugging-port=9222"]
+        },
+        contextOptions: {
+            // see https://playwright.dev/docs/api/class-browser#browser-new-context
+            // for comprehensive list of options
+            viewport: {
+                width: 1280,
+                height: 720
+            }
+        }
+    }
+});
+```
+
+See Playwright's docs on [Launch Options](https://playwright.dev/docs/api/class-browsertype#browser-type-launch) and [Browser Context](https://playwright.dev/docs/api/class-browsercontext) for more details on what can be configured.
+
+You can also connect via CDP to an open CDP-enabled browser:
+
+```ts
+const agent = await startBrowserAgent({
+    url: "https://google.com", 
+    browser: {
+        cdp: "http://localhost:9222"
+    }
+});
+```
+

@@ -1,0 +1,84 @@
+---
+title: Test Declaration
+description: "Reference for the `test` function used to define Magnitude test cases."
+icon: "file-code"
+---
+
+Magnitude tests are defined using the globally available `test` function imported from `magnitude-test`.
+
+<RequestExample>
+```typescript Basic Usage
+import { test } from 'magnitude-test';
+
+test('Descriptive test title', async (agent) => {
+  // Test logic using agent
+});
+```
+</RequestExample>
+
+## `test(title, options?, testFn)`
+
+Defines a new test case.
+
+<ParamField path="title" type="string" required>
+  A descriptive title for the test case. This title appears in test reports and logs.
+</ParamField>
+
+<ParamField path="options" type="object">
+  Optional configuration specific to this test case.
+</ParamField>
+
+<Expandable title="options properties">
+  <ResponseField name="url" type="string">
+    Overrides the base URL defined in the global configuration or test group for this specific test case.
+  </ResponseField>
+</Expandable>
+
+<ParamField path="testFn" type="(agent) => Promise<void>" required>
+  An asynchronous function containing the test logic. It receives an `agent` object with the properties described below.
+</ParamField>
+
+<Expandable title="testFn context properties">
+  <ResponseField name="agent" type="object" required>
+    The agent object providing methods for AI interaction (`agent.act()`, `agent.check()`) and access to Playwright's `agent.page` and `agent.context`. See [AI Steps and Checks](./ai-steps-checks), [Low-Level AI Actions](./ai-low-level), and [Playwright Access](./playwright-access).
+  </ResponseField>
+</Expandable>
+
+## `test.group(id, options?, groupFn)`
+
+Defines a group of test cases, allowing shared options (like `url`) to be applied to all tests within the group.
+
+<RequestExample>
+```typescript Group Example
+import { test } from 'magnitude-test';
+
+test.group('User Authentication Flow', { url: '/login' }, () => {
+  test('should display login form', async (agent) => {
+    await agent.check("Login form is visible");
+  });
+
+  test('should allow login with valid credentials', async (agent) => {
+    await agent.act("Log in with valid credentials");
+    await agent.check("User is redirected to dashboard");
+  });
+});
+```
+</RequestExample>
+
+<ParamField path="id" type="string" required>
+  A descriptive identifier for the test group.
+</ParamField>
+
+<ParamField path="options" type="object">
+  Optional configuration applied to all tests within this group. See properties below.
+</ParamField>
+
+<Expandable title="options properties">
+  <ResponseField name="url" type="string">
+    Sets a base URL for all tests within the group. Can be overridden by individual test options.
+  </ResponseField>
+</Expandable>
+
+<ParamField path="groupFn" type="() => void" required>
+  A synchronous function that contains the `test()` declarations belonging to this group.
+</ParamField>

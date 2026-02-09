@@ -1,0 +1,89 @@
+---
+title: Browser Interaction
+description: "Instruct and control what the agent should do in the browser"
+icon: mouse-pointer-2
+---
+
+## Taking Action
+
+Use **act()** to tell the agent what to do:
+
+Instructions provided to act can be high-level tasks:
+```ts
+await agent.act('log in to the app');
+```
+
+or low level actions:
+```ts
+await agent.act('click the submit button');
+```
+
+Think of it like you're telling a coworker to do something. Breaking it up into tiny steps is unnecessary, but you want to be specific enough to make the objective clear.
+
+### Chaining Acts
+
+Combine multiple **act** calls to accomplish complex sequences of interactions:
+```ts
+await agent.act('go to tasks page');
+await agent.act('assign all pending tasks to Bob');
+await agent.act('move all pending tasks to "In Progress"');
+```
+
+You can also chain multiple steps together in the same act call for convenience:
+```ts
+await agent.act([
+    'go to tasks page',
+    'assign all pending tasks to Bob',
+    'move all pending tasks to "In Progress"'
+]);
+```
+
+### Providing Data
+
+You can provide arbitrary data fields that the agent will use where appropriate during its actions:
+```ts
+await agent.act('create a new task', {
+    data: {
+        title: 'important task',
+        description: 'some description'
+    }
+});
+```
+
+### Custom Prompting
+
+Provide custom system prompt instructions as needed:
+```ts
+await agent.act('create a new task', {
+    prompt: 'tasks should be written in spanish'
+});
+```
+
+## Navigating Directly
+
+While the agent is capable of navigating to URLs on its own, you may sometimes want to navigate to a specific URL directly.
+
+To do this, use `nav`:
+```ts
+await agent.nav('https://google.com');
+```
+
+## Agent Capabilities
+
+### What can agent do in act?
+
+The agent is capable of **mouse**, **keyboard**, and **browser**-specific actions, including but not limited to:
+- Clicking with the mouse
+- Dragging with the mouse
+- Typing long blocks of content
+- Pressing specific keystrokes
+- Switching tabs
+- Navigating to URLs
+
+### What is the agent aware of?
+
+The agent knows about and sees:
+- The current screenshot plus some past screenshots
+- History of its own actions from the same `act()`
+- All currently open tabs
+- Which tab is active

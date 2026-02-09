@@ -1,0 +1,30 @@
+---
+title: TestCaseAgent
+description: "Reference for the `agent` object used in Magnitude tests."
+icon: "bot"
+---
+
+The `agent` object is your primary tool for interacting with the browser within a Magnitude test. It's an instance of the `TestCaseAgent` class.
+
+`TestCaseAgent` extends [`BrowserAgent`](/reference/browser-agent) and includes all of its methods, such as `act()`, `nav()`, and `extract()`.
+
+In addition to the inherited methods, `TestCaseAgent` provides the following methods for making assertions:
+
+## `agent.check(description)`
+
+Verifies that a certain condition holds true on the web page based on a natural language description. The AI evaluates the description against the current page state (DOM, visibility, text content).
+
+<RequestExample>
+```typescript Complete Test Case Example
+import { test } from 'magnitude-test';
+
+test('should create three todos', async (agent) => {
+    await agent.act('create three todos');
+    await agent.check('three todos exist');
+});
+```
+</RequestExample>
+
+<ParamField path="description" type="string" required>
+  A natural language statement describing the expected condition or state to verify.
+</ParamField>

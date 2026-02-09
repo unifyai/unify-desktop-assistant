@@ -1,0 +1,72 @@
+---
+title: LLM Roles
+description: "Designate different LLMs for different responsibilities"
+icon: venetian-mask
+---
+
+You can customize the Magnitude agent to use different LLMs for each of the three primary operations: `act`, `extract`, `query`.
+
+By default when a single LLM is provided, all responsibilites will be handled by that LLM. However, by specifying different LLMs for certain roles you may be able to save on cost and speed.
+
+Example:
+```typescript
+import { startBrowserAgent } from 'magnitude-core';
+import z from 'zod';
+
+async function main() {
+    const agent = await startBrowserAgent({
+        url: 'https://magnitasks.com/tasks',
+        narrate: true,
+        llm: [
+            {
+                provider: 'claude-code',
+                options: {
+                    model: 'claude-sonnet-4-20250514'
+                }
+            },
+            {
+                roles: ['extract'],
+                provider: 'google-ai',
+                options: {
+                    model: 'gemini-2.5-flash-lite-preview-06-17',//'gemini-2.5-flash'
+                }
+            },
+            {
+                roles: ['query'],
+                provider: 'google-ai',
+                options: {
+                    // Balance intelligent querying and cheap tokens
+                    model: 'gemini-2.5-flash'
+                }
+            }
+        ]
+    });
+    
+    const tasks = await agent.extract(
+        'Extract all tasks in To Do column',
+        z.array(z.object({ title: z.string(), desc: z.string() }))
+    ); // ^ this will use gemini-2.5-flash-lite-preview-06-17
+
+    await agent.act('Move each to in progress', { data: tasks });
+    // ^ this will use Claude
+
+    const numTodosMoved = await agent.query(
+        'How many todos were moved?',
+        z.number()
+    ); // ^ this will use gemini-2.5-flash
+
+    console.log(numTodosMoved);
+
+    await agent.stop();
+}
+
+main();
+```
+
+One great use case for this is to reduce the cost of extracting data. While `act` requires an intelligent and [visually grounded model](/core-concepts/compatible-llms), `extract` and `query` do not require grounded models, and can often work fine with less intelligent models.
+
+General recommendations:
+- `act`: MUST use an [intelligent, visually grounded model](/core-concepts/compatible-llms)
+- `extract`: Can use a fast and cheap model, like `gemini-2.5-flash` or even `gemini-2.5-flash-lite`
+- `query`: Can use any model that's reasonably intelligent but fast, depending on the complexity of the queries you plan to ask. `gemini-2.5-flash` might be a good option.
+

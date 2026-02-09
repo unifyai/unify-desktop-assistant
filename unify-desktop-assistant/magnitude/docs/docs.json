@@ -1,0 +1,134 @@
+{
+    "$schema": "https://mintlify.com/docs.json",
+    "name": "Magnitude",
+    "theme": "maple",
+    "description": "Open source AI agents for web testing",
+    "logo": "/logo.svg",
+    "favicon": "/logo.svg",
+    "icons": {
+        "library": "lucide"
+    },
+    "colors": {
+        "primary": "#0369a1",
+        "light": "#0ea5e9",
+        "dark": "#075985"
+    },
+    "navbar": {
+        "links": [
+            {
+                "label": "Community",
+                "href": "https://discord.gg/VcdpMh9tTy"
+            }
+        ],
+        "primary": {
+            "type": "button",
+            "label": "GitHub",
+            "href": "https://github.com/magnitudedev/magnitude"
+        }
+    },
+    "navigation": {
+        "global": {
+            "anchors": [
+                {
+                    "anchor": "GitHub",
+                    "icon": "github",
+                    "href": "https://github.com/magnitudedev/magnitude"
+                },
+                {
+                    "anchor": "Community",
+                    "icon": "discord",
+                    "href": "https://discord.gg/VcdpMh9tTy"
+                },
+                {
+                    "anchor": "Contact",
+                    "icon": "mail",
+                    "href": "mailto:founders@magnitude.run"
+                }
+            ]
+        },
+        "dropdowns": [
+            {
+                "dropdown": "Documentation",
+                "icon": "book",
+                "groups": [
+                    {
+                        "group": "Getting Started",
+                        "pages": [
+                            "getting-started/introduction",
+                            "getting-started/quickstart"
+                        ]
+                    },
+                    {
+                        "group": "Core Concepts",
+                        "pages": [
+                            "core-concepts/browser-interaction",
+                            "core-concepts/data-extraction",
+                            "core-concepts/agent-options",
+                            "core-concepts/compatible-llms",
+                            "core-concepts/playwright"
+                        ]
+                    },
+                    {
+                        "group": "Testing Web Apps",
+                        "pages": [
+                            "testing/test-setup",
+                            "testing/building-test-cases",
+                            "testing/running-tests",
+                            "testing/test-configuration",
+                            "testing/ci"
+                        ]
+                    },
+                    {
+                        "group": "Advanced",
+                        "pages": [
+                            "advanced/memory",
+                            "advanced/roles"
+                        ]
+                    },
+                    {
+                        "group": "Integrations",
+                        "pages": [
+                            "integrations/kernel"
+                        ]
+                    },
+                    {
+                        "group": "Reference",
+                        "pages": [
+                            "reference/llm-providers",
+                            "reference/browser-agent",
+                            "reference/test-case-agent",
+                            "reference/test-declaration"
+                        ]
+                    }
+                ]
+            },
+            {
+                "dropdown": "Contributing",
+                "icon": "wrench",
+                "groups": [
+                    {
+                        "group": "Contributing",
+                        "pages": [
+                            "contributing/introduction",
+                            "contributing/suggestions",
+                            "contributing/creating-prs",
+                            "contributing/setup"
+                        ]
+                    }
+                ]
+            }
+        ]
+    },
+    "search": {
+        "prompt": "Search or ask..."
+    },
+    "seo": {
+        "indexing": "all"
+    },
+    "contextual": {
+        "options": [
+            "copy",
+            "view"
+        ]
+    }
+}

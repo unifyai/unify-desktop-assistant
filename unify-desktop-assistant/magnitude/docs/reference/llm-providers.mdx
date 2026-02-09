@@ -1,0 +1,188 @@
+---
+title: LLM Providers
+description: "Instructions for configuring LLMs with different providers"
+icon: "cloudy"
+---
+
+You can specify which LLM to use in `magnitude.config.ts`. If no LLM is configured and `ANTHROPIC_API_KEY` is available, Magnitude will use Claude Sonnet 4 automatically.
+
+
+<Warning>While a variety of LLM providers are supported, many of them do NOT have any visually grounded model. See [LLM Configuration](/customizing/llm-configuration) for details.</Warning>
+
+<Info>Magnitude uses [BAML](https://docs.boundaryml.com/ref/llm-client-providers/overview)'s providers under the hood, so their docs may be a useful secondary reference for credential configuration.</Info>
+
+
+To configure your LLM, pass one of the client interfaces described below to your `magnitude.config.ts`, like:
+```typescript
+import { type MagnitudeConfig } from 'magnitude-test';
+
+export default {
+    url: "http://localhost:5173",
+    llm: {
+        provider: 'anthropic', // your provider of choice
+        options: {
+            // any required + optional configuration for that provider
+            model: 'claude-3-7-sonnet-latest',
+            apiKey: process.env.ANTHROPIC_API_KEY
+        }
+    }
+} satisfies MagnitudeConfig;
+```
+
+# Providers
+
+## Google AI Studio
+```typescript
+interface GoogleAIClient {
+    provider: 'google-ai',
+    options: {
+        model: string,
+        apiKey?: string // defaults to GOOGLE_API_KEY
+        temperature?: number,
+        baseUrl?: string // defaults to https://generativelanguage.googleapis.com/v1beta
+    }
+}
+```
+
+## Google Vertex AI
+
+```typescript
+interface GoogleVertexClient {
+    provider: 'vertex-ai',
+    options: {
+        model: string,
+        location: string,
+        baseUrl?: string,
+        projectId?: string,
+        credentials?: string | object,
+        temperature?: number,
+    }
+}
+```
+
+The easiest way to authenticate with Vertex AI is to authenticate using the `gcloud` CLI.
+
+1. Create a project in [Google Cloud](https://console.cloud.google.com).
+2. Enable Vertex AI in that project by going to [Vertex AI Dashboard](https://console.cloud.google.com/vertex-ai/dashboard) an selecting "Enable all Recommended APIs"
+3. Install the `gcloud` CLI ([instructions](https://cloud.google.com/sdk/docs/install))
+4. Run `gcloud auth application-default login --project <your-project-id>`
+
+Once you've done these steps, you can set up a project to use Vertex with the available credentials like this:
+```ts
+import { type MagnitudeConfig } from "magnitude-test";
+
+export default {
+    url: "http://localhost:5173",
+    llm: {
+        provider: 'vertex-ai',
+        options: {
+            model: 'google/gemini-2.5-pro-preview-05-06',
+            location: 'us-central1'
+        }
+    }
+} satisfies MagnitudeConfig;
+```
+
+If running in GCP, it will query the metadata server to use the attached service account.
+
+<Info>More info: [BAML Google Vertex Provider Docs](https://docs.boundaryml.com/ref/llm-client-providers/google-vertex#authentication)</Info>
+
+
+
+## Anthropic
+
+```typescript
+interface AnthropicClient {
+    provider: 'anthropic',
+    options: {
+        model: string,
+        apiKey?: string,
+        temperature?: number
+    }   
+}
+```
+
+## OpenAI
+```typescript
+interface OpenAIClient {
+    provider: 'openai',
+    options: {
+        model: string,
+        apiKey?: string,
+        temperature?: number
+    }
+}
+```
+
+## OpenAI-compatible (OpenRouter, Ollama, etc.)
+
+```typescript
+interface OpenAIGenericClient {
+    provider: 'openai-generic'
+    options: {
+        model: string,
+        baseUrl: string,
+        apiKey?: string,
+        temperature?: number,
+        headers?: Record<string, string>
+    }
+}
+```
+
+## AWS Bedrock
+
+```typescript
+interface BedrockClient {
+    provider: 'aws-bedrock',
+    options: {
+        model: string,
+        // passed to inference_configuration
+        temperature?: number
+    }   
+}
+```
+
+Authenticate with bedrock using environment variables:
+```sh
+export AWS_ACCESS_KEY_ID="your_key"
+export AWS_SECRET_ACCESS_KEY="your_secret"
+export AWS_REGION="us-east-1"
+```
+
+## Azure OpenAI
+
+```typescript
+interface AzureOpenAIClient {
+    provider: 'azure-openai',
+    options: {
+        resourceName: string,
+        deploymentId: string,
+        apiVersion: string,
+        apiKey: string
+    }
+}
+```
+<Info>More info on authenticating with Azure: https://docs.boundaryml.com/ref/llm-client-providers/open-ai-from-azure</Info>
+
+## Configuring Moondream
+
+Moondream cloud is the easiest way to get set up, and offers 5,000 free requests per day. Get an API key [here](https://moondream.ai/c/cloud/api-keys).
+
+Moondream is open source and can also be self-hosted instead of using their cloud option. See [here](https://moondream.ai/c/moondream-server) for instructions.
+
+If self-hosting, configure the `baseUrl` to point to your server:
+
+```typescript
+import { type MagnitudeConfig } from 'magnitude-test';
+
+export default {
+    url: "http://localhost:5173",
+    grounding: {
+        provider: 'moondream',
+        options: {
+            baseUrl: 'your-self-hosted-moondream-endpoint',
+            apiKey: process.env.MOONDREAM_API_KEY // not necessary if self-hosted
+        }
+    }
+} satisfies MagnitudeConfig;
+```

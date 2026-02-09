@@ -1,0 +1,74 @@
+{
+  "name": "magnitude-core",
+  "version": "0.3.0",
+  "description": "Magnitude e2e testing agent",
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.cts",
+  "bin": {
+    "magnus": "dist/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/magnitudedev/magnitude.git"
+  },
+  "homepage": "https://github.com/magnitudedev/magnitude#readme",
+  "bugs": {
+    "url": "https://github.com/magnitudedev/magnitude/issues"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "testing",
+    "ui-testing",
+    "automation",
+    "magnitude",
+    "typescript"
+  ],
+  "scripts": {
+    "build": "baml-cli generate && tsc && pkgroll",
+    "check": "tsc --noEmit",
+    "cli": "bun ./src/cli.ts",
+    "pubdev": "bun run build && yalc publish --force --push"
+  },
+  "author": {
+    "name": "Magnitude",
+    "email": "founders@magnitude.run",
+    "url": "https://magnitude.run"
+  },
+  "contributors": [
+    "Anders Lie <anders@magnitude.run>"
+  ],
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "@types/object-hash": "^3.0.6",
+    "pkgroll": "^2.10.0",
+    "typescript": "~5.7.2"
+  },
+  "dependencies": {
+    "@boundaryml/baml": "^0.202.0",
+    "@google-cloud/storage": "^7.17.3",
+    "@paralleldrive/cuid2": "^2.2.2",
+    "ansis": "^4.1.0",
+    "commander": "^13.1.0",
+    "eventemitter3": "^5.0.1",
+    "google-auth-library": "^9.0.0",
+    "magnitude-extract": "0.0.2",
+    "object-hash": "^3.0.0",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "playwright": "npm:patchright@^1.52.0",
+    "posthog-node": "^5.1.1",
+    "sharp": "^0.33.5",
+    "sharp-phash": "^2.0.0",
+    "zod": "^3.24.4",
+    "zod-to-json-schema": "^3.24.5"
+  }
+}
