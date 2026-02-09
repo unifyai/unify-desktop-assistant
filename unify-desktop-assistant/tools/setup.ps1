@@ -31,9 +31,10 @@ $ErrorActionPreference = 'Stop'
 
 $script:StartTime = Get-Date
 $script:ToolsDir = $PSScriptRoot
+$script:InstallDir = Split-Path -Parent $PSScriptRoot
 $script:NoVncDir = Join-Path $script:ToolsDir 'novnc'
-$script:MagnitudeDir = Join-Path $script:ToolsDir 'magnitude'
-$script:AgentServiceDir = Join-Path $script:ToolsDir 'agent-service'
+$script:MagnitudeDir = Join-Path $script:InstallDir 'magnitude'
+$script:AgentServiceDir = Join-Path $script:InstallDir 'agent-service'
 
 Write-Host ""
 Write-Host "=========================================="
@@ -86,43 +87,6 @@ function Save-DependenciesHash {
     }
 }
 
-function Get-RemoteCommitHash {
-    param(
-        [string]$RepoUrl,
-        [string]$Branch
-    )
-    try {
-        $gitExe = Get-Command git -ErrorAction SilentlyContinue
-        if (-not $gitExe) { return $null }
-        
-        $output = & git ls-remote $RepoUrl "refs/heads/$Branch" 2>&1
-        if ($output -match '^([a-f0-9]+)\s') {
-            return $matches[1].Substring(0, 12)
-        }
-    } catch {
-        Write-Host "  WARNING: Failed to get remote commit hash - $_" -ForegroundColor Yellow
-    }
-    return $null
-}
-
-function Get-SavedCommitHash {
-    param([string]$Dir)
-    $hashFile = Join-Path $Dir '.commit-hash'
-    if (Test-Path $hashFile) {
-        return (Get-Content $hashFile -ErrorAction SilentlyContinue).Trim()
-    }
-    return $null
-}
-
-function Save-CommitHash {
-    param(
-        [string]$Dir,
-        [string]$Hash
-    )
-    if ($Hash) {
-        $Hash | Out-File -FilePath (Join-Path $Dir '.commit-hash') -Encoding UTF8 -NoNewline
-    }
-}
 
 # =============================================================================
 # Fast Mode Detection
@@ -131,24 +95,39 @@ function Save-CommitHash {
 function Test-FastMode {
     Write-Host "Checking installation status..." -ForegroundColor Cyan
     
-    $checks = @(
-        @{ Path = 'C:\Program Files\TightVNC\tvnserver.exe'; Name = 'TightVNC' },
-        @{ Path = (Join-Path $script:NoVncDir 'vnc.html'); Name = 'noVNC' },
+    # Pre-provided packages (should always exist after installation)
+    $preProvided = @(
         @{ Path = (Join-Path $script:MagnitudeDir 'packages\magnitude-core\package.json'); Name = 'Magnitude' },
         @{ Path = (Join-Path $script:AgentServiceDir 'package.json'); Name = 'AgentService' }
     )
     
-    $allPresent = $true
-    foreach ($check in $checks) {
+    foreach ($check in $preProvided) {
+        if (Test-Path $check.Path) {
+            Write-Host "  [OK] $($check.Name) (pre-installed)" -ForegroundColor Green
+        } else {
+            Write-Host "  [ERR] $($check.Name) NOT FOUND" -ForegroundColor Red
+            Write-Host "       Expected at: $($check.Path)" -ForegroundColor Red
+            throw "Required component '$($check.Name)' is missing from the installation."
+        }
+    }
+    
+    # Components that need installation
+    $installChecks = @(
+        @{ Path = 'C:\Program Files\TightVNC\tvnserver.exe'; Name = 'TightVNC' },
+        @{ Path = (Join-Path $script:NoVncDir 'vnc.html'); Name = 'noVNC' }
+    )
+    
+    $allInstalled = $true
+    foreach ($check in $installChecks) {
         if (Test-Path $check.Path) {
             Write-Host "  [OK] $($check.Name)" -ForegroundColor Green
         } else {
             Write-Host "  [--] $($check.Name) (will install)" -ForegroundColor Yellow
-            $allPresent = $false
+            $allInstalled = $false
         }
     }
     
-    return $allPresent
+    return $allInstalled
 }
 
 # =============================================================================
@@ -283,23 +262,59 @@ function Install-Bun {
 function Install-TightVNC {
     param([string]$Password = "unify123")
     
+    Write-Host ""
+    Write-Host "=== Installing TightVNC ===" -ForegroundColor Cyan
+    
     $tvnExe = 'C:\Program Files\TightVNC\tvnserver.exe'
     
     if (-not (Test-Path $tvnExe)) {
-        Write-Host ""
-        Write-Host "=== Installing TightVNC ===" -ForegroundColor Cyan
+        # Download and install via MSI with password parameters (no user interaction)
+        $vncInstallerUrl = 'https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi'
+        $vncInstallerPath = 'C:\temp\tightvnc.msi'
         
-        choco install tightvnc -y --no-progress | Out-Host
+        New-Item -ItemType Directory -Force -Path 'C:\temp' | Out-Null
         
-        Write-Host "  TightVNC installed" -ForegroundColor Green
+        Write-Host "  Downloading TightVNC..."
+        Invoke-WebRequest -Uri $vncInstallerUrl -OutFile $vncInstallerPath -UseBasicParsing
+        
+        Write-Host "  Installing TightVNC (silent with password)..."
+        $vncArgs = @(
+            "/i", $vncInstallerPath,
+            "/quiet", "/norestart",
+            "ADDLOCAL=Server",
+            "SET_USEVNCAUTHENTICATION=1",
+            "VALUE_OF_USEVNCAUTHENTICATION=1",
+            "SET_PASSWORD=1",
+            "VALUE_OF_PASSWORD=$Password",
+            "SET_USECONTROLAUTHENTICATION=1",
+            "VALUE_OF_USECONTROLAUTHENTICATION=1",
+            "SET_CONTROLPASSWORD=1",
+            "VALUE_OF_CONTROLPASSWORD=$Password"
+        )
+        $vncProcess = Start-Process msiexec.exe -ArgumentList $vncArgs -Wait -NoNewWindow -PassThru
+        
+        Write-Host "  TightVNC installation exit code: $($vncProcess.ExitCode)"
+        
+        if (Test-Path $tvnExe) {
+            Write-Host "  TightVNC installed" -ForegroundColor Green
+        } else {
+            Write-Host "  WARNING: TightVNC may not have installed correctly" -ForegroundColor Yellow
+        }
+        
+        # Cleanup
+        Remove-Item $vncInstallerPath -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "  TightVNC already installed" -ForegroundColor Green
     }
     
-    # Configure TightVNC registry settings
-    Write-Host "  Configuring TightVNC registry..." -ForegroundColor Gray
+    # Configure TightVNC registry settings (both HKLM and HKCU for service and app mode)
+    Write-Host "  Configuring TightVNC settings..."
     
     $regPaths = @(
         'HKLM:\SOFTWARE\TightVNC\Server',
-        'HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server'
+        'HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server',
+        'HKCU:\SOFTWARE\TightVNC\Server',
+        'HKCU:\SOFTWARE\WOW6432Node\TightVNC\Server'
     )
     
     foreach ($regPath in $regPaths) {
@@ -315,15 +330,38 @@ function Install-TightVNC {
         Set-ItemProperty -Path $regPath -Name 'RfbPort' -Value 5900 -Type DWord -Force
     }
     
-    Write-Host "  TightVNC registry configured" -ForegroundColor Green
+    Write-Host "  Registry settings configured" -ForegroundColor Green
     
-    # Launch config app for password setup if first time
-    if (Test-Path $tvnExe) {
-        Write-Host ""
-        Write-Host "  IMPORTANT: Set VNC password in the TightVNC configuration dialog" -ForegroundColor Yellow
-        Write-Host "  (Use your Unify API key as the password)" -ForegroundColor Yellow
-        try { & $tvnExe -configapp } catch {}
+    # Copy encrypted password from HKLM to HKCU (for app-mode operation)
+    $hklmPath = 'HKLM:\SOFTWARE\TightVNC\Server'
+    $hkcuPath = 'HKCU:\SOFTWARE\TightVNC\Server'
+    $passwordExists = (Get-ItemProperty -Path $hkcuPath -Name 'Password' -ErrorAction SilentlyContinue).Password
+    
+    if (-not $passwordExists) {
+        Write-Host "  Configuring password for app-mode..."
+        
+        # Start service briefly to initialize password in registry
+        Set-Service -Name "tvnserver" -StartupType Manual -ErrorAction SilentlyContinue
+        Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+        
+        # Copy encrypted password bytes from HKLM to HKCU
+        try {
+            $passwordBytes = Get-ItemPropertyValue -Path $hklmPath -Name 'Password' -ErrorAction Stop
+            Set-ItemProperty -Path $hkcuPath -Name 'Password' -Value $passwordBytes -Type Binary -Force
+            $controlPwdBytes = Get-ItemPropertyValue -Path $hklmPath -Name 'ControlPassword' -ErrorAction Stop
+            Set-ItemProperty -Path $hkcuPath -Name 'ControlPassword' -Value $controlPwdBytes -Type Binary -Force
+            Write-Host "  Password configured automatically" -ForegroundColor Green
+        } catch {
+            Write-Host "  WARNING: Password copy failed - $_" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  Password already configured" -ForegroundColor Green
     }
+    
+    # Set service to automatic startup
+    Set-Service -Name "tvnserver" -StartupType Automatic -ErrorAction SilentlyContinue
+    Write-Host "  TightVNC configured" -ForegroundColor Green
 }
 
 function Install-NoVNC {
@@ -419,54 +457,22 @@ function Install-Magnitude {
     param([switch]$Force)
     
     Write-Host ""
-    Write-Host "=== Installing Magnitude ===" -ForegroundColor Cyan
+    Write-Host "=== Setting up Magnitude ===" -ForegroundColor Cyan
     
     $magnitudeCoreDir = Join-Path $script:MagnitudeDir 'packages\magnitude-core'
-    $repoUrl = 'https://github.com/unifyai/magnitude.git'
-    $branch = 'unity-modifications'
     
-    # Check if update needed
-    $needsClone = -not (Test-Path (Join-Path $magnitudeCoreDir 'package.json'))
-    $needsBuild = $false
-    
-    if (-not $needsClone -and -not $Force) {
-        $savedHash = Get-SavedCommitHash -Dir $script:MagnitudeDir
-        $remoteHash = Get-RemoteCommitHash -RepoUrl $repoUrl -Branch $branch
-        
-        if ($savedHash -and $remoteHash -and ($savedHash -eq $remoteHash)) {
-            Write-Host "  Magnitude up-to-date (commit: $savedHash)" -ForegroundColor Green
-            
-            # Still check if deps need install
-            if (-not (Test-DependenciesInstalled -Dir $magnitudeCoreDir)) {
-                $needsBuild = $true
-            }
-        } else {
-            Write-Host "  Magnitude update available" -ForegroundColor Yellow
-            $needsClone = $true
-        }
+    # Magnitude is pre-provided in the installer, no git clone needed
+    if (-not (Test-Path (Join-Path $magnitudeCoreDir 'package.json'))) {
+        Write-Host "  ERROR: magnitude not found at $script:MagnitudeDir" -ForegroundColor Red
+        Write-Host "  This should be included in the installer package." -ForegroundColor Red
+        return
     }
     
-    if ($needsClone) {
-        Write-Host "  Cloning magnitude repository..."
-        
-        if (Test-Path $script:MagnitudeDir) {
-            Remove-Item -Recurse -Force $script:MagnitudeDir -ErrorAction SilentlyContinue
-        }
-        
-        git clone --depth 1 --branch $branch $repoUrl $script:MagnitudeDir 2>&1 | Out-Null
-        
-        # Save commit hash
-        Push-Location $script:MagnitudeDir
-        $commitHash = git rev-parse --short=12 HEAD 2>&1
-        Pop-Location
-        Save-CommitHash -Dir $script:MagnitudeDir -Hash $commitHash
-        
-        $needsBuild = $true
-        Write-Host "  Cloned (commit: $commitHash)" -ForegroundColor Green
-    }
-    
-    if ($needsBuild -or $Force) {
-        Write-Host "  Building magnitude-core..."
+    # Check if deps need install
+    if ((Test-DependenciesInstalled -Dir $magnitudeCoreDir) -and -not $Force) {
+        Write-Host "  Dependencies up-to-date" -ForegroundColor Green
+    } else {
+        Write-Host "  Installing dependencies and building magnitude-core..."
         
         Push-Location $magnitudeCoreDir
         
