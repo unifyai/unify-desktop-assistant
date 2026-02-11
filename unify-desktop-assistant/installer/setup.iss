@@ -1,0 +1,206 @@
+; Unify Desktop Assistant - Inno Setup Script
+; 
+; This script creates a Windows installer that:
+; - Installs all files to Program Files
+; - Creates Start Menu entries
+; - Launches the tray GUI app on install
+; - Registers for auto-start on login
+;
+; Build:
+;   iscc setup.iss
+; Or use:
+;   .\build.ps1
+
+#define AppName "Unify Desktop Assistant"
+#define AppVersion "1.0.0"
+#define AppPublisher "Unify"
+#define AppURL "https://unify.ai"
+#define AppExeName "UnifyAssistant.vbs"
+
+[Setup]
+; Unique app identifier
+AppId={{7E8A9F2D-3B4C-5D6E-8F9A-1B2C3D4E5F6A}
+AppName={#AppName}
+AppVersion={#AppVersion}
+AppPublisher={#AppPublisher}
+AppPublisherURL={#AppURL}
+AppSupportURL={#AppURL}
+AppUpdatesURL={#AppURL}
+DefaultDirName={autopf}\{#AppName}
+DisableProgramGroupPage=yes
+DefaultGroupName={#AppName}
+OutputDir=output
+OutputBaseFilename=UnifyDesktopAssistant-Setup-{#AppVersion}
+SetupIconFile=assets\icon.ico
+UninstallDisplayIcon={app}\assets\icon.ico
+Compression=lzma2/ultra64
+SolidCompression=yes
+WizardStyle=modern
+PrivilegesRequired=admin
+ArchitecturesInstallIn64BitMode=x64
+MinVersion=10.0
+
+; Wizard appearance (optional - uses defaults if files missing)
+; WizardImageFile=assets\wizard.bmp
+; WizardSmallImageFile=assets\wizard-small.bmp
+DisableWelcomePage=no
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "autostart"; Description: "Start automatically when Windows starts"; GroupDescription: "Startup options:"; Flags: checkedonce
+
+[Files]
+; Core application files
+Source: "..\tools\*"; DestDir: "{app}\tools"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\gui\*"; DestDir: "{app}\gui"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\magnitude\*"; DestDir: "{app}\magnitude"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\agent-service\*"; DestDir: "{app}\agent-service"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+; Assets
+Source: "assets\icon.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
+
+; Launcher script (runs PowerShell GUI hidden)
+Source: "launcher.vbs"; DestDir: "{app}"; DestName: "{#AppExeName}"; Flags: ignoreversion
+
+[Icons]
+; Start Menu
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\assets\icon.ico"; WorkingDir: "{app}"
+Name: "{autoprograms}\{#AppName} Settings"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\gui\UnifyAssistant.ps1"""; IconFilename: "{app}\assets\icon.ico"; WorkingDir: "{app}"
+
+; Desktop icon (optional)
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\assets\icon.ico"; WorkingDir: "{app}"; Tasks: desktopicon
+
+[Registry]
+; Auto-start on login (optional task)
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "UnifyDesktopAssistant"; ValueData: """{app}\{#AppExeName}"""; Flags: uninsdeletevalue; Tasks: autostart
+
+[Run]
+; Run initial setup with configuration dialog
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File ""{app}\gui\UnifyAssistant.ps1""' -WindowStyle Hidden"""; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runhidden
+
+[UninstallRun]
+; Stop services before uninstall
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -Stop"; Flags: runhidden waituntilterminated; RunOnceId: "StopServices"
+
+[UninstallDelete]
+; Clean up generated files
+Type: filesandordirs; Name: "{app}\tools\novnc"
+Type: filesandordirs; Name: "{app}\magnitude\node_modules"
+Type: filesandordirs; Name: "{app}\magnitude\packages\magnitude-core\node_modules"
+Type: filesandordirs; Name: "{app}\agent-service\node_modules"
+Type: files; Name: "{app}\agent-service\.env"
+Type: files; Name: "{app}\settings.json"
+
+[Code]
+// Configuration page variables
+var
+  ConfigPage: TWizardPage;
+  UnifyKeyEdit: TNewEdit;
+  OrchestraUrlEdit: TNewEdit;
+
+// Initialize configuration page
+procedure InitializeWizard();
+begin
+  // Create custom configuration page
+  ConfigPage := CreateCustomPage(wpSelectTasks, 'Configuration', 'Enter your Unify API credentials');
+  
+  // Unify Key label
+  with TNewStaticText.Create(ConfigPage) do
+  begin
+    Parent := ConfigPage.Surface;
+    Caption := 'Unify API Key:';
+    Left := 0;
+    Top := 8;
+    Width := ConfigPage.SurfaceWidth;
+  end;
+  
+  // Unify Key edit
+  UnifyKeyEdit := TNewEdit.Create(ConfigPage);
+  with UnifyKeyEdit do
+  begin
+    Parent := ConfigPage.Surface;
+    Left := 0;
+    Top := 28;
+    Width := ConfigPage.SurfaceWidth;
+    PasswordChar := '*';
+  end;
+  
+  // Orchestra URL label
+  with TNewStaticText.Create(ConfigPage) do
+  begin
+    Parent := ConfigPage.Surface;
+    Caption := 'Orchestra URL (optional):';
+    Left := 0;
+    Top := 68;
+    Width := ConfigPage.SurfaceWidth;
+  end;
+  
+  // Orchestra URL edit
+  OrchestraUrlEdit := TNewEdit.Create(ConfigPage);
+  with OrchestraUrlEdit do
+  begin
+    Parent := ConfigPage.Surface;
+    Left := 0;
+    Top := 88;
+    Width := ConfigPage.SurfaceWidth;
+    Text := 'https://api.unify.ai/v0';
+  end;
+  
+  // Help text
+  with TNewStaticText.Create(ConfigPage) do
+  begin
+    Parent := ConfigPage.Surface;
+    Caption := 'You can change these settings later from the tray icon menu.';
+    Left := 0;
+    Top := 130;
+    Width := ConfigPage.SurfaceWidth;
+    Font.Style := [fsItalic];
+  end;
+end;
+
+// Validate configuration before proceeding
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  
+  if CurPageID = ConfigPage.ID then
+  begin
+    if Trim(UnifyKeyEdit.Text) = '' then
+    begin
+      MsgBox('Please enter your Unify API Key.', mbError, MB_OK);
+      Result := False;
+    end;
+  end;
+end;
+
+// Save configuration after install
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  EnvFile: String;
+  EnvContent: String;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    // Create .env file with user configuration
+    EnvFile := ExpandConstant('{app}\agent-service\.env');
+    EnvContent := '# Agent Service Environment Configuration' + #13#10 +
+                  '# Generated by installer' + #13#10 +
+                  #13#10 +
+                  'PORT=3000' + #13#10 +
+                  'UNIFY_KEY=' + UnifyKeyEdit.Text + #13#10 +
+                  'ORCHESTRA_URL=' + OrchestraUrlEdit.Text + #13#10;
+    SaveStringToFile(EnvFile, EnvContent, False);
+    
+    // Also save settings.json for the GUI
+    SaveStringToFile(ExpandConstant('{app}\settings.json'), '{"AutoStartServices": false}', False);
+  end;
+end;
+
+// Check if running as admin
+function InitializeSetup(): Boolean;
+begin
+  Result := True;
+end;
