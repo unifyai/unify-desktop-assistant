@@ -1,0 +1,84 @@
+---
+title: Creating PRs
+description: How to propose code changes to Magnitude
+icon: hammer
+---
+
+## Accepted PRs
+
+Before you dive into making code changes, you should understand whether your work is likely to get merged!
+
+Generally accepted PRs:
+- Bugfixes (for known or newly identified issues)
+- [Open issues](https://github.com/magnitudedev/magnitude/issues), especially issues that are affecting or blocking multiple people.
+
+However, if there's something else you plan to implement - feel free to create an issue for it or run it by us on Discord first. You can wing it and create the PR too, but no guarantees it will be accepted.
+
+<Info> If you're ever not sure if a PR is likely to get accepted, feel free to ping us on Discord. Keep in mind that even a working implementation of a feature or resolving an issue may recieve additional scrutiny based on conventions or quality. </Info>
+
+Other general guidelines:
+- Changes in `magnitude-test` are more likely to be accepted quickly as the surface area to gain feature-parity with other test runners is quite large.
+- Changes to `magnitude-core` may also be accepted but may want to run these past us on Discord first.
+
+
+## PR Creation Process
+
+To make a contribution to Magnitude, follow this process:
+
+<Steps>
+    <Step title="🍴 Create a fork for your PR">
+        First, fork the Magnitude monorepo on GitHub into a version that lives on your account. This will enable you to push changes onto your fork that you can use to create PRs into the main repo.
+        
+        1. Go to https://github.com/magnitudedev/magnitude
+        2. Click "Fork", name it whatever, then "Create fork"
+        3. Clone your fork locally
+    </Step>
+    <Step title="⚙️ Set up Magnitude monorepo">
+        Follow the [Development Setup](/contributing/setup) instructions.
+    </Step>
+    <Step title="🛠️ Make a change">
+        Create changes and push them to your fork, adhering to the conventions listed [below](#pr-checklist).
+    </Step>
+    <Step title="📬 Submit a PR">
+        [Create a PR](https://github.com/magnitudedev/magnitude/pulls) in the Magnitude repository requesting to merge from the appropriate branch on your fork.
+
+        Follow instructions below for what should be included in your [PR description](#pr-checklist).
+    </Step>
+    <Step title="📝 Follow the review process">
+        We regularly keep an eye out for new PRs - and may leave comments about any additional changes you may need to make in order for your PR to be merged.
+
+        Once we've taken a look - if the PR looks good, it'll be merged and you'll officially be a Magnitude contributor 😎
+
+        Upon the next release, your changes will be live and everyone can enjoy your contributions! 🎉
+
+        
+    </Step>
+</Steps>
+
+<Info>PRs will be reviewed and accepted on a case-by-case basis. Submitting a PR does not guarantee that your work will be merged.</Info>
+
+## PR Checklist
+
+There's a few things you should be sure to do in any PR. Please follow these steps to help your PR get merged smoothly.
+
+### ✅ Manually verify your own changes
+You should confirm your changes are working as expected, for example by using yalc to publish and test locally (see [local testing](/contributing/setup#local-testing)).
+
+### ✅ Add a clear description
+If you've implemented a new feature, give example usage that demonstrates what changes you've made. You should also describe what you've done to confirm that your changes are working as expected (any manual testing).
+
+### ✅ Create a `changeset` describing your changes:
+
+Once you've made your other changes, run this from monorepo root:
+```
+bun changeset add
+```
+In this menu, add a comment describing your change. Unless it's a big change and you've received confirmation that your change should be a `major` or `minor` version bump, ensure that your changeset is marked as `patch`.
+
+Commit this changeset file. This will ensure that the next release is tracking your change and will credit you as the author for the change.
+
+### ✅ Update docs
+
+If you've made a dev-facing change and there is an appropriate place in the docs that needs updating, feel free to do so.
+
+This is not required, but we appreciate it!

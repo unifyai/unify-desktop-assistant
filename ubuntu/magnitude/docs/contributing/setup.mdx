@@ -1,0 +1,70 @@
+---
+title: Development Setup
+description: Learn how to set up the Magnitude codebase
+icon: wrench
+---
+
+## Prerequisites
+
+### Bun
+
+While not explicitly required, it's recommended to use [Bun](https://bun.sh/) as your node runtime since that's what our team uses.
+
+To install bun:
+
+<Tabs>
+  <Tab title="Linux & macOS">
+  ```sh
+  curl -fsSL https://bun.sh/install | bash
+  ```
+  </Tab>
+  <Tab title="Windows">
+  ```powershell
+  powershell -c "irm bun.sh/install.ps1 | iex"
+  ```
+  </Tab>
+</Tabs>
+
+<Info>All other contribution-related docs will refer to `bun` in commands - but you can replace with `npm` if preferred</Info>
+
+## Monorepo Setup
+
+```sh
+git clone https://github.com/magnitudedev/magnitude.git
+```
+
+Then run:
+```sh
+bun i && bun run build
+```
+
+The monorepo now has dependencies installed and is built.
+
+## Building Packages
+
+Whenever you make a change to `magnitude-core` that you want to be reflected in `magnitude-test` during testing, make sure to rebuild with `bun run build`.
+
+## Local Testing
+
+When you make changes to `magnitude-test` that you want to test in your project or elsewhere, you need a way to refer to your local package.
+
+To do this, you can use [yalc](https://github.com/wclr/yalc).
+
+Install yalc:
+```sh
+bun i -g yalc
+```
+
+Then in the monorepo:
+```sh
+cd packages/magnitude-test
+bun run pubdev
+```
+
+In your other project:
+```sh
+yalc add magnitude-test
+```
+This will add the yalc (local) version of magnitude-test instead of the one published on npm
+
+Run `pubdev` again as needed to update your other project with your modified version of Magnitude.

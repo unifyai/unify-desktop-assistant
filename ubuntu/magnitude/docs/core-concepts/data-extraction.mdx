@@ -1,0 +1,64 @@
+---
+title: Data Extraction
+description: "Intelligently turn browser content into structured data"
+icon: pickaxe
+---
+
+## Extract 101
+
+Pass instructions and a zod schema to `extract()` in order to intelligently collect data from the current page:
+```ts
+import z from 'zod';
+
+const numInProgress = await agent.extract(
+    'how many items are "In Progress"?',
+    z.number()
+);
+```
+
+Schemas can be any valid zod schema to capture complex data:
+```ts
+const tasks = await agent.extract(
+    'list all tasks',
+    z.array(z.object({
+        title: z.string(),
+        status: z.enum(['todo', 'inprogress', 'done']),
+        description: z.string(),
+        priority: z.enum(['low', 'medium', 'high', 'urgent']),
+        labels: z.array(z.string()),
+        assignee: z.string()
+    }))
+);
+```
+
+### Data Chaining
+
+Capturing structured data on its own is helpful. You could save that data to a filesystem, upload it to a database, or pass it off to another process.
+
+However, you might want to integrate that data into another web application or trigger additional agent workflows with it.
+
+A great way to do this is by using standard control flow based on extracted data, or passing `data` to `act` where needed:
+
+```ts
+const urgentTasks = tasks.filter(
+    task => task.priority === 'urgent' && task.status === 'todo'
+);
+if (urgentTasks.length > 10) {
+    await agent.act('create a new task', data: {
+        title: 'get some of these urgent tasks done!',
+        description: urgentTasks.map(task => task.title).join(', ')
+    });
+}
+```
+
+### Extractable content
+`extract()` will show the agent:
+1. A screenshot of the browser window
+2. A simplified version of the DOM content
+3. The instructions and schema you provide
+
+As long as its clear enough how that data should be converted to the provdided zod schema, the agent will return data conforming to the schema based on what it sees in the browser.
+
+Magnitude supports any schema that can be defined with `zod` - including arrays, composite objects, numbers, strings, etc.
+
+See https://zod.dev/ for more information about zod.

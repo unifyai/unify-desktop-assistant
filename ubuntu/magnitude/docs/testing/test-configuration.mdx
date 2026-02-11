@@ -1,0 +1,111 @@
+---
+title: Configure Test Runner
+description: "Customize browser settings, web servers, and more"
+icon: settings
+---
+
+When you run `npx magnitude init`, a `magnitude.config.ts` will be generated for you. By default it looks something like:
+
+```typescript
+import { type MagnitudeConfig } from 'magnitude-test';
+
+export default {
+    url: "http://localhost:5173"
+} satisfies MagnitudeConfig;
+```
+
+`url` is the default URL that all test cases will use if not specified.
+
+However, there's a lot more you can customize to get Magnitude working exactly as you want.
+
+## Browser Options
+
+You can customize options to pass to each [Playwright browser context](https://playwright.dev/docs/api/class-browser#browser-new-context) that gets created while running Magnitude tests.
+
+Common options you may want to customize might be `viewport` or even `recordVideo` to capture videos of tests. For example:
+
+```typescript
+import { type MagnitudeConfig } from 'magnitude-test';
+
+export default {
+    url: "http://localhost:5173",
+    browser: {
+        contextOptions: {
+            viewport: { width: 800, height: 600 },
+            recordVideo: {
+                dir: './videos/',
+                size: { width: 800, height: 600 }
+            }
+        }
+    }
+} satisfies MagnitudeConfig;
+```
+
+## Development web server
+
+Magnitude can automatically launch your development server when tests run. Configure `webServer` with the command to start the server and the URL it will listen on:
+
+```typescript
+import { type MagnitudeConfig } from 'magnitude-test';
+
+export default {
+    url: 'http://localhost:3000',
+    webServer: {
+        command: 'npm run start',
+        url: 'http://localhost:3000',
+        timeout: 120_000,
+        reuseExistingServer: true
+    }
+} satisfies MagnitudeConfig;
+```
+
+Magnitude checks if `webServer.url` is already reachable. If so and `reuseExistingServer` is `true`, the command is skipped. The server process is killed automatically once the test run completes.
+
+## Test failure behaviour
+
+The default behaviour for failed tests is to terminate execution after the first failed test. To change this and allow other tests to run regardless of failed tests, you can either
+
+- Run magnitude with the `--no-fail-fast` CLI flag
+- Add `continueAfterFailure: true` to your `magnitude.config.ts`
+
+Example:
+
+```typescript
+import { type MagnitudeConfig } from 'magnitude-test';
+
+export default {
+    url: "...",
+    continueAfterFailure: true,
+    llm: {
+        //...
+    }
+} satisfies MagnitudeConfig;
+```
+
+## Test URL resolution 
+
+Each test uses a URL that is built from the broader scope of configuration in this order:
+
+1. **Environment variable** (`MAGNITUDE_TEST_URL`)
+2. **Global configuration** (`magnitude.config.ts`)
+3. **Test group options**
+4. **Individual test options**
+
+For the `url` option at any of these levels, you can provide a relative path to attach to the upper level's URL, or a full URL to override it.
+For example, if you provide `{url: "https://localhost:8080"}` in `magnitude.config.ts`, and an individual test has `{url: "/items?id=1"}`, the test runner will navigate to `https://localhost:8080/items?id=1`.
+
+## Telemetry Opt-Out
+
+By default Magnitude collects basic anonymized telemetry when you run a test, such as the duration of the test and number of tokens used.
+We use this information to help us understand our usage and grow as an open source project. We appreciate it if you leave it on :)
+
+To opt out of telemetry:
+
+```typescript
+import { type MagnitudeConfig } from 'magnitude-test';
+
+export default {
+    url: "http://localhost:5173",
+    telemetry: false
+} satisfies MagnitudeConfig;
+```

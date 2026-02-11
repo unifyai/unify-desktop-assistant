@@ -1,0 +1,138 @@
+---
+title: Building Test Cases
+description: "How to design and build effective test cases"
+icon: pencil-ruler
+---
+
+## Test Cases
+
+Each Magnitude test case navigates to a URL in a browser, executes **Test Steps** on the web application at that URL, and verifies any **Checks** along the way.
+
+For example:
+```typescript
+test('can add and remove todos', async (agent) => {
+    await agent.act('Add a todo');
+    await agent.act('Remove the todo');
+});
+```
+
+<Info>A test case is designed to represent a single user flow in your web app.</Info>
+
+
+### Configure Test Cases
+
+Each test can additionally be configured with a different starting URL (defaults to the [configured project](/customization/configuration) `url` in `magnitude.config.ts`):
+
+```typescript
+test('can add and remove todos', { url: "https://mytodoapp.com" }, async (agent) => {
+    await agent.act('Add a todo');
+    await agent.act('Remove the todo');
+});
+```
+
+## Test Steps
+
+When you define a step, you provide a description for what Magnitude should do during that step, for example:
+```typescript
+test('example', async (agent) => {
+    await agent.act('Log in'); // step description
+});
+```
+Each step should make sense on its own and describe a portion of the user flow.
+
+Steps should only be specific enough that it's clear from your app's interface how to complete the step. For example - to log into an app, you don't need to say type into each field or what buttons to press - just provide any necessary data and say "Log in".
+
+### Checks
+
+A **check** is a **natural language visual assertion** that you can add to any step in your test case.
+
+<Info>Think `assert` in other testing frameworks, except it can "see" the website and understand natural language descriptions.</Info>
+
+Examples of valid checks:
+- "Only 3 todos should be listed"
+- "Make sure image of giraffe is visible"
+- "The response from the chat bot should make sense and answer the user's question"
+
+<Info>Checks are validated after the step they are attached to is executed.</Info>
+
+To actually use a check in a test case, include it after the relevant step:
+```typescript
+test('example', async (agent) => {
+    await agent.act('Log in');
+    await agent.check('Dashboard is visible');
+});
+```
+
+### Test Data
+
+You can provide additional **test data** relevant to specific step like this:
+
+```typescript
+test('example', async (agent) => {
+    await agent.act('Log in', { data: { email: "foo@bar.com", password: "foo" } });
+    await agent.check('Dashboard is visible');
+});
+```
+
+<Info>The key/value pairs are completely up to you, but it should be clear enough what they should be used for.</Info>
+
+You can also provide completely freeform data by passing in a string instead of a key/value object:
+```typescript
+test('example', async (agent) => {
+    await agent.act('Add 3 todos', { data: 'Use "Take out trash" for the first todo and make up the other 2' });
+});
+```
+
+### Custom LLM prompting
+
+You can pass custom instructions to any `act` call by specifing the `prompt` option.
+
+```typescript
+test('example', async (agent) => {
+    await agent.act('create 3 todos', { prompt: 'all todos must be animal-related' });
+});
+```
+
+You can also do this at the test or group level to apply to all acts within that block.
+
+```typescript
+test.group('todo list', { prompt: 'Each todo should be exactly 5 words'}, () => {
+    test('can add todos', { url: 'https://magnitodo.com', prompt: 'All todos should be animal related' }, async (agent) => {
+        await agent.act('create 3 todos', { prompt: 'the first and last word on the todo must start with the same letter'});
+    });
+});
+```
+
+### Example of migrating a Playwright test case to Magnitude
+
+A simple test case from the Playwright demo TODO app:
+```typescript  
+test('should allow me to add todo items', async ({ page }) => {
+    const newTodo = page.getByPlaceholder('What needs to be done?');
+
+    await newTodo.fill(TODO_ITEMS[0]);
+    await newTodo.press('Enter');
+
+    await expect(page.getByTestId('todo-title')).toHaveText([
+        TODO_ITEMS[0]
+    ]);
+
+    await newTodo.fill(TODO_ITEMS[1]);
+    await newTodo.press('Enter');
+
+    await expect(page.getByTestId('todo-title')).toHaveText([
+        TODO_ITEMS[0],
+        TODO_ITEMS[1]
+    ]);
+  });
+```
+
+The same test case in Magnitude:
+```typescript
+test('should allow me to add todo items', async (agent) => {
+    await agent.act('Create todo', { data: TODO_ITEMS[0] });
+    await agent.check('First todo appears in list');
+    await agent.act('Create another todo', { data: TODO_ITEMS[1] });
+    await agent.check('List has two todos');
+});
+```

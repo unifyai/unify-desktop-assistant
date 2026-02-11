@@ -1,0 +1,88 @@
+---
+title: 'Quickstart'
+description: 'Set up a Magnitude project and run an example'
+icon: rocket
+---
+
+## Get Started
+
+<Steps>
+  <Step title="Setup a new project">
+    ```sh
+    npx create-magnitude-app
+    ```
+    This script will create a project from a starter template based on your preferences. Simply follow the instructions to set up your project and configure an LLM.
+
+    <Accordion title="See example code">
+    ```typescript
+    import { startBrowserAgent } from "magnitude-core";
+    import z from 'zod';
+    import dotenv from 'dotenv';
+
+    dotenv.config();
+
+    async function main() {
+        const agent = await startBrowserAgent({
+            // Starting URL for agent
+            url: 'https://docs.magnitude.run/getting-started/quickstart',
+            // Show thoughts and actions
+            narrate: true,
+            // LLM configuration
+            llm: {
+                provider: 'claude-code',
+                options: {
+                    model: 'claude-sonnet-4-20250514'
+                }
+            },
+        });
+
+        // Intelligently extract data based on the DOM content matching a provided zod schema
+        const gettingStarted = await agent.extract('Extract how to get started with Magnitude', z.object({
+            // Agent can extract existing data or new insights
+            difficulty: z.enum(['easy', 'medium', 'hard']),
+            steps: z.array(z.string()),
+        }));
+
+        // Navigate to a new URL
+        await agent.nav('https://magnitasks.com');
+
+        // Magnitude can handle high-level tasks
+        await agent.act('Create a task', { 
+            // Optionally pass data that the agent will use where appropriate
+            data: { 
+                title: 'Get started with Magnitude', 
+                description: gettingStarted.steps.map(step => `• ${step}`).join('\n') 
+            } 
+        });
+
+        // It can also handle low-level actions
+        await agent.act('Drag "Get started with Magnitude" to the top of the in progress column');
+
+        // Stop agent and browser
+        await agent.stop();
+    }
+
+    main();
+
+    ```
+    </Accordion>
+  </Step>
+  <Step title="Run the example">
+    ```sh
+    cd my-project
+    npm start
+    ```
+    This will kick off a basic example included in the template that shows you a bit of what Magnitude can do.
+  </Step>
+  <Step title="Make some changes">
+    Trying tweaking one of the `act()` calls, run `npm start` again, and see what happens - or replace the URL and try an automation on a completely different site.
+  </Step>
+</Steps>
+
+
+
+🚀 Now you're ready to automate anything!
+
+Continue reading docs to learn more about what you can do with the agent, or just keep building and let us know if you have any questions in our [Discord](https://discord.gg/VcdpMh9tTy)!
+
+<Info>For testing web apps with our native test runner, see [testing setup](/testing/test-setup)</Info>
