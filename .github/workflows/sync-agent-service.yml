@@ -1,34 +1,30 @@
-# name: Sync agent-service from unifyai/unity
+# Sync agent-service and magnitude from unifyai/unity into each platform folder.
+#
+# Each platform folder (windows/, macos/, ubuntu/) is self-contained with its
+# own copy of agent-service/ and magnitude/. This workflow keeps them in sync
+# with the canonical source in unifyai/unity.
+
+name: Sync shared components
 
 # on:
 #   workflow_dispatch:
-#     inputs:
-#       branches:
-#         description: "Comma-separated branches to update (defaults to ubuntu,macos,win,agent-service)"
-#         required: false
-#         default: "ubuntu,macos,win,agent-service"
 #   schedule:
-#     - cron: '0 0 * * *'
+#     - cron: '0 0 * * *'   # daily at midnight UTC
 
 # permissions:
 #   contents: write
-#   pull-requests: write
 
 # jobs:
 #   sync:
 #     runs-on: ubuntu-latest
+#     strategy:
+#       matrix:
+#         platform: [windows, macos, ubuntu]
 #     steps:
-#       - name: Checkout target repository
+#       - name: Checkout this repository
 #         uses: actions/checkout@v4
-#         with:
-#           fetch-depth: 0
 
-#       - name: Fetch all branches
-#         shell: bash
-#         run: |
-#           git fetch --all --prune
-
-#       - name: Checkout unity repository (same org)
+#       - name: Checkout unifyai/unity
 #         uses: actions/checkout@v4
 #         with:
 #           repository: unifyai/unity
@@ -37,88 +33,24 @@
 #           path: _unity
 #           fetch-depth: 1
 
-#       - name: Parse branches input
-#         id: parse
-#         shell: bash
+#       - name: Copy agent-service
 #         run: |
-#           set -euo pipefail
-#           BRANCHES_INPUT="${{ github.event.inputs.branches }}"
-#           if [ -z "${BRANCHES_INPUT}" ]; then
-#             BRANCHES_INPUT="ubuntu,macos,win,agent-service"
-#           fi
-#           # Normalize and output as newline-separated list for matrix-like loop
-#           echo "branches<<EOF" >> $GITHUB_OUTPUT
-#           echo "$BRANCHES_INPUT" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -v '^$' >> $GITHUB_OUTPUT || true
-#           echo "EOF" >> $GITHUB_OUTPUT
+#           rm -rf ${{ matrix.platform }}/agent-service
+#           cp -a _unity/agent-service ${{ matrix.platform }}/agent-service
 
-#       - name: Ensure git user
+#       - name: Copy magnitude
+#         run: |
+#           rm -rf ${{ matrix.platform }}/magnitude
+#           cp -a _unity/magnitude ${{ matrix.platform }}/magnitude
+
+#       - name: Commit and push if changed
 #         run: |
 #           git config user.name "github-actions[bot]"
 #           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-#       - name: Sync loop
-#         shell: bash
-#         run: |
-#           set -euo pipefail
-
-#           while IFS= read -r BRANCH; do
-#             [ -z "$BRANCH" ] && continue
-#             echo "=== Processing branch: $BRANCH ==="
-
-#             # 0) Checkout the branch (create local tracking if necessary)
-#             if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
-#               git switch "$BRANCH"
-#             else
-#               git switch -c "$BRANCH" --track "origin/$BRANCH" || git switch -c "$BRANCH"
-#             fi
-
-#             # 1) Use the already-checked-out unity repository
-#             UNITY_DIR="_unity"
-#             echo "Using unity sources from $UNITY_DIR"
-
-#             # 2) Determine destination path per branch and copy agent-service
-#             case "$BRANCH" in
-#               macos|agent-service)
-#                 DEST_DIR="agent-service"
-#                 ;;
-#               win)
-#                 DEST_DIR="unify-desktop-assistant/tools/agent-service"
-#                 ;;
-#               ubuntu)
-#                 DEST_DIR="unify-desktop-assistant/opt/unify-desktop-assistant/agent-service"
-#                 ;;
-#               *)
-#                 echo "Unknown branch $BRANCH; skipping"
-#                 rm -rf "$TMPDIR"
-#                 continue
-#                 ;;
-#             esac
-
-#             if [ -d "$UNITY_DIR/agent-service" ]; then
-#               rm -rf "$DEST_DIR"
-#               mkdir -p "$DEST_DIR"
-#               cp -a "$UNITY_DIR/agent-service/." "$DEST_DIR"/
-#             else
-#               echo "agent-service not found in unifyai/unity; skipping branch $BRANCH"
-#               continue
-#             fi
-
-#             # 3) Add and commit only if changes exist inside destination path
-#             git add -N "$DEST_DIR" >/dev/null 2>&1 || true
-#             if ! git diff --quiet --exit-code -- "$DEST_DIR"; then
-#               git add "$DEST_DIR"
-#               COMMIT_MSG="chore(agent-service): sync from unifyai/unity@main"
-#               git commit -m "$COMMIT_MSG"
-#               echo "Committed updates on $BRANCH"
-#               # 4) Push
-#               git push origin "$BRANCH"
-#             else
-#               echo "No changes detected for $BRANCH; skipping commit"
-#               # Ensure clean index
-#               git restore --staged "$DEST_DIR" || true
-#               git checkout -- "$DEST_DIR" || true
-#             fi
-
-#           done < <(echo "${{ steps.parse.outputs.branches }}")
-
-
+#           git add ${{ matrix.platform }}/agent-service ${{ matrix.platform }}/magnitude
+#           if ! git diff --cached --quiet; then
+#             git commit -m "chore: sync agent-service & magnitude into ${{ matrix.platform }}/"
+#             git push
+#           else
+#             echo "No changes for ${{ matrix.platform }}"
+#           fi
