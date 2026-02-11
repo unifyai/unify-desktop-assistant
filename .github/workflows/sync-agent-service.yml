@@ -1,124 +1,124 @@
-name: Sync agent-service from unifyai/unity
+# name: Sync agent-service from unifyai/unity
 
-on:
-  workflow_dispatch:
-    inputs:
-      branches:
-        description: "Comma-separated branches to update (defaults to ubuntu,macos,win,agent-service)"
-        required: false
-        default: "ubuntu,macos,win,agent-service"
-  schedule:
-    - cron: '0 0 * * *'
+# on:
+#   workflow_dispatch:
+#     inputs:
+#       branches:
+#         description: "Comma-separated branches to update (defaults to ubuntu,macos,win,agent-service)"
+#         required: false
+#         default: "ubuntu,macos,win,agent-service"
+#   schedule:
+#     - cron: '0 0 * * *'
 
-permissions:
-  contents: write
-  pull-requests: write
+# permissions:
+#   contents: write
+#   pull-requests: write
 
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout target repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+# jobs:
+#   sync:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Checkout target repository
+#         uses: actions/checkout@v4
+#         with:
+#           fetch-depth: 0
 
-      - name: Fetch all branches
-        shell: bash
-        run: |
-          git fetch --all --prune
+#       - name: Fetch all branches
+#         shell: bash
+#         run: |
+#           git fetch --all --prune
 
-      - name: Checkout unity repository (same org)
-        uses: actions/checkout@v4
-        with:
-          repository: unifyai/unity
-          ref: main
-          token: ${{ secrets.CLONE_TOKEN }}
-          path: _unity
-          fetch-depth: 1
+#       - name: Checkout unity repository (same org)
+#         uses: actions/checkout@v4
+#         with:
+#           repository: unifyai/unity
+#           ref: main
+#           token: ${{ secrets.CLONE_TOKEN }}
+#           path: _unity
+#           fetch-depth: 1
 
-      - name: Parse branches input
-        id: parse
-        shell: bash
-        run: |
-          set -euo pipefail
-          BRANCHES_INPUT="${{ github.event.inputs.branches }}"
-          if [ -z "${BRANCHES_INPUT}" ]; then
-            BRANCHES_INPUT="ubuntu,macos,win,agent-service"
-          fi
-          # Normalize and output as newline-separated list for matrix-like loop
-          echo "branches<<EOF" >> $GITHUB_OUTPUT
-          echo "$BRANCHES_INPUT" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -v '^$' >> $GITHUB_OUTPUT || true
-          echo "EOF" >> $GITHUB_OUTPUT
+#       - name: Parse branches input
+#         id: parse
+#         shell: bash
+#         run: |
+#           set -euo pipefail
+#           BRANCHES_INPUT="${{ github.event.inputs.branches }}"
+#           if [ -z "${BRANCHES_INPUT}" ]; then
+#             BRANCHES_INPUT="ubuntu,macos,win,agent-service"
+#           fi
+#           # Normalize and output as newline-separated list for matrix-like loop
+#           echo "branches<<EOF" >> $GITHUB_OUTPUT
+#           echo "$BRANCHES_INPUT" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -v '^$' >> $GITHUB_OUTPUT || true
+#           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Ensure git user
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+#       - name: Ensure git user
+#         run: |
+#           git config user.name "github-actions[bot]"
+#           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Sync loop
-        shell: bash
-        run: |
-          set -euo pipefail
+#       - name: Sync loop
+#         shell: bash
+#         run: |
+#           set -euo pipefail
 
-          while IFS= read -r BRANCH; do
-            [ -z "$BRANCH" ] && continue
-            echo "=== Processing branch: $BRANCH ==="
+#           while IFS= read -r BRANCH; do
+#             [ -z "$BRANCH" ] && continue
+#             echo "=== Processing branch: $BRANCH ==="
 
-            # 0) Checkout the branch (create local tracking if necessary)
-            if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
-              git switch "$BRANCH"
-            else
-              git switch -c "$BRANCH" --track "origin/$BRANCH" || git switch -c "$BRANCH"
-            fi
+#             # 0) Checkout the branch (create local tracking if necessary)
+#             if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+#               git switch "$BRANCH"
+#             else
+#               git switch -c "$BRANCH" --track "origin/$BRANCH" || git switch -c "$BRANCH"
+#             fi
 
-            # 1) Use the already-checked-out unity repository
-            UNITY_DIR="_unity"
-            echo "Using unity sources from $UNITY_DIR"
+#             # 1) Use the already-checked-out unity repository
+#             UNITY_DIR="_unity"
+#             echo "Using unity sources from $UNITY_DIR"
 
-            # 2) Determine destination path per branch and copy agent-service
-            case "$BRANCH" in
-              macos|agent-service)
-                DEST_DIR="agent-service"
-                ;;
-              win)
-                DEST_DIR="unify-desktop-assistant/tools/agent-service"
-                ;;
-              ubuntu)
-                DEST_DIR="unify-desktop-assistant/opt/unify-desktop-assistant/agent-service"
-                ;;
-              *)
-                echo "Unknown branch $BRANCH; skipping"
-                rm -rf "$TMPDIR"
-                continue
-                ;;
-            esac
+#             # 2) Determine destination path per branch and copy agent-service
+#             case "$BRANCH" in
+#               macos|agent-service)
+#                 DEST_DIR="agent-service"
+#                 ;;
+#               win)
+#                 DEST_DIR="unify-desktop-assistant/tools/agent-service"
+#                 ;;
+#               ubuntu)
+#                 DEST_DIR="unify-desktop-assistant/opt/unify-desktop-assistant/agent-service"
+#                 ;;
+#               *)
+#                 echo "Unknown branch $BRANCH; skipping"
+#                 rm -rf "$TMPDIR"
+#                 continue
+#                 ;;
+#             esac
 
-            if [ -d "$UNITY_DIR/agent-service" ]; then
-              rm -rf "$DEST_DIR"
-              mkdir -p "$DEST_DIR"
-              cp -a "$UNITY_DIR/agent-service/." "$DEST_DIR"/
-            else
-              echo "agent-service not found in unifyai/unity; skipping branch $BRANCH"
-              continue
-            fi
+#             if [ -d "$UNITY_DIR/agent-service" ]; then
+#               rm -rf "$DEST_DIR"
+#               mkdir -p "$DEST_DIR"
+#               cp -a "$UNITY_DIR/agent-service/." "$DEST_DIR"/
+#             else
+#               echo "agent-service not found in unifyai/unity; skipping branch $BRANCH"
+#               continue
+#             fi
 
-            # 3) Add and commit only if changes exist inside destination path
-            git add -N "$DEST_DIR" >/dev/null 2>&1 || true
-            if ! git diff --quiet --exit-code -- "$DEST_DIR"; then
-              git add "$DEST_DIR"
-              COMMIT_MSG="chore(agent-service): sync from unifyai/unity@main"
-              git commit -m "$COMMIT_MSG"
-              echo "Committed updates on $BRANCH"
-              # 4) Push
-              git push origin "$BRANCH"
-            else
-              echo "No changes detected for $BRANCH; skipping commit"
-              # Ensure clean index
-              git restore --staged "$DEST_DIR" || true
-              git checkout -- "$DEST_DIR" || true
-            fi
+#             # 3) Add and commit only if changes exist inside destination path
+#             git add -N "$DEST_DIR" >/dev/null 2>&1 || true
+#             if ! git diff --quiet --exit-code -- "$DEST_DIR"; then
+#               git add "$DEST_DIR"
+#               COMMIT_MSG="chore(agent-service): sync from unifyai/unity@main"
+#               git commit -m "$COMMIT_MSG"
+#               echo "Committed updates on $BRANCH"
+#               # 4) Push
+#               git push origin "$BRANCH"
+#             else
+#               echo "No changes detected for $BRANCH; skipping commit"
+#               # Ensure clean index
+#               git restore --staged "$DEST_DIR" || true
+#               git checkout -- "$DEST_DIR" || true
+#             fi
 
-          done < <(echo "${{ steps.parse.outputs.branches }}")
+#           done < <(echo "${{ steps.parse.outputs.branches }}")
 
 
