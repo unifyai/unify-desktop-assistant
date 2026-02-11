@@ -1,0 +1,179 @@
+---
+title: 'BrowserAgent'
+description: 'The BrowserAgent class for browser automation.'
+icon: 'app-window'
+---
+
+# BrowserAgent
+
+The `BrowserAgent` is the primary class for browser automation with Magnitude. It provides a high-level, AI-powered API for controlling a web browser.
+
+An agent is created and initialized using the `startBrowserAgent` function.
+
+## `startBrowserAgent(options?)`
+
+This function creates, initializes, and returns a `BrowserAgent` instance.
+
+<RequestExample>
+```typescript Basic Usage
+import { startBrowserAgent } from 'magnitude-core';
+
+const agent = await startBrowserAgent();
+await agent.nav("https://google.com");
+// ... perform actions
+await agent.stop();
+```
+</RequestExample>
+
+<ParamField path="options" type="object">
+  An optional configuration object that can be used to customize the agent's behavior, including Playwright launch options and LLM settings. See [Agent Options](/core-concepts/agent-options) for a full reference.
+</ParamField>
+
+<Expandable title="options properties">
+  <ResponseField name="browser" type="object">
+    An object to configure the browser instance. It can contain either Playwright `launchOptions` or `contextOptions`.
+    <Expandable title="properties">
+      <ResponseField name="launchOptions" type="object">
+        Standard Playwright launch options. See the [Playwright documentation](https://playwright.dev/docs/api/class-browsertype#browser-type-launch) for a full list of options.
+        ```typescript Example: Launching with a proxy
+        const agent = await startBrowserAgent({
+          browser: {
+            launchOptions: {
+              proxy: {
+                server: 'http://my-proxy-server.com:8080'
+              }
+            }
+          }
+        });
+        ```
+      </ResponseField>
+      <ResponseField name="contextOptions" type="object">
+        Standard Playwright browser context options. See the [Playwright documentation](https://playwright.dev/docs/api/class-browser#browser-new-context) for a full list of options.
+        ```typescript Example: Setting a custom user agent
+        const agent = await startBrowserAgent({
+          browser: {
+            contextOptions: {
+              userAgent: 'MyCustomBrowser/1.0'
+            }
+          }
+        });
+        ```
+      </ResponseField>
+    </Expandable>
+  </ResponseField>
+  <ResponseField name="url" type="string">
+    An initial URL to navigate to immediately after the browser starts.
+  </ResponseField>
+  <ResponseField name="virtualScreenDimensions" type="{ width: number, height: number }">
+    Sets the resolution of the screenshot that the LLM sees. This does not change the browser's viewport size, but scales the screenshot to these dimensions. This is useful for ensuring a consistent input size for the vision model.
+  </ResponseField>
+  <ResponseField name="llm" type="object">
+    Configure the LLM to be used by the agent. See the [LLM Providers](/reference/llm-providers) documentation for details.
+  </ResponseField>
+  <ResponseField name="narrate" type="boolean">
+    If `true`, the agent will narrate its actions to the console, providing a running commentary of what it's doing.
+  </ResponseField>
+</Expandable>
+
+---
+
+## Methods
+
+### `act(description, options?)`
+
+Executes one or more browser actions based on a natural language description. Magnitude interprets the description and determines the necessary interactions (clicks, types, scrolls, etc.).
+
+<RequestExample>
+```typescript Step Examples
+// Simple step
+await agent.act("Click the main login button");
+
+// Step with data
+await agent.act("Enter {username} into the user field", {
+  data: { username: "test@example.com" }
+});
+```
+</RequestExample>
+
+<ParamField path="description" type="string" required>
+  A natural language description of the action(s) to perform. Can include placeholders like `{key}` which will be substituted by values from `options.data`.
+</ParamField>
+
+<ParamField path="options" type="object">
+  Optional parameters for the step.
+</ParamField>
+
+<Expandable title="options properties">
+  <ResponseField name="data" type="string | Record<string, string>">
+    Provides data for the step.
+    - **`string`**: A single string value.
+    - **`Record<string, string>`**: Key-value pairs where keys match placeholders in the `description`.
+  </ResponseField>
+  <ResponseField name="prompt" type="string">
+    - **`string`**: Provide additional instructions for the LLM. These are injected into the system prompt.
+  </ResponseField>
+</Expandable>
+
+### `nav(url: string)`
+
+Navigates to a URL.
+
+```typescript
+await agent.nav('https://google.com');
+```
+
+### `page` and `context`
+
+Access the underlying Playwright `Page` and `BrowserContext`.
+
+```typescript
+const page = agent.page;
+const context = agent.context;
+```
+
+### `extract(instructions, schema)`
+
+The `BrowserAgent` provides a powerful `extract()` method that uses AI to pull structured data from a webpage based on your instructions and a Zod schema.
+
+<RequestExample>
+```typescript Example: Extracting Hacker News headlines
+import { startBrowserAgent } from 'magnitude-core';
+import { z } from 'zod';
+
+const HackerNewsStory = z.object({
+  rank: z.number().describe('The story rank'),
+  title: z.string().describe('The title of the story'),
+  url: z.string().url().describe('The URL of the story'),
+});
+
+const HackerNewsSchema = z.array(HackerNewsStory);
+
+const agent = await startBrowserAgent();
+await agent.nav("https://news.ycombinator.com");
+
+const stories = await agent.extract(
+  "Extract the top 5 stories from Hacker News",
+  HackerNewsSchema
+);
+
+console.log(stories);
+await agent.stop();
+```
+</RequestExample>
+
+<ParamField path="instructions" type="string" required>
+  Natural language instructions for the AI, describing what data to extract from the page.
+</ParamField>
+
+<ParamField path="schema" type="ZodSchema" required>
+  A Zod schema that defines the structure of the data to be extracted. The AI will do its best to populate the fields of the schema based on the page content and your instructions.
+
+  <Note>
+  Adding `.describe()` calls to your schema fields can significantly improve the accuracy of the extraction by providing more context to the AI.
+  </Note>
+</ParamField>
+
+### `stop()`
+
+Closes the browser and cleans up any resources used by the agent.
+

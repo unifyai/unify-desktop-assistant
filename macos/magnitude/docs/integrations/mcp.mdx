@@ -1,0 +1,77 @@
+---
+title: 'MCP'
+description: 'Enable Cline, Cursor, or Windsurf to build and run Magnitude tests with MCP'
+icon: brain-circuit
+---
+
+Magnitude provides an official MCP server that enables AI assistants to set up projects, build test cases, and run tests with Magnitude.
+
+<Tabs>
+  <Tab title="Cline">
+    ### Marketplace Install
+
+    To install with Cline, you can find us on the official Cline Marketplace.
+
+    Go to `MCP Servers -> Marketplace`, search for `Magnitude`, click `Install` and follow the instructions!
+
+
+    ### Manual Install
+
+    Alternatively, to manually install the MCP server for Cline, follow these steps:
+
+    1. Install MCP server via npm:
+    ```
+    npm i -g magnitude-mcp
+    ```
+
+    2. Go to `MCP Servers -> Installed -> Configure MCP Servers` and add our MCP server to the JSON:
+    ```json
+    {
+        "mcpServers": {
+            "magnitude": {
+                "command": "npx",
+                "args": ["magnitude-mcp"]
+            }
+        }
+    }
+    ```
+
+    Now start a new chat with Cline and ask to set up a new project with Magnitude, build new Magnitude tests, or run tests!
+  </Tab>
+  <Tab title="Cursor">
+    1. Install MCP server via npm:
+    ```
+    npm i -g magnitude-mcp
+    ```
+    2. Open Cursor Settings, go to Features > MCP Servers
+    3. Click "+ Add new global MCP server" and enter the following code: 
+    ```json
+    {
+        "mcpServers": {
+            "magnitude": {
+                "command": "npx",
+                "args": ["magnitude-mcp"]
+            }
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Windsurf">
+    1. Install MCP server via npm:
+    ```
+    npm i -g magnitude-mcp
+    ```
+    2. Add this to your `./codeium/windsurf/model_config.json`:
+    ```json
+    {
+        "mcpServers": {
+            "magnitude": {
+                "command": "npx",
+                "args": ["magnitude-mcp"]
+            }
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+

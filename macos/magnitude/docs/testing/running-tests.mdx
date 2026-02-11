@@ -1,0 +1,32 @@
+---
+title: Running Tests
+description: "How to run test cases"
+icon: play
+---
+
+To run your Magnitude test cases, use the CLI:
+```
+npx magnitude
+```
+
+## Test in Parallel
+You can run your Magnitude tests in parallel simply by providing the `--workers` or `-w` flag with the desired number of parallel workers:
+
+```
+npx magnitude -w 4
+```
+
+If any Magnitude test fails, the CLI process will exit with status code 1. When deployed as part of a CI/CD pipeline e.g. with a GitHub Action, this will fail the deployment.
+
+## Test Failures
+
+Unlike existing frameworks like Playwright, the criteria for test case failure is not based on whether a selector fails or some expression evaluates false.
+
+Instead, Magnitude decides to fail a test case if either **(1) any act cannot be completed** or **(2) a check does not hold true**.
+
+It will attempt to execute a test case according to the provided steps and only fail if there is no clear way to accomplish the test case, or if any check isn't satisfied.
+
+
+## Integrating with CI/CD
+You can run Magnitude tests in CI anywhere that you could run Playwright tests, just include LLM client credentials.
+For instructions on running tests cases on GitHub actions, see [here](/testing/ci).

@@ -1,0 +1,30 @@
+---
+title: 'Playwright Access'
+description: 'Combine agentic flows with Playwright operations'
+icon: 'pen-tool'
+---
+
+Magnitude interacts with the browser using Playwright.
+
+The agent exposes its `BrowserContext` and the `Page` it's currently on via `agent.context` and `agent.page`.
+
+This can be useful when you need some lower-level browser interactions - for example manipulating cookies, listening to network traffic, or emulating specific keystrokes.
+
+## Example
+
+```ts
+// Inject some authorization cookies directly with browser context
+await agent.context.addCookies([{ name: 'session_id', value: 'fake-session-token', domain: 'localhost', path: '/' }]);
+
+// Mock the settings API
+await agent.page.route('**/api/user/settings', async route => {
+  await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(mockProfileData) });
+});
+
+// Manually emulate a keypress
+await agent.page.keyboard.press('ArrowRight');
+```
+
+If the agent switches tabs, `agent.page` will always refer to the agent's active tab.
+
+See Playwright's docs for [Page](https://playwright.dev/docs/api/class-page) and [BrowserContext](https://playwright.dev/docs/api/class-browsercontext) for details. 

@@ -1,0 +1,42 @@
+[
+    {
+        "variant": "type",
+        "target": "Email field",
+        "content": "test-user@magnitude.run"
+    },
+    {
+        "variant": "type",
+        "target": "Password field",
+        "content": "test"
+    },
+    {
+        "variant": "click",
+        "target": "Login button"
+    },
+    {
+        "variant": "click",
+        "target": "Companies section on left sidebar"
+    },
+    {
+        "variant": "click",
+        "target": "Add company button"
+    },
+    {
+        "variant": "type",
+        "target": "Name field",
+        "content": "Magnitude AI Inc"
+    },
+    {
+        "variant": "type",
+        "target": "Domain field",
+        "content": "https://magnitude.run"
+    },
+    {
+        "variant": "click",
+        "target": "Save button"
+    },
+    {
+        "variant": "check",
+        "description": "Magnitude AI Inc appears in the list of companies"
+    }
+]
