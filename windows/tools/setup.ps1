@@ -47,6 +47,22 @@ Write-Host ""
 # Helper Functions
 # =============================================================================
 
+# Run a native command without $ErrorActionPreference = 'Stop' killing it
+# when the command writes to stderr (git, choco, npm, pip, bun all do this).
+# Uses dot-sourcing (.) so the script block runs in THIS scope where
+# $ErrorActionPreference is already set to SilentlyContinue, and avoids
+# 2>&1 which converts stderr lines into ErrorRecord objects.
+function Invoke-NativeCommand {
+    param([scriptblock]$Command)
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        . $Command
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+}
+
 function Test-PortListening {
     param([int]$Port, [int]$TimeoutMs = 1000)
     try {
@@ -61,7 +77,11 @@ function Get-PackageJsonHash {
     param([string]$Dir)
     $pkgFile = Join-Path $Dir 'package.json'
     if (Test-Path $pkgFile) {
-        return (Get-FileHash $pkgFile -Algorithm MD5).Hash.Substring(0, 8)
+        $md5 = [System.Security.Cryptography.MD5]::Create()
+        $bytes = [System.IO.File]::ReadAllBytes($pkgFile)
+        $hash = [BitConverter]::ToString($md5.ComputeHash($bytes)).Replace("-","")
+        $md5.Dispose()
+        return $hash.Substring(0, 8)
     }
     return $null
 }
@@ -229,7 +249,7 @@ function Install-Git {
     Write-Host ""
     Write-Host "=== Installing Git ===" -ForegroundColor Cyan
     
-    choco install git -y --no-progress | Out-Host
+    Invoke-NativeCommand { choco install git -y --no-progress }
     
     # Refresh PATH
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
@@ -245,7 +265,7 @@ function Install-Python {
     Write-Host ""
     Write-Host "=== Installing Python ===" -ForegroundColor Cyan
     
-    choco install python312 -y --no-progress | Out-Host
+    Invoke-NativeCommand { choco install python312 -y --no-progress }
     
     # Refresh PATH
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
@@ -253,7 +273,7 @@ function Install-Python {
     # Upgrade pip
     $pythonExe = Find-PythonExe
     if ($pythonExe) {
-        & $pythonExe -m pip install --upgrade pip 2>&1 | Out-Null
+        Invoke-NativeCommand { & $pythonExe -m pip install --upgrade pip }
     }
     
     Write-Host "  Python installed" -ForegroundColor Green
@@ -267,7 +287,7 @@ function Install-NodeJS {
     Write-Host ""
     Write-Host "=== Installing Node.js ===" -ForegroundColor Cyan
     
-    choco install nodejs-lts -y --no-progress | Out-Host
+    Invoke-NativeCommand { choco install nodejs-lts -y --no-progress }
     
     # Refresh PATH
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
@@ -431,7 +451,7 @@ function Install-NoVNC {
         }
         
         Write-Host "  Cloning noVNC repository..."
-        git clone --depth 1 https://github.com/novnc/noVNC.git $script:NoVncDir 2>&1 | Out-Null
+        Invoke-NativeCommand { git clone --depth 1 https://github.com/novnc/noVNC.git $script:NoVncDir }
         
         if (Test-Path $vncHtml) {
             Write-Host "  noVNC cloned" -ForegroundColor Green
@@ -498,7 +518,7 @@ function Install-Websockify {
     $pythonExe = Find-PythonExe
     
     if ($pythonExe) {
-        & $pythonExe -m pip install websockify --quiet 2>&1 | Out-Null
+        Invoke-NativeCommand { & $pythonExe -m pip install websockify --quiet }
         Write-Host "  websockify installed via pip (using $pythonExe)" -ForegroundColor Green
     } else {
         throw "Python not found, cannot install websockify"
@@ -531,10 +551,10 @@ function Install-Magnitude {
         $bunExe = "$env:USERPROFILE\.bun\bin\bun.exe"
         if (Test-Path $bunExe) {
             Write-Host "  Running bun install (includes build via postinstall)..."
-            & $bunExe install 2>&1 | Out-Host
+            Invoke-NativeCommand { & $bunExe install }
         } else {
             Write-Host "  Running npm install (includes build via postinstall)..."
-            npm install 2>&1 | Out-Host
+            Invoke-NativeCommand { npm install }
         }
         
         # Verify builds succeeded
@@ -575,10 +595,10 @@ function Install-AgentService {
         Push-Location $script:AgentServiceDir
         
         Write-Host "  Installing npm dependencies..."
-        npm install 2>&1 | Out-Host
+        Invoke-NativeCommand { npm install }
         
         Write-Host "  Installing Playwright + Chromium (this may take a few minutes)..."
-        npx -y playwright@1.52.0 install --with-deps chromium 2>&1 | Out-Host
+        Invoke-NativeCommand { npx -y playwright@1.52.0 install --with-deps chromium }
         
         Save-DependenciesHash -Dir $script:AgentServiceDir
         Pop-Location
