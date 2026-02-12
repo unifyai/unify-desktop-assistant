@@ -129,7 +129,7 @@ function Test-FastMode {
     
     # Pre-provided packages (should always exist after installation)
     $preProvided = @(
-        @{ Path = (Join-Path $script:MagnitudeDir 'packages\magnitude-core\package.json'); Name = 'Magnitude' },
+        @{ Path = (Join-Path $script:MagnitudeDir 'package.json'); Name = 'Magnitude' },
         @{ Path = (Join-Path $script:AgentServiceDir 'package.json'); Name = 'AgentService' }
     )
     
@@ -285,6 +285,11 @@ function Install-Bun {
     
     try {
         powershell -Command "irm bun.sh/install.ps1 | iex" 2>&1 | Out-Null
+        
+        # Refresh PATH so bun is available in the current session
+        # (turbo reads packageManager field and looks for bun in PATH)
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+        
         Write-Host "  Bun installed" -ForegroundColor Green
     } catch {
         Write-Host "  WARNING: Bun install failed (optional)" -ForegroundColor Yellow
@@ -505,37 +510,47 @@ function Install-Magnitude {
     Write-Host ""
     Write-Host "=== Setting up Magnitude ===" -ForegroundColor Cyan
     
-    $magnitudeCoreDir = Join-Path $script:MagnitudeDir 'packages\magnitude-core'
-    
-    # Magnitude is pre-provided in the installer, no git clone needed
-    if (-not (Test-Path (Join-Path $magnitudeCoreDir 'package.json'))) {
+    # Magnitude is pre-provided in the installer as a monorepo (turbo workspace)
+    if (-not (Test-Path (Join-Path $script:MagnitudeDir 'package.json'))) {
         Write-Host "  ERROR: magnitude not found at $script:MagnitudeDir" -ForegroundColor Red
         Write-Host "  This should be included in the installer package." -ForegroundColor Red
         return
     }
     
     # Check if deps need install
-    if ((Test-DependenciesInstalled -Dir $magnitudeCoreDir) -and -not $Force) {
+    if ((Test-DependenciesInstalled -Dir $script:MagnitudeDir) -and -not $Force) {
         Write-Host "  Dependencies up-to-date" -ForegroundColor Green
     } else {
-        Write-Host "  Installing dependencies and building magnitude-core..."
+        Write-Host "  Installing dependencies and building magnitude workspace..."
         
-        Push-Location $magnitudeCoreDir
+        Push-Location $script:MagnitudeDir
         
-        # Prefer bun, fallback to npm
+        # Install at monorepo root — postinstall runs "turbo run build" which builds
+        # magnitude-extract then magnitude-core in correct dependency order
         $bunExe = "$env:USERPROFILE\.bun\bin\bun.exe"
         if (Test-Path $bunExe) {
-            & $bunExe install 2>&1 | Out-Null
+            Write-Host "  Running bun install (includes build via postinstall)..."
+            & $bunExe install 2>&1 | Out-Host
         } else {
-            npm install 2>&1 | Out-Null
+            Write-Host "  Running npm install (includes build via postinstall)..."
+            npm install 2>&1 | Out-Host
         }
         
-        npm run build 2>&1 | Out-Null
+        # Verify builds succeeded
+        # if ((Test-Path $coreDistDir) -and (Test-Path $extractDistDir)) {
+        #     Save-DependenciesHash -Dir $script:MagnitudeDir
+        #     Write-Host "  magnitude workspace built" -ForegroundColor Green
+        # } else {
+        #     Write-Host "  WARNING: magnitude build may have failed — dist/ not found" -ForegroundColor Yellow
+        #     if (-not (Test-Path $extractDistDir)) {
+        #         Write-Host "    Missing: magnitude-extract/dist/" -ForegroundColor Yellow
+        #     }
+        #     if (-not (Test-Path $coreDistDir)) {
+        #         Write-Host "    Missing: magnitude-core/dist/" -ForegroundColor Yellow
+        #     }
+        # }
         
-        Save-DependenciesHash -Dir $magnitudeCoreDir
         Pop-Location
-        
-        Write-Host "  magnitude-core built" -ForegroundColor Green
     }
 }
 
@@ -562,7 +577,7 @@ function Install-AgentService {
         npm install 2>&1 | Out-Host
         
         Write-Host "  Installing Playwright + Chromium (this may take a few minutes)..."
-        npx playwright@1.52.0 install -y --with-deps chromium 2>&1 | Out-Host
+        npx -y playwright@1.52.0 install --with-deps chromium 2>&1 | Out-Host
         
         Save-DependenciesHash -Dir $script:AgentServiceDir
         Pop-Location
