@@ -411,7 +411,7 @@ function Configure-TightVNC {
     Write-Host "  Registry settings configured" -ForegroundColor Green
     Write-Host "  Password copied to all registry paths" -ForegroundColor Green
     
-    # Disable the Windows service — we run TightVNC in app mode via scheduled task
+    # Disable the Windows service — we run TightVNC in app mode via Setup-TightVNCStartup
     # This prevents the service from auto-starting and conflicting with the app-mode instance
     Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
     Set-Service -Name "tvnserver" -StartupType Disabled -ErrorAction SilentlyContinue
@@ -701,6 +701,37 @@ objShell.Run "cmd /c """"$batFile""""", 0, False
     Write-Host "  Scheduled task created: $taskName (hidden)" -ForegroundColor Green
 }
 
+function Setup-TightVNCStartup {
+    Write-Host ""
+    Write-Host "=== Setting up TightVNC startup ===" -ForegroundColor Cyan
+    
+    $tvnExe = 'C:\Program Files\TightVNC\tvnserver.exe'
+    $vbsFile = Join-Path $script:ToolsDir 'start-tightvnc.vbs'
+    
+    if (-not (Test-Path $tvnExe)) {
+        Write-Host "  ERROR: TightVNC not found at $tvnExe" -ForegroundColor Red
+        return
+    }
+    
+    # Create VBS wrapper to run TightVNC in app mode hidden (no visible window)
+    $vbsContent = @"
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run """$tvnExe"" -run", 0, False
+"@
+    $vbsContent | Out-File -FilePath $vbsFile -Encoding ASCII
+    
+    # Create/update scheduled task for auto-start on logon (uses VBS to hide window)
+    $taskName = "UnifyTightVNC"
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    
+    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbsFile`"" -WorkingDirectory $script:ToolsDir
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
+    Write-Host "  Scheduled task created: $taskName (hidden)" -ForegroundColor Green
+}
+
 function Configure-Firewall {
     Write-Host ""
     Write-Host "=== Configuring Firewall ===" -ForegroundColor Cyan
@@ -907,6 +938,7 @@ if ($fastMode) {
 # Always run configuration
 Configure-TightVNC -Password $UnifyKey
 Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
+Setup-TightVNCStartup
 Setup-WebsockifyStartup
 Setup-AgentServiceStartup
 Configure-Firewall
