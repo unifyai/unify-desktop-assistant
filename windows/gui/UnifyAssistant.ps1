@@ -23,6 +23,7 @@ $script:AgentServiceDir = Join-Path $script:InstallDir 'agent-service'
 $script:SetupScript = Join-Path $script:ToolsDir 'setup.ps1'
 $script:EnvFile = Join-Path $script:AgentServiceDir '.env'
 $script:SettingsFile = Join-Path $script:InstallDir 'settings.json'
+$script:IconPath = Join-Path $script:InstallDir 'assets\icon.ico'
 
 # Service ports
 $script:VncPort = 5900
@@ -171,6 +172,7 @@ function Get-TrayIcon {
     $bitmap = New-Object System.Drawing.Bitmap($size, $size)
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
     
     # Background
     $graphics.Clear([System.Drawing.Color]::Transparent)
@@ -183,12 +185,37 @@ function Get-TrayIcon {
         default   { [System.Drawing.Color]::FromArgb(255, 158, 158, 158) } # Gray
     }
     
-    $brush = New-Object System.Drawing.SolidBrush($color)
-    $graphics.FillEllipse($brush, 2, 2, 12, 12)
+    # Draw logo icon if available, otherwise fall back to solid circle
+    if (Test-Path $script:IconPath) {
+        try {
+            $icon = New-Object System.Drawing.Icon($script:IconPath, $size, $size)
+            $graphics.DrawIcon($icon, 0, 0)
+            $icon.Dispose()
+        } catch {
+            # Fallback: draw solid colored circle
+            $brush = New-Object System.Drawing.SolidBrush($color)
+            $graphics.FillEllipse($brush, 2, 2, 12, 12)
+            $brush.Dispose()
+        }
+    } else {
+        # Fallback: draw solid colored circle
+        $brush = New-Object System.Drawing.SolidBrush($color)
+        $graphics.FillEllipse($brush, 2, 2, 12, 12)
+        $brush.Dispose()
+    }
     
-    # Border
-    $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 50, 50, 50), 1)
-    $graphics.DrawEllipse($pen, 2, 2, 12, 12)
+    # Draw status overlay dot (6px) in bottom-right corner
+    $dotSize = 6
+    $dotX = $size - $dotSize
+    $dotY = $size - $dotSize
+    
+    # Dark border for visibility
+    $borderPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 30, 30, 30), 1)
+    $statusBrush = New-Object System.Drawing.SolidBrush($color)
+    $graphics.FillEllipse($statusBrush, $dotX, $dotY, $dotSize - 1, $dotSize - 1)
+    $graphics.DrawEllipse($borderPen, $dotX, $dotY, $dotSize - 1, $dotSize - 1)
+    $statusBrush.Dispose()
+    $borderPen.Dispose()
     
     $graphics.Dispose()
     
