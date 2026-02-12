@@ -27,6 +27,7 @@ AppPublisherURL={#AppURL}
 AppSupportURL={#AppURL}
 AppUpdatesURL={#AppURL}
 DefaultDirName={autopf}\{#AppName}
+DisableDirPage=auto
 DisableProgramGroupPage=yes
 DefaultGroupName={#AppName}
 OutputDir=output
@@ -97,20 +98,152 @@ Type: files; Name: "{app}\agent-service\.env"
 Type: files; Name: "{app}\settings.json"
 
 [Code]
-// Configuration page variables
+// =========================================================================
+// Constants - Environment URLs
+// =========================================================================
+const
+  // Production
+  ProdOrchestraUrl = 'https://api.unify.ai/v0';
+  ProdCommsUrl = 'https://unity-comms-app-000000000000.us-central1.run.app';
+  // Staging
+  StagingOrchestraUrl = 'https://service.a.run.app/v0';
+  StagingCommsUrl = 'https://unity-comms-app-staging-000000000000.us-central1.run.app';
+
+// =========================================================================
+// Variables
+// =========================================================================
 var
   ConfigPage: TWizardPage;
   UnifyKeyEdit: TNewEdit;
-  OrchestraUrlEdit: TNewEdit;
-  UnityCommsUrlEdit: TNewEdit;
+  EnvCombo: TNewComboBox;
+  OrchestraUrlLabel: TNewStaticText;
+  CommsUrlLabel: TNewStaticText;
+  UpgradeNote: TNewStaticText;
+  ConfigPagePrefilled: Boolean;
 
-// Initialize configuration page
+// =========================================================================
+// Helper: Read a value from existing .env file
+// =========================================================================
+function ReadEnvValue(const EnvFile, Key: String): String;
+var
+  Lines: TArrayOfString;
+  I: Integer;
+  Line, Prefix: String;
+begin
+  Result := '';
+  Prefix := Key + '=';
+  if FileExists(EnvFile) then
+  begin
+    if LoadStringsFromFile(EnvFile, Lines) then
+    begin
+      for I := 0 to GetArrayLength(Lines) - 1 do
+      begin
+        Line := Trim(Lines[I]);
+        if Pos(Prefix, Line) = 1 then
+        begin
+          Result := Copy(Line, Length(Prefix) + 1, Length(Line));
+          Exit;
+        end;
+      end;
+    end;
+  end;
+end;
+
+// =========================================================================
+// Helper: Get resolved URLs based on environment selection
+// =========================================================================
+function GetResolvedOrchestraUrl: String;
+begin
+  if EnvCombo.ItemIndex = 1 then
+    Result := StagingOrchestraUrl
+  else
+    Result := ProdOrchestraUrl;
+end;
+
+function GetResolvedCommsUrl: String;
+begin
+  if EnvCombo.ItemIndex = 1 then
+    Result := StagingCommsUrl
+  else
+    Result := ProdCommsUrl;
+end;
+
+// =========================================================================
+// Helper: Detect environment from existing .env URLs
+// =========================================================================
+function DetectEnvironment(const EnvFile: String): Integer;
+var
+  OrcUrl: String;
+begin
+  // Default to Production (index 0)
+  Result := 0;
+  OrcUrl := ReadEnvValue(EnvFile, 'ORCHESTRA_URL');
+  if Pos('staging', OrcUrl) > 0 then
+    Result := 1;
+end;
+
+// =========================================================================
+// Event: Environment dropdown changed - update URL labels
+// =========================================================================
+procedure EnvComboChanged(Sender: TObject);
+begin
+  OrchestraUrlLabel.Caption := 'Orchestra URL:  ' + GetResolvedOrchestraUrl;
+  CommsUrlLabel.Caption := 'Comms URL:  ' + GetResolvedCommsUrl;
+end;
+
+// =========================================================================
+// PrepareToInstall: Stop services before upgrading files
+// =========================================================================
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  SetupScript: String;
+  ResultCode: Integer;
+begin
+  Result := '';
+  SetupScript := ExpandConstant('{app}\tools\setup.ps1');
+
+  // Only run on upgrade (existing installation)
+  if FileExists(SetupScript) then
+  begin
+    // Stop services gracefully via setup.ps1 -Stop
+    Exec('powershell.exe',
+      '-NoProfile -ExecutionPolicy Bypass -File "' + SetupScript + '" -Stop',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+    // Kill the tray app process if running (releases file locks)
+    Exec('powershell.exe',
+      '-NoProfile -Command "Get-Process -Name powershell, pwsh -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -eq '''' -and $_.CommandLine -match ''UnifyAssistant'' } | Stop-Process -Force -ErrorAction SilentlyContinue"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+    // Also kill wscript.exe running the launcher
+    Exec('taskkill.exe', '/F /IM wscript.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+end;
+
+// =========================================================================
+// InitializeWizard: Create the configuration page
+// =========================================================================
 procedure InitializeWizard();
 begin
-  // Create custom configuration page
+  ConfigPagePrefilled := False;
+
+  // Create custom configuration page (after tasks page, before ready page)
   ConfigPage := CreateCustomPage(wpSelectTasks, 'Configuration', 'Enter your Unify API credentials');
-  
-  // Unify Key label
+
+  // --- Upgrade notice (hidden by default, shown if upgrade detected) ---
+  UpgradeNote := TNewStaticText.Create(ConfigPage);
+  with UpgradeNote do
+  begin
+    Parent := ConfigPage.Surface;
+    Caption := 'Existing configuration detected - modify if needed.';
+    Left := 0;
+    Top := 0;
+    Width := ConfigPage.SurfaceWidth;
+    Font.Style := [fsBold];
+    Visible := False;
+  end;
+
+  // --- Unify Key ---
   with TNewStaticText.Create(ConfigPage) do
   begin
     Parent := ConfigPage.Surface;
@@ -119,8 +252,7 @@ begin
     Top := 8;
     Width := ConfigPage.SurfaceWidth;
   end;
-  
-  // Unify Key edit
+
   UnifyKeyEdit := TNewEdit.Create(ConfigPage);
   with UnifyKeyEdit do
   begin
@@ -129,66 +261,109 @@ begin
     Top := 28;
     Width := ConfigPage.SurfaceWidth;
   end;
-  
-  // Orchestra URL label
+
+  // --- Environment selector ---
   with TNewStaticText.Create(ConfigPage) do
   begin
     Parent := ConfigPage.Surface;
-    Caption := 'Orchestra URL (optional):';
+    Caption := 'Environment:';
     Left := 0;
     Top := 68;
     Width := ConfigPage.SurfaceWidth;
   end;
-  
-  // Orchestra URL edit
-  OrchestraUrlEdit := TNewEdit.Create(ConfigPage);
-  with OrchestraUrlEdit do
+
+  EnvCombo := TNewComboBox.Create(ConfigPage);
+  with EnvCombo do
   begin
     Parent := ConfigPage.Surface;
     Left := 0;
     Top := 88;
-    Width := ConfigPage.SurfaceWidth;
-    Text := 'https://api.unify.ai/v0';
+    Width := 200;
+    Style := csDropDownList;
+    Items.Add('Production');
+    Items.Add('Staging');
+    ItemIndex := 0;
+    OnChange := @EnvComboChanged;
   end;
-  
-  // Unity Comms URL label
-  with TNewStaticText.Create(ConfigPage) do
-  begin
-    Parent := ConfigPage.Surface;
-    Caption := 'Unity Comms URL (optional):';
-    Left := 0;
-    Top := 128;
-    Width := ConfigPage.SurfaceWidth;
-  end;
-  
-  // Unity Comms URL edit
-  UnityCommsUrlEdit := TNewEdit.Create(ConfigPage);
-  with UnityCommsUrlEdit do
+
+  // --- Read-only URL display labels ---
+  OrchestraUrlLabel := TNewStaticText.Create(ConfigPage);
+  with OrchestraUrlLabel do
   begin
     Parent := ConfigPage.Surface;
     Left := 0;
-    Top := 148;
+    Top := 122;
     Width := ConfigPage.SurfaceWidth;
-    Text := 'https://unity-comms-app-000000000000.us-central1.run.app';
+    Font.Color := clGray;
   end;
-  
-  // Help text
+
+  CommsUrlLabel := TNewStaticText.Create(ConfigPage);
+  with CommsUrlLabel do
+  begin
+    Parent := ConfigPage.Surface;
+    Left := 0;
+    Top := 142;
+    Width := ConfigPage.SurfaceWidth;
+    Font.Color := clGray;
+  end;
+
+  // Set initial URL label text
+  EnvComboChanged(nil);
+
+  // --- Help text ---
   with TNewStaticText.Create(ConfigPage) do
   begin
     Parent := ConfigPage.Surface;
     Caption := 'You can change these settings later from the tray icon menu.';
     Left := 0;
-    Top := 190;
+    Top := 176;
     Width := ConfigPage.SurfaceWidth;
     Font.Style := [fsItalic];
   end;
 end;
 
+// =========================================================================
+// CurPageChanged: Pre-fill config from existing .env on upgrade
+// (called when each wizard page is shown - {app} is available by now)
+// =========================================================================
+procedure CurPageChanged(CurPageID: Integer);
+var
+  EnvFile: String;
+  ExistingKey: String;
+  DetectedEnv: Integer;
+begin
+  if (CurPageID = ConfigPage.ID) and (not ConfigPagePrefilled) then
+  begin
+    ConfigPagePrefilled := True;
+
+    // Now {app} is safe to expand (dir page has been passed or auto-skipped)
+    EnvFile := ExpandConstant('{app}\agent-service\.env');
+
+    if FileExists(EnvFile) then
+    begin
+      // Show upgrade notice
+      UpgradeNote.Visible := True;
+
+      // Pre-fill API key
+      ExistingKey := ReadEnvValue(EnvFile, 'UNIFY_KEY');
+      if ExistingKey <> '' then
+        UnifyKeyEdit.Text := ExistingKey;
+
+      // Auto-select environment based on existing URLs
+      DetectedEnv := DetectEnvironment(EnvFile);
+      EnvCombo.ItemIndex := DetectedEnv;
+      EnvComboChanged(nil);
+    end;
+  end;
+end;
+
+// =========================================================================
 // Validate configuration before proceeding
+// =========================================================================
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-  
+
   if CurPageID = ConfigPage.ID then
   begin
     if Trim(UnifyKeyEdit.Text) = '' then
@@ -199,28 +374,36 @@ begin
   end;
 end;
 
+// =========================================================================
 // Save configuration after install
+// =========================================================================
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   EnvFile: String;
   EnvContent: String;
+  SettingsFile: String;
 begin
   if CurStep = ssPostInstall then
   begin
-    // Create .env file with user configuration
     EnvFile := ExpandConstant('{app}\agent-service\.env');
+    SettingsFile := ExpandConstant('{app}\settings.json');
+
+    // Always write .env (fresh install or upgrade - URLs may have changed)
     EnvContent := 'PORT=3000' + Chr(13) + Chr(10) +
                   'UNIFY_KEY=' + UnifyKeyEdit.Text + Chr(13) + Chr(10) +
-                  'ORCHESTRA_URL=' + OrchestraUrlEdit.Text + Chr(13) + Chr(10) +
-                  'UNITY_COMMS_URL=' + UnityCommsUrlEdit.Text + Chr(13) + Chr(10);
+                  'ORCHESTRA_URL=' + GetResolvedOrchestraUrl + Chr(13) + Chr(10) +
+                  'UNITY_COMMS_URL=' + GetResolvedCommsUrl + Chr(13) + Chr(10);
     SaveStringToFile(EnvFile, EnvContent, False);
-    
-    // Also save settings.json for the GUI
-    SaveStringToFile(ExpandConstant('{app}\settings.json'), '{"AutoStartServices": true}', False);
+
+    // Only create settings.json on fresh install (preserve existing user prefs)
+    if not FileExists(SettingsFile) then
+      SaveStringToFile(SettingsFile, '{"AutoStartServices": true}', False);
   end;
 end;
 
+// =========================================================================
 // Scripted constants for [Run] section to pass config values to setup.ps1
+// =========================================================================
 function GetUnifyKey(Param: String): String;
 begin
   Result := UnifyKeyEdit.Text;
@@ -228,15 +411,17 @@ end;
 
 function GetOrchestraUrl(Param: String): String;
 begin
-  Result := OrchestraUrlEdit.Text;
+  Result := GetResolvedOrchestraUrl;
 end;
 
 function GetUnityCommsUrl(Param: String): String;
 begin
-  Result := UnityCommsUrlEdit.Text;
+  Result := GetResolvedCommsUrl;
 end;
 
-// Check if running as admin
+// =========================================================================
+// InitializeSetup
+// =========================================================================
 function InitializeSetup(): Boolean;
 begin
   Result := True;
