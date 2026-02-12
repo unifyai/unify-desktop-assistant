@@ -361,7 +361,7 @@ function Configure-TightVNC {
     } catch {}
     
     if (-not $encryptedPwd) {
-        # MSI didn't write the password yet — start the service briefly to let TightVNC initialize it
+        # MSI didn't write the password yet - start the service briefly to let TightVNC initialize it
         Write-Host "  Password not in registry, initializing via service start..." -ForegroundColor Gray
         try {
             Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
@@ -377,7 +377,7 @@ function Configure-TightVNC {
     
     if (-not $encryptedPwd) {
         Write-Host "  WARNING: Could not read TightVNC password from registry" -ForegroundColor Yellow
-        Write-Host "  VNC authentication may fail — check HKLM:\SOFTWARE\TightVNC\Server" -ForegroundColor Yellow
+        Write-Host "  VNC authentication may fail - check HKLM:\SOFTWARE\TightVNC\Server" -ForegroundColor Yellow
         return
     }
     
@@ -411,7 +411,7 @@ function Configure-TightVNC {
     Write-Host "  Registry settings configured" -ForegroundColor Green
     Write-Host "  Password copied to all registry paths" -ForegroundColor Green
     
-    # Disable the Windows service — we run TightVNC in app mode via Setup-TightVNCStartup
+    # Disable the Windows service - we run TightVNC in app mode via Setup-TightVNCStartup
     # This prevents the service from auto-starting and conflicting with the app-mode instance
     Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
     Set-Service -Name "tvnserver" -StartupType Disabled -ErrorAction SilentlyContinue
@@ -526,7 +526,7 @@ function Install-Magnitude {
         
         Push-Location $script:MagnitudeDir
         
-        # Install at monorepo root — postinstall runs "turbo run build" which builds
+        # Install at monorepo root - postinstall runs "turbo run build" which builds
         # magnitude-extract then magnitude-core in correct dependency order
         $bunExe = "$env:USERPROFILE\.bun\bin\bun.exe"
         if (Test-Path $bunExe) {
@@ -542,7 +542,7 @@ function Install-Magnitude {
         #     Save-DependenciesHash -Dir $script:MagnitudeDir
         #     Write-Host "  magnitude workspace built" -ForegroundColor Green
         # } else {
-        #     Write-Host "  WARNING: magnitude build may have failed — dist/ not found" -ForegroundColor Yellow
+        #     Write-Host "  WARNING: magnitude build may have failed - dist/ not found" -ForegroundColor Yellow
         #     if (-not (Test-Path $extractDistDir)) {
         #         Write-Host "    Missing: magnitude-extract/dist/" -ForegroundColor Yellow
         #     }

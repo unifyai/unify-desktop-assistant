@@ -77,7 +77,9 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename:
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "UnifyDesktopAssistant"; ValueData: """{app}\{#AppExeName}"""; Flags: uninsdeletevalue
 
 [Run]
-; Run initial setup with configuration dialog
+; Install all dependencies during setup (runs after .env is written by CurStepChanged)
+Filename: "cmd.exe"; Parameters: "/k powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -UnifyKey ""{code:GetUnifyKey}"" -OrchestraUrl ""{code:GetOrchestraUrl}"" -UnityCommsUrl ""{code:GetUnityCommsUrl}"""; StatusMsg: "Installing dependencies (this may take several minutes)..."; Flags: waituntilterminated
+; Launch tray app after install
 Filename: "wscript.exe"; Parameters: """{app}\{#AppExeName}"""; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runhidden
 
 [UninstallRun]
@@ -215,6 +217,22 @@ begin
     // Also save settings.json for the GUI
     SaveStringToFile(ExpandConstant('{app}\settings.json'), '{"AutoStartServices": true}', False);
   end;
+end;
+
+// Scripted constants for [Run] section to pass config values to setup.ps1
+function GetUnifyKey(Param: String): String;
+begin
+  Result := UnifyKeyEdit.Text;
+end;
+
+function GetOrchestraUrl(Param: String): String;
+begin
+  Result := OrchestraUrlEdit.Text;
+end;
+
+function GetUnityCommsUrl(Param: String): String;
+begin
+  Result := UnityCommsUrlEdit.Text;
 end;
 
 // Check if running as admin

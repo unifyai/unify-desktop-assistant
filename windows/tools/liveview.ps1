@@ -115,5 +115,5 @@ cloudflared tunnel --url "http://localhost:$LocalPort/vnc.html?resize=scale&auto
 #   & cloudflared tunnel route dns "$TunnelName" "$Hostname" | Out-Host
 # } catch {}
 
-# Write-Host "[tunnel] Running tunnel '$TunnelName' for https://$Hostname → http://localhost:$LocalPort"
+# Write-Host "[tunnel] Running tunnel '$TunnelName' for https://$Hostname -> http://localhost:$LocalPort"
 # & cloudflared tunnel run "$TunnelName"
