@@ -1,0 +1,24 @@
+Template: unify-desktop-assistant/unify-key
+Type: string
+Default:
+Description: Unify API Key
+ Enter your Unify API key. This key is used to authenticate with the Unify
+ platform and is also used as the VNC password for the desktop viewer.
+ .
+ You can change this later from the system tray icon menu (Settings).
+
+Template: unify-desktop-assistant/orchestra-url
+Type: string
+Default: https://api.unify.ai/v0
+Description: Orchestra URL
+ The URL for the Unify Orchestra API endpoint.
+ .
+ Leave as default unless you know you need a different endpoint.
+
+Template: unify-desktop-assistant/unity-comms-url
+Type: string
+Default: https://unity-comms-app-000000000000.us-central1.run.app
+Description: Unity Comms URL
+ The URL for the Unity Communications service.
+ .
+ Leave as default unless you know you need a different endpoint.

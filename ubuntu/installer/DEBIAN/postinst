@@ -1,0 +1,51 @@
+#!/bin/bash
+# postinst - Post-installation script
+# Runs setup.sh to install all dependencies and configure services.
+
+set -e
+
+APP_DIR="/opt/unify-desktop-assistant"
+SETUP_SCRIPT="$APP_DIR/tools/setup.sh"
+
+case "$1" in
+    configure)
+        # Source debconf
+        . /usr/share/debconf/confmodule
+
+        # Get values from debconf
+        db_get unify-desktop-assistant/unify-key
+        UNIFY_KEY="$RET"
+
+        db_get unify-desktop-assistant/orchestra-url
+        ORCHESTRA_URL="${RET:-https://api.unify.ai/v0}"
+
+        db_get unify-desktop-assistant/unity-comms-url
+        UNITY_COMMS_URL="${RET:-https://unity-comms-app-000000000000.us-central1.run.app}"
+
+        # Ensure setup script is executable
+        chmod +x "$SETUP_SCRIPT"
+
+        # Run the consolidated setup script
+        echo "Running Unify Desktop Assistant setup..."
+        "$SETUP_SCRIPT" \
+            --unify-key "$UNIFY_KEY" \
+            --orchestra-url "$ORCHESTRA_URL" \
+            --unity-comms-url "$UNITY_COMMS_URL" || {
+            echo "WARNING: Setup encountered errors. You can re-run manually:" >&2
+            echo "  sudo $SETUP_SCRIPT --unify-key YOUR_KEY" >&2
+        }
+
+        # Stop debconf to avoid holding the pipe
+        db_stop || true
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
