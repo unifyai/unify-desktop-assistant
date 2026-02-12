@@ -201,15 +201,15 @@ function Update-TrayStatus {
     if ($status.AllRunning) {
         $script:NotifyIcon.Icon = Get-TrayIcon -Status "running"
         $script:NotifyIcon.Text = "$($script:AppName)`nStatus: Running"
-        $script:StatusMenuItem.Text = "Status: ● Running"
+        $script:StatusMenuItem.Text = "Status: Running"
     } elseif ($status.AnyRunning) {
         $script:NotifyIcon.Icon = Get-TrayIcon -Status "partial"
         $script:NotifyIcon.Text = "$($script:AppName)`nStatus: Partial"
-        $script:StatusMenuItem.Text = "Status: ◐ Partial"
+        $script:StatusMenuItem.Text = "Status: Partial"
     } else {
         $script:NotifyIcon.Icon = Get-TrayIcon -Status "stopped"
         $script:NotifyIcon.Text = "$($script:AppName)`nStatus: Stopped"
-        $script:StatusMenuItem.Text = "Status: ○ Stopped"
+        $script:StatusMenuItem.Text = "Status: Stopped"
     }
 }
 
@@ -397,7 +397,7 @@ $contextMenu.Items.Add($titleItem) | Out-Null
 
 # Status
 $script:StatusMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
-$script:StatusMenuItem.Text = "Status: ○ Stopped"
+$script:StatusMenuItem.Text = "Status: Stopped"
 $script:StatusMenuItem.Enabled = $false
 $contextMenu.Items.Add($script:StatusMenuItem) | Out-Null
 
@@ -406,13 +406,13 @@ $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | O
 
 # Start Services
 $startItem = New-Object System.Windows.Forms.ToolStripMenuItem
-$startItem.Text = "▶ Start Services"
+$startItem.Text = "Start Services"
 $startItem.Add_Click({ Start-Services })
 $contextMenu.Items.Add($startItem) | Out-Null
 
 # Stop Services
 $stopItem = New-Object System.Windows.Forms.ToolStripMenuItem
-$stopItem.Text = "■ Stop Services"
+$stopItem.Text = "Stop Services"
 $stopItem.Add_Click({ Stop-Services })
 $contextMenu.Items.Add($stopItem) | Out-Null
 
@@ -421,7 +421,7 @@ $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | O
 
 # Open Desktop
 $desktopItem = New-Object System.Windows.Forms.ToolStripMenuItem
-$desktopItem.Text = "🖥 Open Desktop Viewer"
+$desktopItem.Text = "Open Desktop Viewer"
 $desktopItem.Add_Click({
     $key = Get-EnvValue -Key "UNIFY_KEY"
     $url = "http://localhost:$($script:NoVncPort)/custom.html"
@@ -432,7 +432,7 @@ $contextMenu.Items.Add($desktopItem) | Out-Null
 
 # Open API
 $apiItem = New-Object System.Windows.Forms.ToolStripMenuItem
-$apiItem.Text = "🔗 Open API (localhost:$($script:AgentPort))"
+$apiItem.Text = "Open API (localhost:$($script:AgentPort))"
 $apiItem.Add_Click({
     Start-Process "http://localhost:$($script:AgentPort)"
 })
@@ -443,13 +443,13 @@ $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | O
 
 # Settings
 $settingsItem = New-Object System.Windows.Forms.ToolStripMenuItem
-$settingsItem.Text = "⚙ Settings..."
+$settingsItem.Text = "Settings..."
 $settingsItem.Add_Click({ Show-SettingsDialog })
 $contextMenu.Items.Add($settingsItem) | Out-Null
 
 # View Logs
 $logsItem = New-Object System.Windows.Forms.ToolStripMenuItem
-$logsItem.Text = "📋 View Logs..."
+$logsItem.Text = "View Logs..."
 $logsItem.Add_Click({ Show-LogViewer })
 $contextMenu.Items.Add($logsItem) | Out-Null
 
@@ -458,7 +458,7 @@ $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | O
 
 # Exit
 $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem
-$exitItem.Text = "❌ Exit"
+$exitItem.Text = "Exit"
 $exitItem.Add_Click({
     $script:NotifyIcon.Visible = $false
     $script:NotifyIcon.Dispose()
