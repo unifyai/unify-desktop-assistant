@@ -87,6 +87,38 @@ function Save-DependenciesHash {
     }
 }
 
+function Find-PythonExe {
+    # Search for the real Python binary, avoiding the Windows Store stub
+    # (WindowsApps\python.exe redirects to the Microsoft Store and is not usable)
+    
+    $searchPaths = @(
+        'C:\Program Files\Python312\python.exe',
+        'C:\Program Files\Python311\python.exe',
+        'C:\Program Files\Python310\python.exe',
+        'C:\Python312\python.exe',
+        'C:\Python311\python.exe',
+        'C:\Python310\python.exe',
+        "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+        "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
+        "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
+    )
+    
+    foreach ($p in $searchPaths) {
+        if (Test-Path $p) { return $p }
+    }
+    
+    # Fallback: use where.exe to find python, filtering out the MS Store stub
+    try {
+        $candidates = & where.exe python 2>$null
+        if ($candidates) {
+            foreach ($c in $candidates) {
+                if ($c -notlike '*WindowsApps*') { return $c }
+            }
+        }
+    } catch {}
+    
+    return $null
+}
 
 # =============================================================================
 # Fast Mode Detection
@@ -205,8 +237,7 @@ function Install-Git {
 }
 
 function Install-Python {
-    $pythonExe = 'C:\Program Files\Python312\python.exe'
-    if ((Test-Path $pythonExe) -or (Get-Command python -ErrorAction SilentlyContinue)) {
+    if (Find-PythonExe) {
         return
     }
     
@@ -219,7 +250,8 @@ function Install-Python {
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
     
     # Upgrade pip
-    if (Test-Path $pythonExe) {
+    $pythonExe = Find-PythonExe
+    if ($pythonExe) {
         & $pythonExe -m pip install --upgrade pip 2>&1 | Out-Null
     }
     
@@ -306,10 +338,46 @@ function Install-TightVNC {
     } else {
         Write-Host "  TightVNC already installed" -ForegroundColor Green
     }
+}
+
+function Configure-TightVNC {
+    param([string]$Password = "unify123")
     
-    # Configure TightVNC registry settings (both HKLM and HKCU for service and app mode)
-    Write-Host "  Configuring TightVNC settings..."
+    Write-Host ""
+    Write-Host "=== Configuring TightVNC ===" -ForegroundColor Cyan
     
+    $hklmPath = 'HKLM:\SOFTWARE\TightVNC\Server'
+    
+    # Read the MSI-written encrypted password from HKLM (TightVNC's own encryption)
+    $encryptedPwd = $null
+    try {
+        $encryptedPwd = Get-ItemPropertyValue -Path $hklmPath -Name 'Password' -ErrorAction Stop
+    } catch {}
+    
+    if (-not $encryptedPwd) {
+        # MSI didn't write the password yet — start the service briefly to let TightVNC initialize it
+        Write-Host "  Password not in registry, initializing via service start..." -ForegroundColor Gray
+        try {
+            Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
+            Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
+        } catch {}
+        
+        try {
+            $encryptedPwd = Get-ItemPropertyValue -Path $hklmPath -Name 'Password' -ErrorAction Stop
+        } catch {}
+    }
+    
+    if (-not $encryptedPwd) {
+        Write-Host "  WARNING: Could not read TightVNC password from registry" -ForegroundColor Yellow
+        Write-Host "  VNC authentication may fail — check HKLM:\SOFTWARE\TightVNC\Server" -ForegroundColor Yellow
+        return
+    }
+    
+    Write-Host "  Read encrypted password from HKLM ($($encryptedPwd.Length) bytes)" -ForegroundColor Gray
+    
+    # Copy the MSI-written password + settings to all registry paths
     $regPaths = @(
         'HKLM:\SOFTWARE\TightVNC\Server',
         'HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server',
@@ -328,36 +396,14 @@ function Install-TightVNC {
         Set-ItemProperty -Path $regPath -Name 'UseVncAuthentication' -Value 1 -Type DWord -Force
         Set-ItemProperty -Path $regPath -Name 'QueryIfNoPassword' -Value 0 -Type DWord -Force
         Set-ItemProperty -Path $regPath -Name 'RfbPort' -Value 5900 -Type DWord -Force
+        
+        # Copy MSI-encrypted password (TightVNC's own format, guaranteed correct)
+        Set-ItemProperty -Path $regPath -Name 'Password' -Value ([byte[]]$encryptedPwd) -Type Binary -Force
+        Set-ItemProperty -Path $regPath -Name 'ControlPassword' -Value ([byte[]]$encryptedPwd) -Type Binary -Force
     }
     
     Write-Host "  Registry settings configured" -ForegroundColor Green
-    
-    # Copy encrypted password from HKLM to HKCU (for app-mode operation)
-    $hklmPath = 'HKLM:\SOFTWARE\TightVNC\Server'
-    $hkcuPath = 'HKCU:\SOFTWARE\TightVNC\Server'
-    $passwordExists = (Get-ItemProperty -Path $hkcuPath -Name 'Password' -ErrorAction SilentlyContinue).Password
-    
-    if (-not $passwordExists) {
-        Write-Host "  Configuring password for app-mode..."
-        
-        # Start service briefly to initialize password in registry
-        Set-Service -Name "tvnserver" -StartupType Manual -ErrorAction SilentlyContinue
-        Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 1
-        
-        # Copy encrypted password bytes from HKLM to HKCU
-        try {
-            $passwordBytes = Get-ItemPropertyValue -Path $hklmPath -Name 'Password' -ErrorAction Stop
-            Set-ItemProperty -Path $hkcuPath -Name 'Password' -Value $passwordBytes -Type Binary -Force
-            $controlPwdBytes = Get-ItemPropertyValue -Path $hklmPath -Name 'ControlPassword' -ErrorAction Stop
-            Set-ItemProperty -Path $hkcuPath -Name 'ControlPassword' -Value $controlPwdBytes -Type Binary -Force
-            Write-Host "  Password configured automatically" -ForegroundColor Green
-        } catch {
-            Write-Host "  WARNING: Password copy failed - $_" -ForegroundColor Yellow
-        }
-    } else {
-        Write-Host "  Password already configured" -ForegroundColor Green
-    }
+    Write-Host "  Password copied to all registry paths" -ForegroundColor Green
     
     # Disable the Windows service — we run TightVNC in app mode via scheduled task
     # This prevents the service from auto-starting and conflicting with the app-mode instance
@@ -443,14 +489,11 @@ function Install-Websockify {
     Write-Host ""
     Write-Host "=== Installing websockify ===" -ForegroundColor Cyan
     
-    $pythonExe = 'C:\Program Files\Python312\python.exe'
-    if (-not (Test-Path $pythonExe)) {
-        $pythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
-    }
+    $pythonExe = Find-PythonExe
     
-    if ($pythonExe -and (Test-Path $pythonExe)) {
+    if ($pythonExe) {
         & $pythonExe -m pip install websockify --quiet 2>&1 | Out-Null
-        Write-Host "  websockify installed via pip" -ForegroundColor Green
+        Write-Host "  websockify installed via pip (using $pythonExe)" -ForegroundColor Green
     } else {
         throw "Python not found, cannot install websockify"
     }
@@ -513,12 +556,13 @@ function Install-AgentService {
     if ((Test-DependenciesInstalled -Dir $script:AgentServiceDir) -and -not $Force) {
         Write-Host "  Dependencies up-to-date" -ForegroundColor Green
     } else {
-        Write-Host "  Installing dependencies..."
-        
         Push-Location $script:AgentServiceDir
         
-        npm install 2>&1 | Out-Null
-        npx playwright@1.52.0 install --with-deps chromium 2>&1 | Out-Null
+        Write-Host "  Installing npm dependencies..."
+        npm install 2>&1 | Out-Host
+        
+        Write-Host "  Installing Playwright + Chromium (this may take a few minutes)..."
+        npx playwright@1.52.0 install -y --with-deps chromium 2>&1 | Out-Host
         
         Save-DependenciesHash -Dir $script:AgentServiceDir
         Pop-Location
@@ -564,11 +608,8 @@ function Setup-WebsockifyStartup {
     
     $batFile = Join-Path $script:NoVncDir 'start-websockify.bat'
     
-    # Find Python
-    $pythonExe = 'C:\Program Files\Python312\python.exe'
-    if (-not (Test-Path $pythonExe)) {
-        $pythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
-    }
+    # Find Python (avoid MS Store stub)
+    $pythonExe = Find-PythonExe
     
     if (-not $pythonExe) {
         Write-Host "  ERROR: Python not found" -ForegroundColor Red
@@ -576,10 +617,11 @@ function Setup-WebsockifyStartup {
     }
     
     # Create startup script - CRITICAL: localhost:5900 (not hardcoded IP)
+    $wsLog = Join-Path $script:NoVncDir 'websockify.log'
     $websockifyScript = @"
 @echo off
 cd /d "$($script:NoVncDir)"
-"$pythonExe" -m websockify --web "$($script:NoVncDir)" 6080 localhost:5900
+"$pythonExe" -m websockify --web "$($script:NoVncDir)" 6080 localhost:5900 > "$wsLog" 2>&1
 "@
     
     $websockifyScript | Out-File -FilePath $batFile -Encoding ASCII
@@ -607,10 +649,11 @@ function Setup-AgentServiceStartup {
     $batFile = Join-Path $script:AgentServiceDir 'start-agent.bat'
     
     # Create startup script
+    $agentLog = Join-Path $script:AgentServiceDir 'agent.log'
     $agentScript = @"
 @echo off
 cd /d "$($script:AgentServiceDir)"
-npx ts-node src/index.ts >> "$($script:AgentServiceDir)\agent.log" 2>&1
+npx -y ts-node src/index.ts > "$agentLog" 2>&1
 "@
     
     $agentScript | Out-File -FilePath $batFile -Encoding ASCII
@@ -675,49 +718,88 @@ function Start-AllServices {
         try { & $tvnExe -controlapp -reload 2>&1 | Out-Null } catch {}
     }
     
-    # Start websockify
+    # Start websockify directly via cmd.exe with log redirection
+    $wsLog = Join-Path $script:NoVncDir 'websockify.log'
     if (-not (Test-PortListening -Port 6080)) {
-        $batFile = Join-Path $script:NoVncDir 'start-websockify.bat'
-        if (Test-Path $batFile) {
-            Write-Host "  Starting websockify..." -ForegroundColor Gray
-            Start-Process -FilePath $batFile -WorkingDirectory $script:NoVncDir -WindowStyle Hidden
+        $pythonExe = Find-PythonExe
+        
+        if ($pythonExe) {
+            Write-Host "  Starting websockify (using $pythonExe)..." -ForegroundColor Gray
+            Start-Process cmd.exe -ArgumentList "/c `"`"$pythonExe`" -m websockify --web `"$($script:NoVncDir)`" 6080 localhost:5900 > `"$wsLog`" 2>&1`"" -WindowStyle Hidden
+        } else {
+            Write-Host "  ERROR: Python not found, cannot start websockify" -ForegroundColor Red
         }
     }
     
-    # Start Agent Service
+    # Start Agent Service directly via cmd.exe with log redirection
+    $agentLog = Join-Path $script:AgentServiceDir 'agent.log'
     if (-not (Test-PortListening -Port 3000)) {
-        $batFile = Join-Path $script:AgentServiceDir 'start-agent.bat'
-        if (Test-Path $batFile) {
-            Write-Host "  Starting Agent Service..." -ForegroundColor Gray
-            Start-Process -FilePath $batFile -WorkingDirectory $script:AgentServiceDir -WindowStyle Hidden
-        }
+        Write-Host "  Starting Agent Service..." -ForegroundColor Gray
+        Start-Process cmd.exe -ArgumentList "/c cd /d `"$($script:AgentServiceDir)`" && npx -y ts-node src/index.ts > `"$agentLog`" 2>&1" -WindowStyle Hidden
     }
     
-    # Wait for services to start
+    # Poll for services to come up (up to 20 seconds)
     Write-Host ""
-    Write-Host "  Waiting for services..." -ForegroundColor Gray
-    Start-Sleep -Seconds 3
+    Write-Host "  Waiting for services to start..." -ForegroundColor Gray
     
-    # Verify
+    $maxWait = 20
+    $waited = 0
+    while ($waited -lt $maxWait) {
+        Start-Sleep -Seconds 2
+        $waited += 2
+        
+        $vncUp = Test-PortListening -Port 5900
+        $wsUp = Test-PortListening -Port 6080
+        $agentUp = Test-PortListening -Port 3000
+        
+        if ($vncUp -and $wsUp -and $agentUp) { break }
+        
+        # Progress indicator
+        $status = @()
+        if (-not $vncUp) { $status += "VNC" }
+        if (-not $wsUp) { $status += "websockify" }
+        if (-not $agentUp) { $status += "agent" }
+        Write-Host "  Waiting ($waited`s): $($status -join ', ')..." -ForegroundColor Gray
+    }
+    
+    # Final status report
     Write-Host ""
     Write-Host "Service Status:" -ForegroundColor Cyan
+    
+    $allOk = $true
     
     if (Test-PortListening -Port 5900) {
         Write-Host "  [OK] TightVNC (port 5900)" -ForegroundColor Green
     } else {
-        Write-Host "  [--] TightVNC (port 5900) - starting..." -ForegroundColor Yellow
+        Write-Host "  [FAIL] TightVNC (port 5900)" -ForegroundColor Red
+        $allOk = $false
     }
     
     if (Test-PortListening -Port 6080) {
         Write-Host "  [OK] websockify (port 6080)" -ForegroundColor Green
     } else {
-        Write-Host "  [--] websockify (port 6080) - starting..." -ForegroundColor Yellow
+        Write-Host "  [FAIL] websockify (port 6080)" -ForegroundColor Red
+        $allOk = $false
+        if (Test-Path $wsLog) {
+            Write-Host "  Log ($wsLog):" -ForegroundColor Gray
+            Get-Content $wsLog -Tail 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+        }
     }
     
     if (Test-PortListening -Port 3000) {
         Write-Host "  [OK] Agent Service (port 3000)" -ForegroundColor Green
     } else {
-        Write-Host "  [--] Agent Service (port 3000) - starting..." -ForegroundColor Yellow
+        Write-Host "  [FAIL] Agent Service (port 3000)" -ForegroundColor Red
+        $allOk = $false
+        if (Test-Path $agentLog) {
+            Write-Host "  Log ($agentLog):" -ForegroundColor Gray
+            Get-Content $agentLog -Tail 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+        }
+    }
+    
+    if (-not $allOk) {
+        Write-Host ""
+        Write-Host "  Some services failed to start. Check the log files above for details." -ForegroundColor Yellow
     }
 }
 
@@ -796,6 +878,7 @@ if ($fastMode) {
 }
 
 # Always run configuration
+Configure-TightVNC -Password $UnifyKey
 Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl
 Setup-WebsockifyStartup
 Setup-AgentServiceStartup
