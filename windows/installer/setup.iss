@@ -50,7 +50,6 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "autostart"; Description: "Start automatically when Windows starts"; GroupDescription: "Startup options:"; Flags: checkedonce
 
 [Files]
 ; Core application files
@@ -74,8 +73,8 @@ Name: "{autoprograms}\{#AppName} Settings"; Filename: "powershell.exe"; Paramete
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\assets\icon.ico"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Registry]
-; Auto-start on login (optional task)
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "UnifyDesktopAssistant"; ValueData: """{app}\{#AppExeName}"""; Flags: uninsdeletevalue; Tasks: autostart
+; Auto-start on login (always enabled)
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "UnifyDesktopAssistant"; ValueData: """{app}\{#AppExeName}"""; Flags: uninsdeletevalue
 
 [Run]
 ; Run initial setup with configuration dialog
@@ -126,7 +125,6 @@ begin
     Left := 0;
     Top := 28;
     Width := ConfigPage.SurfaceWidth;
-    PasswordChar := '*';
   end;
   
   // Orchestra URL label
@@ -215,7 +213,7 @@ begin
     SaveStringToFile(EnvFile, EnvContent, False);
     
     // Also save settings.json for the GUI
-    SaveStringToFile(ExpandConstant('{app}\settings.json'), '{"AutoStartServices": false}', False);
+    SaveStringToFile(ExpandConstant('{app}\settings.json'), '{"AutoStartServices": true}', False);
   end;
 end;
 
