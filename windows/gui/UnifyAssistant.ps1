@@ -147,8 +147,8 @@ function Start-Services {
     }
     
     # Run setup.ps1 in background
-    $args = "-UnifyKey `"$UnifyKey`" -OrchestraUrl `"$OrchestraUrl`""
-    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$($script:SetupScript)`" $args" -WindowStyle Hidden
+    $setupArgs = "-UnifyKey `"$UnifyKey`" -OrchestraUrl `"$OrchestraUrl`""
+    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$($script:SetupScript)`" $setupArgs" -WindowStyle Hidden
 }
 
 function Stop-Services {

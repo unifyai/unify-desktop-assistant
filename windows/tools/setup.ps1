@@ -359,22 +359,25 @@ function Install-TightVNC {
         Write-Host "  Password already configured" -ForegroundColor Green
     }
     
-    # Set service to automatic startup
-    Set-Service -Name "tvnserver" -StartupType Automatic -ErrorAction SilentlyContinue
-    Write-Host "  TightVNC configured" -ForegroundColor Green
+    # Disable the Windows service — we run TightVNC in app mode via scheduled task
+    # This prevents the service from auto-starting and conflicting with the app-mode instance
+    Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
+    Set-Service -Name "tvnserver" -StartupType Disabled -ErrorAction SilentlyContinue
+    Write-Host "  TightVNC configured (app mode)" -ForegroundColor Green
 }
 
 function Install-NoVNC {
     Write-Host ""
     Write-Host "=== Installing noVNC ===" -ForegroundColor Cyan
     
-    if (-not (Test-Path $script:NoVncDir)) {
-        New-Item -ItemType Directory -Force -Path $script:NoVncDir | Out-Null
-    }
-    
     $vncHtml = Join-Path $script:NoVncDir 'vnc.html'
     
     if (-not (Test-Path $vncHtml)) {
+        # Clean up any partial/failed previous clone
+        if (Test-Path $script:NoVncDir) {
+            Remove-Item -Recurse -Force $script:NoVncDir -ErrorAction SilentlyContinue
+        }
+        
         Write-Host "  Cloning noVNC repository..."
         git clone --depth 1 https://github.com/novnc/noVNC.git $script:NoVncDir 2>&1 | Out-Null
         

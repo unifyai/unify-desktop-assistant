@@ -197,7 +197,7 @@ Get-NetTCPConnection -LocalPort 5900,6080,3000 -State Listen
 
 Agent service logs are saved to:
 ```
-shared\agent-service\agent.log
+agent-service\agent.log
 ```
 
 Or use **View Logs** from the tray menu.
@@ -210,6 +210,6 @@ cd windows\tools\novnc
 .\start-websockify.bat
 
 # Start agent service manually
-cd shared\agent-service
+cd windows\agent-service
 npx ts-node src/index.ts
 ```
