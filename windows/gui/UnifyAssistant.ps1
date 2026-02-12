@@ -126,7 +126,7 @@ function Set-EnvValue {
 # =============================================================================
 
 function Start-Services {
-    param([string]$UnifyKey, [string]$OrchestraUrl)
+    param([string]$UnifyKey, [string]$OrchestraUrl, [string]$UnityCommsUrl)
     
     if (-not $UnifyKey) {
         $UnifyKey = Get-EnvValue -Key "UNIFY_KEY"
@@ -134,6 +134,10 @@ function Start-Services {
     if (-not $OrchestraUrl) {
         $OrchestraUrl = Get-EnvValue -Key "ORCHESTRA_URL"
         if (-not $OrchestraUrl) { $OrchestraUrl = "https://api.unify.ai/v0" }
+    }
+    if (-not $UnityCommsUrl) {
+        $UnityCommsUrl = Get-EnvValue -Key "UNITY_COMMS_URL"
+        if (-not $UnityCommsUrl) { $UnityCommsUrl = "https://unity-comms-app-000000000000.us-central1.run.app" }
     }
     
     if (-not $UnifyKey) {
@@ -147,7 +151,7 @@ function Start-Services {
     }
     
     # Run setup.ps1 in background
-    $setupArgs = "-UnifyKey `"$UnifyKey`" -OrchestraUrl `"$OrchestraUrl`""
+    $setupArgs = "-UnifyKey `"$UnifyKey`" -OrchestraUrl `"$OrchestraUrl`" -UnityCommsUrl `"$UnityCommsUrl`""
     Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$($script:SetupScript)`" $setupArgs" -WindowStyle Hidden
 }
 
@@ -216,7 +220,7 @@ function Update-TrayStatus {
 function Show-SettingsDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Settings"
-    $form.Size = New-Object System.Drawing.Size(450, 280)
+    $form.Size = New-Object System.Drawing.Size(450, 345)
     $form.StartPosition = "CenterScreen"
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox = $false
@@ -268,10 +272,25 @@ function Show-SettingsDialog {
     if (-not $txtUrl.Text) { $txtUrl.Text = "https://api.unify.ai/v0" }
     $form.Controls.Add($txtUrl)
     
+    # Unity Comms URL Label
+    $lblComms = New-Object System.Windows.Forms.Label
+    $lblComms.Text = "Unity Comms URL:"
+    $lblComms.Location = New-Object System.Drawing.Point(20, 150)
+    $lblComms.Size = New-Object System.Drawing.Size(120, 20)
+    $form.Controls.Add($lblComms)
+    
+    # Unity Comms URL TextBox
+    $txtComms = New-Object System.Windows.Forms.TextBox
+    $txtComms.Location = New-Object System.Drawing.Point(20, 175)
+    $txtComms.Size = New-Object System.Drawing.Size(390, 25)
+    $txtComms.Text = Get-EnvValue -Key "UNITY_COMMS_URL"
+    if (-not $txtComms.Text) { $txtComms.Text = "https://unity-comms-app-000000000000.us-central1.run.app" }
+    $form.Controls.Add($txtComms)
+    
     # Startup Options
     $chkStartup = New-Object System.Windows.Forms.CheckBox
     $chkStartup.Text = "Start on Windows login"
-    $chkStartup.Location = New-Object System.Drawing.Point(20, 150)
+    $chkStartup.Location = New-Object System.Drawing.Point(20, 215)
     $chkStartup.Size = New-Object System.Drawing.Size(200, 25)
     
     # Check if startup entry exists
@@ -283,7 +302,7 @@ function Show-SettingsDialog {
     # Auto-start services
     $chkAutoStart = New-Object System.Windows.Forms.CheckBox
     $chkAutoStart.Text = "Start services automatically"
-    $chkAutoStart.Location = New-Object System.Drawing.Point(20, 175)
+    $chkAutoStart.Location = New-Object System.Drawing.Point(20, 240)
     $chkAutoStart.Size = New-Object System.Drawing.Size(200, 25)
     $settings = Get-Settings
     $chkAutoStart.Checked = $settings -and $settings.AutoStartServices
@@ -292,12 +311,13 @@ function Show-SettingsDialog {
     # Save Button
     $btnSave = New-Object System.Windows.Forms.Button
     $btnSave.Text = "Save"
-    $btnSave.Location = New-Object System.Drawing.Point(230, 210)
+    $btnSave.Location = New-Object System.Drawing.Point(230, 275)
     $btnSave.Size = New-Object System.Drawing.Size(80, 30)
     $btnSave.Add_Click({
         # Save .env values
         Set-EnvValue -Key "UNIFY_KEY" -Value $txtKey.Text
         Set-EnvValue -Key "ORCHESTRA_URL" -Value $txtUrl.Text
+        Set-EnvValue -Key "UNITY_COMMS_URL" -Value $txtComms.Text
         
         # Save startup setting
         $startupPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
@@ -322,7 +342,7 @@ function Show-SettingsDialog {
     # Cancel Button
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = "Cancel"
-    $btnCancel.Location = New-Object System.Drawing.Point(320, 210)
+    $btnCancel.Location = New-Object System.Drawing.Point(320, 275)
     $btnCancel.Size = New-Object System.Drawing.Size(80, 30)
     $btnCancel.Add_Click({
         $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel

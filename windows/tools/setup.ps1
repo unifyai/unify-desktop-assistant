@@ -3,7 +3,7 @@
 # Single script to install, configure, and start all services for localhost use.
 #
 # Usage:
-#   .\setup.ps1 -UnifyKey "your-key" -OrchestraUrl "https://api.unify.ai/v0"
+#   .\setup.ps1 -UnifyKey "your-key" -OrchestraUrl "https://api.unify.ai/v0" -UnityCommsUrl "https://unity-comms-app-000000000000.us-central1.run.app"
 #   .\setup.ps1 -Stop
 #   .\setup.ps1 -UnifyKey "your-key" -Force  # Force reinstall
 #
@@ -21,6 +21,7 @@ param(
     [string]$UnifyKey,
     
     [string]$OrchestraUrl = "https://api.unify.ai/v0",
+    [string]$UnityCommsUrl = "https://unity-comms-app-000000000000.us-central1.run.app",
     
     [switch]$Stop,
     [switch]$Force
@@ -593,7 +594,8 @@ function Install-AgentService {
 function Setup-AgentServiceEnv {
     param(
         [string]$UnifyKey,
-        [string]$OrchestraUrl
+        [string]$OrchestraUrl,
+        [string]$UnityCommsUrl
     )
     
     Write-Host ""
@@ -608,6 +610,7 @@ function Setup-AgentServiceEnv {
 PORT=3000
 UNIFY_KEY=$UnifyKey
 ORCHESTRA_URL=$OrchestraUrl
+UNITY_COMMS_URL=$UnityCommsUrl
 "@
     
     $envContent | Out-File -FilePath $envFile -Encoding UTF8
@@ -615,6 +618,7 @@ ORCHESTRA_URL=$OrchestraUrl
     Write-Host "  .env created" -ForegroundColor Green
     Write-Host "    UNIFY_KEY: $(if ($UnifyKey) { '(set)' } else { '(not set)' })" -ForegroundColor Gray
     Write-Host "    ORCHESTRA_URL: $OrchestraUrl" -ForegroundColor Gray
+    Write-Host "    UNITY_COMMS_URL: $UnityCommsUrl" -ForegroundColor Gray
 }
 
 function Setup-WebsockifyStartup {
@@ -622,6 +626,7 @@ function Setup-WebsockifyStartup {
     Write-Host "=== Setting up websockify startup ===" -ForegroundColor Cyan
     
     $batFile = Join-Path $script:NoVncDir 'start-websockify.bat'
+    $vbsFile = Join-Path $script:NoVncDir 'start-websockify.vbs'
     
     # Find Python (avoid MS Store stub)
     $pythonExe = Find-PythonExe
@@ -641,20 +646,23 @@ cd /d "$($script:NoVncDir)"
     
     $websockifyScript | Out-File -FilePath $batFile -Encoding ASCII
     
-    # Create scheduled task for auto-start on logon
-    $taskName = "UnifyWebsockify"
-    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    # Create VBS wrapper to run the bat file hidden (no visible cmd window)
+    $vbsContent = @"
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run "cmd /c """"$batFile""""", 0, False
+"@
+    $vbsContent | Out-File -FilePath $vbsFile -Encoding ASCII
     
-    if (-not $existingTask) {
-        $action = New-ScheduledTaskAction -Execute $batFile -WorkingDirectory $script:NoVncDir
-        $trigger = New-ScheduledTaskTrigger -AtLogOn
-        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
-        Write-Host "  Scheduled task created: $taskName" -ForegroundColor Green
-    } else {
-        Write-Host "  Scheduled task exists: $taskName" -ForegroundColor Green
-    }
+    # Create/update scheduled task for auto-start on logon (uses VBS to hide window)
+    $taskName = "UnifyWebsockify"
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    
+    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbsFile`"" -WorkingDirectory $script:NoVncDir
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
+    Write-Host "  Scheduled task created: $taskName (hidden)" -ForegroundColor Green
 }
 
 function Setup-AgentServiceStartup {
@@ -662,6 +670,7 @@ function Setup-AgentServiceStartup {
     Write-Host "=== Setting up Agent Service startup ===" -ForegroundColor Cyan
     
     $batFile = Join-Path $script:AgentServiceDir 'start-agent.bat'
+    $vbsFile = Join-Path $script:AgentServiceDir 'start-agent.vbs'
     
     # Create startup script
     $agentLog = Join-Path $script:AgentServiceDir 'agent.log'
@@ -673,20 +682,23 @@ npx -y ts-node src/index.ts > "$agentLog" 2>&1
     
     $agentScript | Out-File -FilePath $batFile -Encoding ASCII
     
-    # Create scheduled task for auto-start on logon
-    $taskName = "UnifyAgentService"
-    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    # Create VBS wrapper to run the bat file hidden (no visible cmd window)
+    $vbsContent = @"
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run "cmd /c """"$batFile""""", 0, False
+"@
+    $vbsContent | Out-File -FilePath $vbsFile -Encoding ASCII
     
-    if (-not $existingTask) {
-        $action = New-ScheduledTaskAction -Execute $batFile -WorkingDirectory $script:AgentServiceDir
-        $trigger = New-ScheduledTaskTrigger -AtLogOn
-        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
-        Write-Host "  Scheduled task created: $taskName" -ForegroundColor Green
-    } else {
-        Write-Host "  Scheduled task exists: $taskName" -ForegroundColor Green
-    }
+    # Create/update scheduled task for auto-start on logon (uses VBS to hide window)
+    $taskName = "UnifyAgentService"
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    
+    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbsFile`"" -WorkingDirectory $script:AgentServiceDir
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
+    Write-Host "  Scheduled task created: $taskName (hidden)" -ForegroundColor Green
 }
 
 function Configure-Firewall {
@@ -861,7 +873,7 @@ if (-not $UnifyKey) {
     Write-Host "ERROR: -UnifyKey is required" -ForegroundColor Red
     Write-Host ""
     Write-Host "Usage:" -ForegroundColor Cyan
-    Write-Host "  .\setup.ps1 -UnifyKey 'your-key' [-OrchestraUrl 'https://api.unify.ai/v0']"
+    Write-Host "  .\setup.ps1 -UnifyKey 'your-key' [-OrchestraUrl 'https://api.unify.ai/v0'] [-UnityCommsUrl 'https://...']"
     Write-Host "  .\setup.ps1 -Stop"
     Write-Host ""
     exit 1
@@ -894,7 +906,7 @@ if ($fastMode) {
 
 # Always run configuration
 Configure-TightVNC -Password $UnifyKey
-Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl
+Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
 Setup-WebsockifyStartup
 Setup-AgentServiceStartup
 Configure-Firewall

@@ -100,6 +100,7 @@ var
   ConfigPage: TWizardPage;
   UnifyKeyEdit: TNewEdit;
   OrchestraUrlEdit: TNewEdit;
+  UnityCommsUrlEdit: TNewEdit;
 
 // Initialize configuration page
 procedure InitializeWizard();
@@ -149,13 +150,34 @@ begin
     Text := 'https://api.unify.ai/v0';
   end;
   
+  // Unity Comms URL label
+  with TNewStaticText.Create(ConfigPage) do
+  begin
+    Parent := ConfigPage.Surface;
+    Caption := 'Unity Comms URL (optional):';
+    Left := 0;
+    Top := 128;
+    Width := ConfigPage.SurfaceWidth;
+  end;
+  
+  // Unity Comms URL edit
+  UnityCommsUrlEdit := TNewEdit.Create(ConfigPage);
+  with UnityCommsUrlEdit do
+  begin
+    Parent := ConfigPage.Surface;
+    Left := 0;
+    Top := 148;
+    Width := ConfigPage.SurfaceWidth;
+    Text := 'https://unity-comms-app-000000000000.us-central1.run.app';
+  end;
+  
   // Help text
   with TNewStaticText.Create(ConfigPage) do
   begin
     Parent := ConfigPage.Surface;
     Caption := 'You can change these settings later from the tray icon menu.';
     Left := 0;
-    Top := 130;
+    Top := 190;
     Width := ConfigPage.SurfaceWidth;
     Font.Style := [fsItalic];
   end;
@@ -191,7 +213,8 @@ begin
                   #13#10 +
                   'PORT=3000' + #13#10 +
                   'UNIFY_KEY=' + UnifyKeyEdit.Text + #13#10 +
-                  'ORCHESTRA_URL=' + OrchestraUrlEdit.Text + #13#10;
+                  'ORCHESTRA_URL=' + OrchestraUrlEdit.Text + #13#10 +
+                  'UNITY_COMMS_URL=' + UnityCommsUrlEdit.Text + #13#10;
     SaveStringToFile(EnvFile, EnvContent, False);
     
     // Also save settings.json for the GUI

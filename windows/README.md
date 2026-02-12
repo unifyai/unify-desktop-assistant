@@ -72,6 +72,7 @@ Settings are stored in two places:
 ```
 UNIFY_KEY=<your-key>
 ORCHESTRA_URL=https://api.unify.ai/v0
+UNITY_COMMS_URL=https://unity-comms-app-000000000000.us-central1.run.app
 ```
 
 **GUI Settings (settings.json):**
@@ -89,8 +90,8 @@ The setup script can also be run directly:
 # Setup and start services
 .\tools\setup.ps1 -UnifyKey <your-key>
 
-# With custom Orchestra URL
-.\tools\setup.ps1 -UnifyKey <your-key> -OrchestraUrl https://api.unify.ai/v0
+# With custom URLs
+.\tools\setup.ps1 -UnifyKey <your-key> -OrchestraUrl https://api.unify.ai/v0 -UnityCommsUrl https://unity-comms-app-000000000000.us-central1.run.app
 
 # Stop all services
 .\tools\setup.ps1 -Stop
