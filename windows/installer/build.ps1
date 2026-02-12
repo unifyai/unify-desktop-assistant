@@ -194,19 +194,19 @@ function Build-Installer {
     }
     
     # Build arguments
-    $args = @(
-        "/O`"$($script:OutputDir)`""
+    $isccArgs = @(
+        "/O$($script:OutputDir)"
     )
     
     if ($Version) {
-        $args += "/DAppVersion=$Version"
+        $isccArgs += "/DAppVersion=$Version"
     }
     
-    $args += "`"$issFile`""
+    $isccArgs += $issFile
     
-    Write-Host "  Running: $ISCC $($args -join ' ')" -ForegroundColor Gray
+    Write-Host "  Running: $ISCC $($isccArgs -join ' ')" -ForegroundColor Gray
     
-    & $ISCC @args
+    & $ISCC @isccArgs
     
     if ($LASTEXITCODE -ne 0) {
         throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
