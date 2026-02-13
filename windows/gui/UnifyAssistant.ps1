@@ -223,6 +223,17 @@ function Get-TrayIcon {
 }
 
 function Update-TrayStatus {
+    # Check for graceful shutdown signal (created by uninstaller/upgrader)
+    $shutdownFile = Join-Path $script:InstallDir 'uninstall.signal'
+    if (Test-Path $shutdownFile) {
+        Remove-Item $shutdownFile -Force -ErrorAction SilentlyContinue
+        $script:NotifyIcon.Visible = $false
+        $script:NotifyIcon.Dispose()
+        $appContext.ExitThread()
+        [System.Windows.Forms.Application]::Exit()
+        return
+    }
+    
     $status = Get-ServiceStatus
     
     if ($status.AllRunning) {

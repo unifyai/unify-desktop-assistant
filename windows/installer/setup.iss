@@ -101,7 +101,9 @@ Filename: "cmd.exe"; Parameters: "/k powershell.exe -NoProfile -ExecutionPolicy 
 Filename: "wscript.exe"; Parameters: """{app}\{#AppExeName}"""; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runhidden
 
 [UninstallRun]
-; Kill the tray app (wmic has simple quoting, works reliably from any context)
+; Signal tray app to shut down gracefully (creates signal file, waits for tray to dispose its icon)
+Filename: "cmd.exe"; Parameters: "/c echo.>""{app}\uninstall.signal"" && ping -n 7 127.0.0.1 >nul"; Flags: runhidden waituntilterminated; RunOnceId: "SignalTrayApp"
+; Fallback: force-kill tray app if it didn't exit gracefully
 Filename: "wmic.exe"; Parameters: "process where ""Name='powershell.exe' AND CommandLine LIKE '%UnifyAssistant%'"" call terminate"; Flags: runhidden waituntilterminated; RunOnceId: "KillTrayApp"
 ; Stop services, remove scheduled tasks, remove firewall rules
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -Uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallCleanup"
@@ -162,7 +164,13 @@ begin
   // Only run on upgrade (existing installation)
   if FileExists(SetupScript) then
   begin
-    // Kill the tray app (wmic has simple quoting, works reliably from any context)
+    // Signal tray app to shut down gracefully (dispose icon, then exit)
+    Exec('cmd.exe',
+      '/c echo.>"' + ExpandConstant('{app}') + '\uninstall.signal"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Wait ~6 seconds for the tray app to detect signal and exit cleanly
+    Exec('cmd.exe', '/c ping -n 7 127.0.0.1 >nul', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Fallback: force-kill tray app if it didn't exit gracefully
     Exec('wmic.exe',
       'process where "Name=''powershell.exe'' AND CommandLine LIKE ''%UnifyAssistant%''" call terminate',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
