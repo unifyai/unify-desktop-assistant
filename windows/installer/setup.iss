@@ -101,17 +101,15 @@ Filename: "cmd.exe"; Parameters: "/k powershell.exe -NoProfile -ExecutionPolicy 
 Filename: "wscript.exe"; Parameters: """{app}\{#AppExeName}"""; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runhidden
 
 [UninstallRun]
-; Stop services before uninstall
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -Stop"; Flags: runhidden waituntilterminated; RunOnceId: "StopServices"
+; Kill the tray app first (releases file locks)
+Filename: "taskkill.exe"; Parameters: "/F /IM wscript.exe"; Flags: runhidden waituntilterminated; RunOnceId: "KillWscript"
+Filename: "powershell.exe"; Parameters: "-NoProfile -Command ""Get-Process -Name powershell, pwsh -ErrorAction SilentlyContinue | Where-Object {{ $_.CommandLine -match 'UnifyAssistant' }} | Stop-Process -Force -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "KillTrayApp"
+; Stop services, remove scheduled tasks, remove firewall rules
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -Uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallCleanup"
 
 [UninstallDelete]
-; Clean up generated files
-Type: filesandordirs; Name: "{app}\tools\novnc"
-Type: filesandordirs; Name: "{app}\magnitude\node_modules"
-Type: filesandordirs; Name: "{app}\magnitude\packages\magnitude-core\node_modules"
-Type: filesandordirs; Name: "{app}\agent-service\node_modules"
-Type: files; Name: "{app}\agent-service\.env"
-Type: files; Name: "{app}\settings.json"
+; Remove entire install directory (includes node_modules, novnc, logs, etc.)
+Type: filesandordirs; Name: "{app}"
 
 [Code]
 // =========================================================================

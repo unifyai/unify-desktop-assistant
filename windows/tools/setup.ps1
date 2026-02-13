@@ -5,6 +5,7 @@
 # Usage:
 #   .\setup.ps1 -UnifyKey "your-key" -OrchestraUrl "https://api.unify.ai/v0" -UnityCommsUrl "https://unity-comms-app-000000000000.us-central1.run.app"
 #   .\setup.ps1 -Stop
+#   .\setup.ps1 -Uninstall  # Stop services, remove scheduled tasks & firewall rules
 #   .\setup.ps1 -UnifyKey "your-key" -Force  # Force reinstall
 #
 # Services started:
@@ -24,6 +25,7 @@ param(
     [string]$UnityCommsUrl = "https://unity-comms-app-000000000000.us-central1.run.app",
     
     [switch]$Stop,
+    [switch]$Uninstall,
     [switch]$Force
 )
 
@@ -217,6 +219,39 @@ function Stop-AllServices {
     
     Write-Host ""
     Write-Host "All services stopped." -ForegroundColor Green
+}
+
+function Uninstall-All {
+    Write-Host ""
+    Write-Host "=== Uninstalling Unify Desktop Assistant ===" -ForegroundColor Cyan
+    
+    # 1. Stop all services
+    Stop-AllServices
+    
+    # 2. Remove scheduled tasks
+    Write-Host ""
+    Write-Host "Removing scheduled tasks..." -ForegroundColor Cyan
+    foreach ($taskName in @('UnifyWebsockify', 'UnifyAgentService', 'UnifyTightVNC')) {
+        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($task) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Host "  Removed: $taskName" -ForegroundColor Green
+        }
+    }
+    
+    # 3. Remove firewall rules
+    Write-Host ""
+    Write-Host "Removing firewall rules..." -ForegroundColor Cyan
+    foreach ($ruleName in @('Unify-noVNC', 'Unify-AgentService')) {
+        $rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+        if ($rule) {
+            Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+            Write-Host "  Removed: $ruleName" -ForegroundColor Green
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "Uninstall cleanup complete." -ForegroundColor Green
 }
 
 # =============================================================================
@@ -921,6 +956,12 @@ if ($Stop) {
     exit 0
 }
 
+# Handle uninstall command
+if ($Uninstall) {
+    Uninstall-All
+    exit 0
+}
+
 # Validate required parameters
 if (-not $UnifyKey) {
     Write-Host "ERROR: -UnifyKey is required" -ForegroundColor Red
@@ -928,6 +969,7 @@ if (-not $UnifyKey) {
     Write-Host "Usage:" -ForegroundColor Cyan
     Write-Host "  .\setup.ps1 -UnifyKey 'your-key' [-OrchestraUrl 'https://api.unify.ai/v0'] [-UnityCommsUrl 'https://...']"
     Write-Host "  .\setup.ps1 -Stop"
+    Write-Host "  .\setup.ps1 -Uninstall"
     Write-Host ""
     exit 1
 }
