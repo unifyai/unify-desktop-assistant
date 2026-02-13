@@ -1,0 +1,71 @@
+# Build Windows Installer
+#
+# Compiles the Inno Setup installer for Unify Desktop Assistant.
+# Manually triggered. Choose environment (main/staging) and optional version.
+# Uploads the .exe as a build artifact.
+
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment (bakes in API URLs)'
+        required: true
+        type: choice
+        options:
+          - main
+          - staging
+        default: main
+      version:
+        description: 'Version override (e.g. 1.2.0). Leave empty to use default from setup.iss.'
+        required: false
+        type: string
+
+concurrency:
+  group: build-windows-installer-${{ inputs.environment }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $buildArgs = @('-Clean')
+
+          # Determine environment
+          $env = "${{ inputs.environment }}"
+          if ($env -eq 'staging') {
+            $buildArgs += '-Staging'
+            Write-Host "Building for STAGING environment"
+          } else {
+            Write-Host "Building for PRODUCTION environment"
+          }
+
+          # Optional version override
+          $version = "${{ inputs.version }}"
+          if ($version -ne '') {
+            $buildArgs += "-Version"
+            $buildArgs += $version
+            Write-Host "Version override: $version"
+          }
+
+          Write-Host "Running: .\windows\installer\build.ps1 $($buildArgs -join ' ')"
+          & .\windows\installer\build.ps1 @buildArgs
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-${{ inputs.environment }}-${{ github.sha }}
+          path: windows/installer/output/*.exe
+          if-no-files-found: error
+          retention-days: 90
