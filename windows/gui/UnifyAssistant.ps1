@@ -37,21 +37,19 @@ $script:StatusInterval = 5000
 # Helper Functions
 # =============================================================================
 
-function Test-PortListening {
-    param([int]$Port)
-    try {
-        $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-        return $null -ne $conn
-    } catch {
-        return $false
-    }
-}
-
 function Get-ServiceStatus {
-    $vnc = Test-PortListening -Port $script:VncPort
-    $novnc = Test-PortListening -Port $script:NoVncPort
-    $agent = Test-PortListening -Port $script:AgentPort
-    
+    # Use a single .NET call to get all listening ports (fast, no WMI/CIM overhead)
+    try {
+        $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        $listeningPorts = @($listeners | ForEach-Object { $_.Port })
+    } catch {
+        $listeningPorts = @()
+    }
+
+    $vnc = $listeningPorts -contains $script:VncPort
+    $novnc = $listeningPorts -contains $script:NoVncPort
+    $agent = $listeningPorts -contains $script:AgentPort
+
     return @{
         VNC = $vnc
         NoVNC = $novnc
@@ -219,35 +217,58 @@ function Get-TrayIcon {
     
     $graphics.Dispose()
     
-    return [System.Drawing.Icon]::FromHandle($bitmap.GetHicon())
+    $hIcon = $bitmap.GetHicon()
+    $icon = [System.Drawing.Icon]::FromHandle($hIcon)
+    # Clone so we can free the native handle and bitmap immediately
+    $cloned = [System.Drawing.Icon]$icon.Clone()
+    $icon.Dispose()
+    $bitmap.Dispose()
+    return $cloned
 }
 
+# Track last status to avoid recreating icons unnecessarily
+$script:LastStatusKey = ""
+
 function Update-TrayStatus {
-    # Check for graceful shutdown signal (created by uninstaller/upgrader)
-    $shutdownFile = Join-Path $script:InstallDir 'uninstall.signal'
-    if (Test-Path $shutdownFile) {
-        Remove-Item $shutdownFile -Force -ErrorAction SilentlyContinue
-        $script:NotifyIcon.Visible = $false
-        $script:NotifyIcon.Dispose()
-        $appContext.ExitThread()
-        [System.Windows.Forms.Application]::Exit()
-        return
-    }
-    
-    $status = Get-ServiceStatus
-    
-    if ($status.AllRunning) {
-        $script:NotifyIcon.Icon = Get-TrayIcon -Status "running"
-        $script:NotifyIcon.Text = "$($script:AppName)`nStatus: Running"
-        $script:StatusMenuItem.Text = "Status: Running"
-    } elseif ($status.AnyRunning) {
-        $script:NotifyIcon.Icon = Get-TrayIcon -Status "partial"
-        $script:NotifyIcon.Text = "$($script:AppName)`nStatus: Partial"
-        $script:StatusMenuItem.Text = "Status: Partial"
-    } else {
-        $script:NotifyIcon.Icon = Get-TrayIcon -Status "stopped"
-        $script:NotifyIcon.Text = "$($script:AppName)`nStatus: Stopped"
-        $script:StatusMenuItem.Text = "Status: Stopped"
+    try {
+        # Check for graceful shutdown signal (created by uninstaller/upgrader)
+        $shutdownFile = Join-Path $script:InstallDir 'uninstall.signal'
+        if (Test-Path $shutdownFile) {
+            Remove-Item $shutdownFile -Force -ErrorAction SilentlyContinue
+            $script:NotifyIcon.Visible = $false
+            $script:NotifyIcon.Dispose()
+            $appContext.ExitThread()
+            [System.Windows.Forms.Application]::Exit()
+            return
+        }
+        
+        $status = Get-ServiceStatus
+        
+        if ($status.AllRunning) {
+            $statusKey = "running"
+            $statusText = "Running"
+        } elseif ($status.AnyRunning) {
+            $statusKey = "partial"
+            $statusText = "Partial"
+        } else {
+            $statusKey = "stopped"
+            $statusText = "Stopped"
+        }
+        
+        # Only recreate icon when status actually changes (avoids GDI work every tick)
+        if ($script:LastStatusKey -ne $statusKey) {
+            $script:LastStatusKey = $statusKey
+            $oldIcon = $script:NotifyIcon.Icon
+            $script:NotifyIcon.Icon = Get-TrayIcon -Status $statusKey
+            if ($oldIcon) {
+                try { $oldIcon.Dispose() } catch {}
+            }
+        }
+        
+        $script:NotifyIcon.Text = "$($script:AppName)`nStatus: $statusText"
+        $script:StatusMenuItem.Text = "Status: $statusText"
+    } catch {
+        # Silently ignore errors to prevent UI thread from freezing
     }
 }
 
@@ -329,25 +350,22 @@ function Show-SettingsDialog {
     $txtComms.BackColor = [System.Drawing.SystemColors]::Control
     $form.Controls.Add($txtComms)
     
-    # Startup Options
+    # Startup Options (always enabled, not user-editable)
     $chkStartup = New-Object System.Windows.Forms.CheckBox
     $chkStartup.Text = "Start on Windows login"
     $chkStartup.Location = New-Object System.Drawing.Point(20, 215)
     $chkStartup.Size = New-Object System.Drawing.Size(200, 25)
-    
-    # Check if startup entry exists
-    $startupPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-    $startupEntry = Get-ItemProperty -Path $startupPath -Name "UnifyAssistant" -ErrorAction SilentlyContinue
-    $chkStartup.Checked = $null -ne $startupEntry
+    $chkStartup.Checked = $true
+    $chkStartup.Enabled = $false
     $form.Controls.Add($chkStartup)
     
-    # Auto-start services
+    # Auto-start services (always enabled, not user-editable)
     $chkAutoStart = New-Object System.Windows.Forms.CheckBox
     $chkAutoStart.Text = "Start services automatically"
     $chkAutoStart.Location = New-Object System.Drawing.Point(20, 240)
     $chkAutoStart.Size = New-Object System.Drawing.Size(200, 25)
-    $settings = Get-Settings
-    $chkAutoStart.Checked = $settings -and $settings.AutoStartServices
+    $chkAutoStart.Checked = $true
+    $chkAutoStart.Enabled = $false
     $form.Controls.Add($chkAutoStart)
     
     # Save Button
@@ -361,19 +379,15 @@ function Show-SettingsDialog {
         Set-EnvValue -Key "ORCHESTRA_URL" -Value $txtUrl.Text
         Set-EnvValue -Key "UNITY_COMMS_URL" -Value $txtComms.Text
         
-        # Save startup setting
+        # Ensure startup registry key is always set
         $startupPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-        if ($chkStartup.Checked) {
-            $exePath = Join-Path $script:InstallDir "gui\UnifyAssistant.ps1"
-            $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$exePath`""
-            Set-ItemProperty -Path $startupPath -Name "UnifyAssistant" -Value $cmd
-        } else {
-            Remove-ItemProperty -Path $startupPath -Name "UnifyAssistant" -ErrorAction SilentlyContinue
-        }
+        $exePath = Join-Path $script:InstallDir "gui\UnifyAssistant.ps1"
+        $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$exePath`""
+        Set-ItemProperty -Path $startupPath -Name "UnifyAssistant" -Value $cmd
         
-        # Save settings
+        # Save settings (always auto-start)
         Save-Settings @{
-            AutoStartServices = $chkAutoStart.Checked
+            AutoStartServices = $true
         }
         
         $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
@@ -461,28 +475,6 @@ $contextMenu.Items.Add($stopItem) | Out-Null
 # Separator
 $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
-# Open Desktop
-$desktopItem = New-Object System.Windows.Forms.ToolStripMenuItem
-$desktopItem.Text = "Open Desktop Viewer"
-$desktopItem.Add_Click({
-    $key = Get-EnvValue -Key "UNIFY_KEY"
-    $url = "http://localhost:$($script:NoVncPort)/custom.html"
-    if ($key) { $url += "?password=$key" }
-    Start-Process $url
-})
-$contextMenu.Items.Add($desktopItem) | Out-Null
-
-# Open API
-$apiItem = New-Object System.Windows.Forms.ToolStripMenuItem
-$apiItem.Text = "Open API (localhost:$($script:AgentPort))"
-$apiItem.Add_Click({
-    Start-Process "http://localhost:$($script:AgentPort)"
-})
-$contextMenu.Items.Add($apiItem) | Out-Null
-
-# Separator
-$contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
-
 # Settings
 $settingsItem = New-Object System.Windows.Forms.ToolStripMenuItem
 $settingsItem.Text = "Settings..."
@@ -523,13 +515,10 @@ $timer.Start()
 # Initial status update
 Update-TrayStatus
 
-# Auto-start services if configured
-$settings = Get-Settings
-if ($settings -and $settings.AutoStartServices) {
-    $key = Get-EnvValue -Key "UNIFY_KEY"
-    if ($key) {
-        Start-Services -UnifyKey $key
-    }
+# Auto-start services (always enabled)
+$key = Get-EnvValue -Key "UNIFY_KEY"
+if ($key) {
+    Start-Services -UnifyKey $key
 }
 
 # Run application
