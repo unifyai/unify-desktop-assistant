@@ -125,21 +125,8 @@ function Set-EnvValue {
 # =============================================================================
 
 function Start-Services {
-    param([string]$UnifyKey, [string]$OrchestraUrl, [string]$UnityCommsUrl)
-    
-    if (-not $UnifyKey) {
-        $UnifyKey = Get-EnvValue -Key "UNIFY_KEY"
-    }
-    if (-not $OrchestraUrl) {
-        $OrchestraUrl = Get-EnvValue -Key "ORCHESTRA_URL"
-        if (-not $OrchestraUrl) { $OrchestraUrl = "https://api.unify.ai/v0" }
-    }
-    if (-not $UnityCommsUrl) {
-        $UnityCommsUrl = Get-EnvValue -Key "UNITY_COMMS_URL"
-        if (-not $UnityCommsUrl) { $UnityCommsUrl = "https://unity-comms-app-000000000000.us-central1.run.app" }
-    }
-    
-    if (-not $UnifyKey) {
+    $key = Get-EnvValue -Key "UNIFY_KEY"
+    if (-not $key) {
         [System.Windows.Forms.MessageBox]::Show(
             "Please configure your Unify API Key in Settings first.",
             "Configuration Required",
@@ -149,9 +136,8 @@ function Start-Services {
         return
     }
     
-    # Run setup.ps1 in background
-    $setupArgs = "-UnifyKey `"$UnifyKey`" -OrchestraUrl `"$OrchestraUrl`" -UnityCommsUrl `"$UnityCommsUrl`""
-    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$($script:SetupScript)`" $setupArgs" -WindowStyle Hidden
+    # Run setup.ps1 -Start in background (just starts services, no admin needed)
+    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$($script:SetupScript)`" -Start" -WindowStyle Hidden
 }
 
 function Stop-Services {
@@ -518,7 +504,7 @@ Update-TrayStatus
 # Auto-start services (always enabled)
 $key = Get-EnvValue -Key "UNIFY_KEY"
 if ($key) {
-    Start-Services -UnifyKey $key
+    Start-Services
 }
 
 # Run application

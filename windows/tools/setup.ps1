@@ -4,8 +4,9 @@
 #
 # Usage:
 #   .\setup.ps1 -UnifyKey "your-key" -OrchestraUrl "https://api.unify.ai/v0" -UnityCommsUrl "https://unity-comms-app-000000000000.us-central1.run.app"
+#   .\setup.ps1 -Start       # Start services only (no install/config, no admin needed)
 #   .\setup.ps1 -Stop
-#   .\setup.ps1 -Uninstall  # Stop services, remove scheduled tasks & firewall rules
+#   .\setup.ps1 -Uninstall   # Stop services, remove scheduled tasks & firewall rules
 #   .\setup.ps1 -UnifyKey "your-key" -Force  # Force reinstall
 #
 # Services started:
@@ -24,6 +25,7 @@ param(
     [string]$OrchestraUrl = "https://api.unify.ai/v0",
     [string]$UnityCommsUrl = "https://unity-comms-app-000000000000.us-central1.run.app",
     
+    [switch]$Start,
     [switch]$Stop,
     [switch]$Uninstall,
     [switch]$Force
@@ -967,6 +969,12 @@ function Show-Summary {
 # Main Execution
 # =============================================================================
 
+# Handle start command (just start services, no install/config - no admin needed)
+if ($Start) {
+    Start-AllServices
+    exit 0
+}
+
 # Handle stop command
 if ($Stop) {
     Stop-AllServices
@@ -985,6 +993,7 @@ if (-not $UnifyKey) {
     Write-Host ""
     Write-Host "Usage:" -ForegroundColor Cyan
     Write-Host "  .\setup.ps1 -UnifyKey 'your-key' [-OrchestraUrl 'https://api.unify.ai/v0'] [-UnityCommsUrl 'https://...']"
+    Write-Host "  .\setup.ps1 -Start"
     Write-Host "  .\setup.ps1 -Stop"
     Write-Host "  .\setup.ps1 -Uninstall"
     Write-Host ""
