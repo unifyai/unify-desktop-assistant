@@ -101,9 +101,8 @@ Filename: "cmd.exe"; Parameters: "/k powershell.exe -NoProfile -ExecutionPolicy 
 Filename: "wscript.exe"; Parameters: """{app}\{#AppExeName}"""; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runhidden
 
 [UninstallRun]
-; Kill the tray app first (releases file locks)
-Filename: "taskkill.exe"; Parameters: "/F /IM wscript.exe"; Flags: runhidden waituntilterminated; RunOnceId: "KillWscript"
-Filename: "powershell.exe"; Parameters: "-NoProfile -Command ""Get-Process -Name powershell, pwsh -ErrorAction SilentlyContinue | Where-Object {{ $_.CommandLine -match 'UnifyAssistant' }} | Stop-Process -Force -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "KillTrayApp"
+; Kill the tray app first (uses WMI for reliable CommandLine access across contexts)
+Filename: "powershell.exe"; Parameters: "-NoProfile -Command ""Get-CimInstance Win32_Process -Filter \""Name = 'powershell.exe' AND CommandLine LIKE '%UnifyAssistant%'\"" -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"""; Flags: runhidden waituntilterminated; RunOnceId: "KillTrayApp"
 ; Stop services, remove scheduled tasks, remove firewall rules
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -Uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallCleanup"
 
@@ -163,18 +162,15 @@ begin
   // Only run on upgrade (existing installation)
   if FileExists(SetupScript) then
   begin
+    // Kill the tray app process first (uses WMI for reliable CommandLine access)
+    Exec('powershell.exe',
+      '-NoProfile -Command "Get-CimInstance Win32_Process -Filter ""Name = ''powershell.exe'' AND CommandLine LIKE ''%UnifyAssistant%''"" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
     // Stop services gracefully via setup.ps1 -Stop
     Exec('powershell.exe',
       '-NoProfile -ExecutionPolicy Bypass -File "' + SetupScript + '" -Stop',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-    // Kill the tray app process if running (releases file locks)
-    Exec('powershell.exe',
-      '-NoProfile -Command "Get-Process -Name powershell, pwsh -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -eq '''' -and $_.CommandLine -match ''UnifyAssistant'' } | Stop-Process -Force -ErrorAction SilentlyContinue"',
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-    // Also kill wscript.exe running the launcher
-    Exec('taskkill.exe', '/F /IM wscript.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;
 

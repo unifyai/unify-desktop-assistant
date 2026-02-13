@@ -193,20 +193,28 @@ function Stop-AllServices {
     Write-Host ""
     Write-Host "=== Stopping Services ===" -ForegroundColor Cyan
     
-    # Stop Agent Service
-    $agentProcs = Get-Process -Name "node" -ErrorAction SilentlyContinue | 
-        Where-Object { $_.CommandLine -like "*agent-service*" -or $_.CommandLine -like "*ts-node*" }
-    if ($agentProcs) {
-        $agentProcs | Stop-Process -Force -ErrorAction SilentlyContinue
-        Write-Host "  Stopped Agent Service" -ForegroundColor Green
+    # Use WMI (Get-CimInstance) for reliable CommandLine access across sessions/contexts.
+    # Get-Process.CommandLine is unreliable in Windows PowerShell 5.1 and elevated contexts.
+    
+    # Stop Agent Service (node running ts-node/agent-service)
+    $agentProcs = Get-CimInstance Win32_Process -Filter "Name = 'node.exe' AND (CommandLine LIKE '%agent-service%' OR CommandLine LIKE '%ts-node%')" -ErrorAction SilentlyContinue
+    foreach ($proc in $agentProcs) {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host "  Stopped Agent Service (PID $($proc.ProcessId))" -ForegroundColor Green
     }
     
-    # Stop websockify
-    $websockifyProcs = Get-Process -Name "python*" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*websockify*" }
-    if ($websockifyProcs) {
-        $websockifyProcs | Stop-Process -Force -ErrorAction SilentlyContinue
-        Write-Host "  Stopped websockify" -ForegroundColor Green
+    # Stop websockify (python running websockify)
+    $websockifyProcs = Get-CimInstance Win32_Process -Filter "Name LIKE 'python%' AND CommandLine LIKE '%websockify%'" -ErrorAction SilentlyContinue
+    foreach ($proc in $websockifyProcs) {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host "  Stopped websockify (PID $($proc.ProcessId))" -ForegroundColor Green
+    }
+    
+    # Stop parent cmd.exe processes that launched websockify or agent-service
+    $cmdProcs = Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe' AND (CommandLine LIKE '%websockify%' OR CommandLine LIKE '%agent-service%' OR CommandLine LIKE '%ts-node%')" -ErrorAction SilentlyContinue
+    foreach ($proc in $cmdProcs) {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host "  Stopped cmd.exe wrapper (PID $($proc.ProcessId))" -ForegroundColor Green
     }
     
     # Stop TightVNC
