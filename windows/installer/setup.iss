@@ -230,7 +230,7 @@ begin
   // Create custom configuration page (after tasks page, before ready page)
   ConfigPage := CreateCustomPage(wpSelectTasks, 'Configuration', 'Enter your Unify API credentials');
 
-  // --- Upgrade notice (hidden by default, shown if upgrade detected) ---
+  // --- Upgrade notice (hidden by default, shown if upgrade detected in CurPageChanged) ---
   UpgradeNote := TNewStaticText.Create(ConfigPage);
   with UpgradeNote do
   begin
@@ -244,12 +244,13 @@ begin
   end;
 
   // --- Unify Key ---
+  // All controls start at Top=28 to leave clear space for the upgrade notice above
   with TNewStaticText.Create(ConfigPage) do
   begin
     Parent := ConfigPage.Surface;
     Caption := 'Unify API Key:';
     Left := 0;
-    Top := 8;
+    Top := 28;
     Width := ConfigPage.SurfaceWidth;
   end;
 
@@ -258,7 +259,7 @@ begin
   begin
     Parent := ConfigPage.Surface;
     Left := 0;
-    Top := 28;
+    Top := 48;
     Width := ConfigPage.SurfaceWidth;
   end;
 
@@ -268,7 +269,7 @@ begin
     Parent := ConfigPage.Surface;
     Caption := 'Environment:';
     Left := 0;
-    Top := 68;
+    Top := 88;
     Width := ConfigPage.SurfaceWidth;
   end;
 
@@ -277,7 +278,7 @@ begin
   begin
     Parent := ConfigPage.Surface;
     Left := 0;
-    Top := 88;
+    Top := 108;
     Width := 200;
     Style := csDropDownList;
     Items.Add('Production');
@@ -292,7 +293,7 @@ begin
   begin
     Parent := ConfigPage.Surface;
     Left := 0;
-    Top := 122;
+    Top := 142;
     Width := ConfigPage.SurfaceWidth;
     Font.Color := clGray;
   end;
@@ -302,7 +303,7 @@ begin
   begin
     Parent := ConfigPage.Surface;
     Left := 0;
-    Top := 142;
+    Top := 162;
     Width := ConfigPage.SurfaceWidth;
     Font.Color := clGray;
   end;
@@ -316,7 +317,7 @@ begin
     Parent := ConfigPage.Surface;
     Caption := 'You can change these settings later from the tray icon menu.';
     Left := 0;
-    Top := 176;
+    Top := 196;
     Width := ConfigPage.SurfaceWidth;
     Font.Style := [fsItalic];
   end;
