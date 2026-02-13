@@ -305,7 +305,9 @@ function Install-Bun {
     Write-Host "=== Installing Bun ===" -ForegroundColor Cyan
     
     try {
-        powershell -Command "irm bun.sh/install.ps1 | iex" 2>&1 | Out-Null
+        Invoke-NativeCommand {
+            powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; irm bun.sh/install.ps1 | iex"
+        }
         
         # Refresh PATH so bun is available in the current session
         # (turbo reads packageManager field and looks for bun in PATH)
