@@ -291,12 +291,14 @@ function Show-SettingsDialog {
     $lblUrl.Size = New-Object System.Drawing.Size(100, 20)
     $form.Controls.Add($lblUrl)
     
-    # Orchestra URL TextBox
+    # Orchestra URL TextBox (read-only)
     $txtUrl = New-Object System.Windows.Forms.TextBox
     $txtUrl.Location = New-Object System.Drawing.Point(20, 110)
     $txtUrl.Size = New-Object System.Drawing.Size(390, 25)
     $txtUrl.Text = Get-EnvValue -Key "ORCHESTRA_URL"
     if (-not $txtUrl.Text) { $txtUrl.Text = "https://api.unify.ai/v0" }
+    $txtUrl.ReadOnly = $true
+    $txtUrl.BackColor = [System.Drawing.SystemColors]::Control
     $form.Controls.Add($txtUrl)
     
     # Unity Comms URL Label
@@ -306,12 +308,14 @@ function Show-SettingsDialog {
     $lblComms.Size = New-Object System.Drawing.Size(120, 20)
     $form.Controls.Add($lblComms)
     
-    # Unity Comms URL TextBox
+    # Unity Comms URL TextBox (read-only)
     $txtComms = New-Object System.Windows.Forms.TextBox
     $txtComms.Location = New-Object System.Drawing.Point(20, 175)
     $txtComms.Size = New-Object System.Drawing.Size(390, 25)
     $txtComms.Text = Get-EnvValue -Key "UNITY_COMMS_URL"
     if (-not $txtComms.Text) { $txtComms.Text = "https://unity-comms-app-000000000000.us-central1.run.app" }
+    $txtComms.ReadOnly = $true
+    $txtComms.BackColor = [System.Drawing.SystemColors]::Control
     $form.Controls.Add($txtComms)
     
     # Startup Options

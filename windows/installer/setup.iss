@@ -101,8 +101,8 @@ Filename: "cmd.exe"; Parameters: "/k powershell.exe -NoProfile -ExecutionPolicy 
 Filename: "wscript.exe"; Parameters: """{app}\{#AppExeName}"""; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runhidden
 
 [UninstallRun]
-; Kill the tray app first (uses WMI for reliable CommandLine access across contexts)
-Filename: "powershell.exe"; Parameters: "-NoProfile -Command ""Get-CimInstance Win32_Process -Filter \""Name = 'powershell.exe' AND CommandLine LIKE '%UnifyAssistant%'\"" -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"""; Flags: runhidden waituntilterminated; RunOnceId: "KillTrayApp"
+; Kill the tray app (wmic has simple quoting, works reliably from any context)
+Filename: "wmic.exe"; Parameters: "process where ""Name='powershell.exe' AND CommandLine LIKE '%UnifyAssistant%'"" call terminate"; Flags: runhidden waituntilterminated; RunOnceId: "KillTrayApp"
 ; Stop services, remove scheduled tasks, remove firewall rules
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -Uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallCleanup"
 
@@ -162,9 +162,9 @@ begin
   // Only run on upgrade (existing installation)
   if FileExists(SetupScript) then
   begin
-    // Kill the tray app process first (uses WMI for reliable CommandLine access)
-    Exec('powershell.exe',
-      '-NoProfile -Command "Get-CimInstance Win32_Process -Filter ""Name = ''powershell.exe'' AND CommandLine LIKE ''%UnifyAssistant%''"" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"',
+    // Kill the tray app (wmic has simple quoting, works reliably from any context)
+    Exec('wmic.exe',
+      'process where "Name=''powershell.exe'' AND CommandLine LIKE ''%UnifyAssistant%''" call terminate',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
     // Stop services gracefully via setup.ps1 -Stop

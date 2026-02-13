@@ -225,6 +225,15 @@ function Stop-AllServices {
         Write-Host "  Stopped TightVNC" -ForegroundColor Green
     }
     
+    # Final sweep: kill any remaining processes by port (catches anything the above missed)
+    foreach ($port in @(5900, 6080, 3000)) {
+        $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+        foreach ($conn in $conns) {
+            Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
+            Write-Host "  Killed process on port $port (PID $($conn.OwningProcess))" -ForegroundColor Green
+        }
+    }
+    
     Write-Host ""
     Write-Host "All services stopped." -ForegroundColor Green
 }
