@@ -836,10 +836,10 @@ function Start-AllServices {
     Write-Host ""
     Write-Host "=== Starting Services ===" -ForegroundColor Cyan
     
-    # Start TightVNC
+    # Start TightVNC (only if not already running)
     $tvnExe = 'C:\Program Files\TightVNC\tvnserver.exe'
-    if (Test-Path $tvnExe) {
-        # Stop existing service first
+    if ((Test-Path $tvnExe) -and -not (Test-PortListening -Port 5900)) {
+        # Stop existing service if registered (may not be how it was started)
         try { & net stop tvnserver 2>&1 | Out-Null } catch {}
         Start-Sleep -Milliseconds 500
         
