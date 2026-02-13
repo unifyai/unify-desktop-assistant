@@ -7,12 +7,14 @@
 #   - Or install via: choco install innosetup -y
 #
 # Usage:
-#   .\build.ps1                 # Build installer
+#   .\build.ps1                 # Build installer (production URLs)
+#   .\build.ps1 -Staging        # Build installer (staging URLs)
 #   .\build.ps1 -Version 1.2.0  # Build with custom version
 #   .\build.ps1 -Clean          # Clean output before building
 
 param(
     [string]$Version,
+    [switch]$Staging,
     [switch]$Clean
 )
 
@@ -200,6 +202,15 @@ function Build-Installer {
     
     if ($Version) {
         $isccArgs += "/DAppVersion=$Version"
+    }
+    
+    # Environment: staging or main (production)
+    if ($Staging) {
+        $isccArgs += "/DEnvironment=staging"
+        Write-Host "  Environment: staging" -ForegroundColor Yellow
+    } else {
+        $isccArgs += "/DEnvironment=main"
+        Write-Host "  Environment: main (production)" -ForegroundColor Green
     }
     
     $isccArgs += $issFile
