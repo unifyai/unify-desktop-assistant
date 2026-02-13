@@ -1000,41 +1000,54 @@ if (-not $UnifyKey) {
     exit 1
 }
 
-# Detect fast mode
-$fastMode = (Test-FastMode) -and -not $Force
+try {
+    # Detect fast mode
+    $fastMode = (Test-FastMode) -and -not $Force
 
-if ($fastMode) {
+    if ($fastMode) {
+        Write-Host ""
+        Write-Host "Fast mode: All components installed, skipping installations" -ForegroundColor Green
+    } else {
+        Write-Host ""
+        Write-Host "Full install mode" -ForegroundColor Yellow
+        
+        # Install prerequisites
+        Install-Chocolatey
+        Install-Git
+        Install-Python
+        Install-NodeJS
+        Install-Bun
+        
+        # Install main components
+        Install-TightVNC -Password $UnifyKey
+        Install-NoVNC
+        Install-Websockify
+        Install-Magnitude -Force:$Force
+        Install-AgentService -Force:$Force
+    }
+
+    # Always run configuration
+    Configure-TightVNC -Password $UnifyKey
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
+    Setup-TightVNCStartup
+    Setup-WebsockifyStartup
+    Setup-AgentServiceStartup
+    Configure-Firewall
+
+    # Start services
+    Start-AllServices
+
+    # Show summary
+    Show-Summary -UnifyKey $UnifyKey
+} catch {
     Write-Host ""
-    Write-Host "Fast mode: All components installed, skipping installations" -ForegroundColor Green
-} else {
+    Write-Host "===========================================" -ForegroundColor Red
+    Write-Host "  Setup FAILED" -ForegroundColor Red
+    Write-Host "===========================================" -ForegroundColor Red
     Write-Host ""
-    Write-Host "Full install mode" -ForegroundColor Yellow
-    
-    # Install prerequisites
-    Install-Chocolatey
-    Install-Git
-    Install-Python
-    Install-NodeJS
-    Install-Bun
-    
-    # Install main components
-    Install-TightVNC -Password $UnifyKey
-    Install-NoVNC
-    Install-Websockify
-    Install-Magnitude -Force:$Force
-    Install-AgentService -Force:$Force
+    Write-Host "Error: $_" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Press any key to close this window..." -ForegroundColor Yellow
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit 1
 }
-
-# Always run configuration
-Configure-TightVNC -Password $UnifyKey
-Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
-Setup-TightVNCStartup
-Setup-WebsockifyStartup
-Setup-AgentServiceStartup
-Configure-Firewall
-
-# Start services
-Start-AllServices
-
-# Show summary
-Show-Summary -UnifyKey $UnifyKey
