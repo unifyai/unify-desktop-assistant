@@ -56,6 +56,7 @@ PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible
 UsedUserAreasWarning=no
 MinVersion=10.0
+RestartIfNeededByRun=no
 
 ; Wizard appearance (optional - uses defaults if files missing)
 ; WizardImageFile=assets\wizard.bmp
