@@ -96,7 +96,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 ; Install all dependencies during setup (runs after .env is written by CurStepChanged)
-Filename: "cmd.exe"; Parameters: "/k powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -UnifyKey ""{code:GetUnifyKey}"" -OrchestraUrl ""{#OrchestraUrl}"" -UnityCommsUrl ""{#CommsUrl}"" -Force"; StatusMsg: "Installing dependencies (this may take several minutes)..."; Flags: waituntilterminated
+Filename: "cmd.exe"; Parameters: "/c powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -UnifyKey ""{code:GetUnifyKey}"" -OrchestraUrl ""{#OrchestraUrl}"" -UnityCommsUrl ""{#CommsUrl}"" -Force"; StatusMsg: "Installing dependencies (this may take several minutes)..."; Flags: waituntilterminated
 ; Launch tray app after install
 Filename: "wscript.exe"; Parameters: """{app}\{#AppExeName}"""; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runhidden
 

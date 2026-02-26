@@ -682,8 +682,10 @@ function Install-AgentService {
         Write-Host "  Installing npm dependencies..."
         Invoke-NativeCommand { npm install }
         
-        Write-Host "  Installing Playwright + Chromium (this may take a few minutes)..."
-        Invoke-NativeCommand { npx -y playwright@1.52.0 install --with-deps chromium }
+        Write-Host "  Installing Patchright + Chromium (this may take a few minutes)..."
+        [System.Environment]::SetEnvironmentVariable('PLAYWRIGHT_BROWSERS_PATH', 'C:\ms-playwright', 'Machine')
+        $env:PLAYWRIGHT_BROWSERS_PATH = 'C:\ms-playwright'
+        Invoke-NativeCommand { npx -y patchright install chromium }
         
         Save-DependenciesHash -Dir $script:AgentServiceDir
         Pop-Location
@@ -710,6 +712,13 @@ function Install-Rathole {
     }
     
     Write-Host "  Adding Windows Defender exclusion for rathole directory..."
+    try {
+        Add-MpPreference -ExclusionPath $script:RatholeDir -ErrorAction Stop
+        Write-Host "  Defender exclusion added" -ForegroundColor Green
+    } catch {
+        Write-Host "  WARNING: Could not add Defender exclusion: $_" -ForegroundColor Yellow
+    }
+    
     $ratholeVersion = "0.5.0"
     $downloadUrl = "https://github.com/rapiz1/rathole/releases/download/v$ratholeVersion/rathole-x86_64-pc-windows-msvc.zip"
     $zipPath = Join-Path $env:TEMP "rathole-$ratholeVersion.zip"
@@ -1061,6 +1070,7 @@ PORT=3000
 UNIFY_KEY=$UnifyKey
 ORCHESTRA_URL=$OrchestraUrl
 UNITY_COMMS_URL=$UnityCommsUrl
+PLAYWRIGHT_BROWSERS_PATH=C:\ms-playwright
 
 # Tunnel & Device (managed by setup/registration)
 TUNNEL_ID=$existingTunnelId
@@ -1138,6 +1148,7 @@ function Setup-AgentServiceStartup {
     $agentLog = Join-Path $script:AgentServiceDir 'agent.log'
     $agentScript = @"
 @echo off
+set PLAYWRIGHT_BROWSERS_PATH=C:\ms-playwright
 cd /d "$($script:AgentServiceDir)"
 npx -y ts-node src/index.ts > "$agentLog" 2>&1
 "@
