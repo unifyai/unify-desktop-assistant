@@ -73,7 +73,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; Core application files
 Source: "..\tools\*"; DestDir: "{app}\tools"; Excludes: "novnc,novnc\*,*.log"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\gui\*"; DestDir: "{app}\gui"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\magnitude\*"; DestDir: "{app}\magnitude"; Excludes: "node_modules,node_modules\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\magnitude\*"; DestDir: "{app}\magnitude"; Excludes: "node_modules,node_modules\*,.turbo,.turbo\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\agent-service\*"; DestDir: "{app}\agent-service"; Excludes: "node_modules,node_modules\*,*.log,.env"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Assets
@@ -96,7 +96,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 ; Install all dependencies during setup (runs after .env is written by CurStepChanged)
-Filename: "cmd.exe"; Parameters: "/c powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -UnifyKey ""{code:GetUnifyKey}"" -OrchestraUrl ""{#OrchestraUrl}"" -UnityCommsUrl ""{#CommsUrl}"" -Force"; StatusMsg: "Installing dependencies (this may take several minutes)..."; Flags: waituntilterminated
+Filename: "cmd.exe"; Parameters: "/k powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -UnifyKey ""{code:GetUnifyKey}"" -OrchestraUrl ""{#OrchestraUrl}"" -UnityCommsUrl ""{#CommsUrl}"" -Force"; StatusMsg: "Installing dependencies (this may take several minutes)..."; Flags: waituntilterminated
 ; Launch tray app after install
 Filename: "wscript.exe"; Parameters: """{app}\{#AppExeName}"""; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runhidden
 
@@ -290,18 +290,33 @@ var
   EnvFile: String;
   EnvContent: String;
   SettingsFile: String;
+  ExistingTunnelId: String;
+  ExistingTunnelUrl: String;
+  ExistingTunnelToken: String;
+  ExistingDeviceId: String;
 begin
   if CurStep = ssPostInstall then
   begin
     EnvFile := ExpandConstant('{app}\agent-service\.env');
     SettingsFile := ExpandConstant('{app}\settings.json');
 
+    // Preserve existing tunnel/device values on upgrade
+    ExistingTunnelId := ReadEnvValue(EnvFile, 'TUNNEL_ID');
+    ExistingTunnelUrl := ReadEnvValue(EnvFile, 'TUNNEL_URL');
+    ExistingTunnelToken := ReadEnvValue(EnvFile, 'TUNNEL_TOKEN');
+    ExistingDeviceId := ReadEnvValue(EnvFile, 'DEVICE_ID');
+
     // Always write .env (fresh install or upgrade)
     // URLs are baked in at build time via preprocessor defines
     EnvContent := 'PORT=3000' + Chr(13) + Chr(10) +
                   'UNIFY_KEY=' + UnifyKeyEdit.Text + Chr(13) + Chr(10) +
                   'ORCHESTRA_URL={#OrchestraUrl}' + Chr(13) + Chr(10) +
-                  'UNITY_COMMS_URL={#CommsUrl}' + Chr(13) + Chr(10);
+                  'UNITY_COMMS_URL={#CommsUrl}' + Chr(13) + Chr(10) +
+                  Chr(13) + Chr(10) +
+                  'TUNNEL_ID=' + ExistingTunnelId + Chr(13) + Chr(10) +
+                  'TUNNEL_URL=' + ExistingTunnelUrl + Chr(13) + Chr(10) +
+                  'TUNNEL_TOKEN=' + ExistingTunnelToken + Chr(13) + Chr(10) +
+                  'DEVICE_ID=' + ExistingDeviceId + Chr(13) + Chr(10);
     SaveStringToFile(EnvFile, EnvContent, False);
 
     // Only create settings.json on fresh install (preserve existing user prefs)

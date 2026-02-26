@@ -49,11 +49,19 @@ function Get-ServiceStatus {
     $vnc = $listeningPorts -contains $script:VncPort
     $novnc = $listeningPorts -contains $script:NoVncPort
     $agent = $listeningPorts -contains $script:AgentPort
+    
+    # Check if rathole tunnel is running
+    $tunnel = $false
+    try {
+        $ratholeProc = Get-CimInstance Win32_Process -Filter "Name = 'rathole.exe'" -ErrorAction SilentlyContinue
+        $tunnel = $null -ne $ratholeProc
+    } catch {}
 
     return @{
         VNC = $vnc
         NoVNC = $novnc
         Agent = $agent
+        Tunnel = $tunnel
         AllRunning = ($vnc -and $novnc -and $agent)
         AnyRunning = ($vnc -or $novnc -or $agent)
     }
@@ -241,6 +249,9 @@ function Update-TrayStatus {
             $statusText = "Stopped"
         }
         
+        # Append tunnel status
+        $tunnelText = if ($status.Tunnel) { "Connected" } else { "Disconnected" }
+        
         # Only recreate icon when status actually changes (avoids GDI work every tick)
         if ($script:LastStatusKey -ne $statusKey) {
             $script:LastStatusKey = $statusKey
@@ -251,8 +262,8 @@ function Update-TrayStatus {
             }
         }
         
-        $script:NotifyIcon.Text = "$($script:AppName)`nStatus: $statusText"
-        $script:StatusMenuItem.Text = "Status: $statusText"
+        $script:NotifyIcon.Text = "$($script:AppName)`nServices: $statusText | Tunnel: $tunnelText"
+        $script:StatusMenuItem.Text = "Services: $statusText | Tunnel: $tunnelText"
     } catch {
         # Silently ignore errors to prevent UI thread from freezing
     }
@@ -265,22 +276,25 @@ function Update-TrayStatus {
 function Show-SettingsDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Settings"
-    $form.Size = New-Object System.Drawing.Size(450, 345)
+    $form.Size = New-Object System.Drawing.Size(450, 480)
     $form.StartPosition = "CenterScreen"
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
     
+    $yPos = 20
+    
     # Unify Key Label
     $lblKey = New-Object System.Windows.Forms.Label
     $lblKey.Text = "Unify API Key:"
-    $lblKey.Location = New-Object System.Drawing.Point(20, 20)
+    $lblKey.Location = New-Object System.Drawing.Point(20, $yPos)
     $lblKey.Size = New-Object System.Drawing.Size(100, 20)
     $form.Controls.Add($lblKey)
+    $yPos += 25
     
     # Unify Key TextBox
     $txtKey = New-Object System.Windows.Forms.TextBox
-    $txtKey.Location = New-Object System.Drawing.Point(20, 45)
+    $txtKey.Location = New-Object System.Drawing.Point(20, $yPos)
     $txtKey.Size = New-Object System.Drawing.Size(320, 25)
     $txtKey.UseSystemPasswordChar = $true
     $txtKey.Text = Get-EnvValue -Key "UNIFY_KEY"
@@ -289,7 +303,7 @@ function Show-SettingsDialog {
     # Show/Hide Button
     $btnShow = New-Object System.Windows.Forms.Button
     $btnShow.Text = "Show"
-    $btnShow.Location = New-Object System.Drawing.Point(350, 43)
+    $btnShow.Location = New-Object System.Drawing.Point(350, ($yPos - 2))
     $btnShow.Size = New-Object System.Drawing.Size(60, 27)
     $btnShow.Add_Click({
         if ($txtKey.UseSystemPasswordChar) {
@@ -301,63 +315,132 @@ function Show-SettingsDialog {
         }
     })
     $form.Controls.Add($btnShow)
+    $yPos += 40
     
     # Orchestra URL Label
     $lblUrl = New-Object System.Windows.Forms.Label
     $lblUrl.Text = "Orchestra URL:"
-    $lblUrl.Location = New-Object System.Drawing.Point(20, 85)
+    $lblUrl.Location = New-Object System.Drawing.Point(20, $yPos)
     $lblUrl.Size = New-Object System.Drawing.Size(100, 20)
     $form.Controls.Add($lblUrl)
+    $yPos += 25
     
     # Orchestra URL TextBox (read-only)
     $txtUrl = New-Object System.Windows.Forms.TextBox
-    $txtUrl.Location = New-Object System.Drawing.Point(20, 110)
+    $txtUrl.Location = New-Object System.Drawing.Point(20, $yPos)
     $txtUrl.Size = New-Object System.Drawing.Size(390, 25)
     $txtUrl.Text = Get-EnvValue -Key "ORCHESTRA_URL"
     if (-not $txtUrl.Text) { $txtUrl.Text = "https://api.unify.ai/v0" }
     $txtUrl.ReadOnly = $true
     $txtUrl.BackColor = [System.Drawing.SystemColors]::Control
     $form.Controls.Add($txtUrl)
+    $yPos += 40
     
     # Unity Comms URL Label
     $lblComms = New-Object System.Windows.Forms.Label
     $lblComms.Text = "Unity Comms URL:"
-    $lblComms.Location = New-Object System.Drawing.Point(20, 150)
+    $lblComms.Location = New-Object System.Drawing.Point(20, $yPos)
     $lblComms.Size = New-Object System.Drawing.Size(120, 20)
     $form.Controls.Add($lblComms)
+    $yPos += 25
     
     # Unity Comms URL TextBox (read-only)
     $txtComms = New-Object System.Windows.Forms.TextBox
-    $txtComms.Location = New-Object System.Drawing.Point(20, 175)
+    $txtComms.Location = New-Object System.Drawing.Point(20, $yPos)
     $txtComms.Size = New-Object System.Drawing.Size(390, 25)
     $txtComms.Text = Get-EnvValue -Key "UNITY_COMMS_URL"
     if (-not $txtComms.Text) { $txtComms.Text = "https://unity-comms-app-000000000000.us-central1.run.app" }
     $txtComms.ReadOnly = $true
     $txtComms.BackColor = [System.Drawing.SystemColors]::Control
     $form.Controls.Add($txtComms)
+    $yPos += 40
+    
+    # --- Device & Tunnel Info (read-only) ---
+    $deviceId = Get-EnvValue -Key "DEVICE_ID"
+    $tunnelId = Get-EnvValue -Key "TUNNEL_ID"
+    $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
+    
+    # Group label
+    $lblDevice = New-Object System.Windows.Forms.Label
+    $lblDevice.Text = "Device & Tunnel:"
+    $lblDevice.Location = New-Object System.Drawing.Point(20, $yPos)
+    $lblDevice.Size = New-Object System.Drawing.Size(120, 20)
+    $lblDevice.Font = New-Object System.Drawing.Font($lblDevice.Font, [System.Drawing.FontStyle]::Bold)
+    $form.Controls.Add($lblDevice)
+    $yPos += 25
+    
+    # Device ID
+    $lblDeviceId = New-Object System.Windows.Forms.Label
+    $lblDeviceId.Text = "Device ID:"
+    $lblDeviceId.Location = New-Object System.Drawing.Point(20, $yPos)
+    $lblDeviceId.Size = New-Object System.Drawing.Size(80, 20)
+    $form.Controls.Add($lblDeviceId)
+    
+    $txtDeviceId = New-Object System.Windows.Forms.TextBox
+    $txtDeviceId.Location = New-Object System.Drawing.Point(105, $yPos)
+    $txtDeviceId.Size = New-Object System.Drawing.Size(305, 22)
+    $txtDeviceId.Text = if ($deviceId) { $deviceId } else { "(not registered)" }
+    $txtDeviceId.ReadOnly = $true
+    $txtDeviceId.BackColor = [System.Drawing.SystemColors]::Control
+    $form.Controls.Add($txtDeviceId)
+    $yPos += 28
+    
+    # Tunnel ID
+    $lblTunnelId = New-Object System.Windows.Forms.Label
+    $lblTunnelId.Text = "Tunnel ID:"
+    $lblTunnelId.Location = New-Object System.Drawing.Point(20, $yPos)
+    $lblTunnelId.Size = New-Object System.Drawing.Size(80, 20)
+    $form.Controls.Add($lblTunnelId)
+    
+    $txtTunnelId = New-Object System.Windows.Forms.TextBox
+    $txtTunnelId.Location = New-Object System.Drawing.Point(105, $yPos)
+    $txtTunnelId.Size = New-Object System.Drawing.Size(305, 22)
+    $txtTunnelId.Text = if ($tunnelId) { $tunnelId } else { "(not registered)" }
+    $txtTunnelId.ReadOnly = $true
+    $txtTunnelId.BackColor = [System.Drawing.SystemColors]::Control
+    $form.Controls.Add($txtTunnelId)
+    $yPos += 28
+    
+    # Public URL
+    $lblPublicUrl = New-Object System.Windows.Forms.Label
+    $lblPublicUrl.Text = "Public URL:"
+    $lblPublicUrl.Location = New-Object System.Drawing.Point(20, $yPos)
+    $lblPublicUrl.Size = New-Object System.Drawing.Size(80, 20)
+    $form.Controls.Add($lblPublicUrl)
+    
+    $txtPublicUrl = New-Object System.Windows.Forms.TextBox
+    $txtPublicUrl.Location = New-Object System.Drawing.Point(105, $yPos)
+    $txtPublicUrl.Size = New-Object System.Drawing.Size(305, 22)
+    $txtPublicUrl.Text = if ($tunnelUrl) { $tunnelUrl } else { "(not available)" }
+    $txtPublicUrl.ReadOnly = $true
+    $txtPublicUrl.BackColor = [System.Drawing.SystemColors]::Control
+    $form.Controls.Add($txtPublicUrl)
+    $yPos += 40
     
     # Startup Options (always enabled, not user-editable)
     $chkStartup = New-Object System.Windows.Forms.CheckBox
     $chkStartup.Text = "Start on Windows login"
-    $chkStartup.Location = New-Object System.Drawing.Point(20, 215)
+    $chkStartup.Location = New-Object System.Drawing.Point(20, $yPos)
     $chkStartup.Size = New-Object System.Drawing.Size(200, 25)
     $chkStartup.Checked = $true
     $chkStartup.Enabled = $false
     $form.Controls.Add($chkStartup)
+    $yPos += 25
     
     # Auto-start services (always enabled, not user-editable)
     $chkAutoStart = New-Object System.Windows.Forms.CheckBox
     $chkAutoStart.Text = "Start services automatically"
-    $chkAutoStart.Location = New-Object System.Drawing.Point(20, 240)
+    $chkAutoStart.Location = New-Object System.Drawing.Point(20, $yPos)
     $chkAutoStart.Size = New-Object System.Drawing.Size(200, 25)
     $chkAutoStart.Checked = $true
     $chkAutoStart.Enabled = $false
     $form.Controls.Add($chkAutoStart)
+    $yPos += 40
     
     # Save Button
     $btnSave = New-Object System.Windows.Forms.Button
     $btnSave.Text = "Save"
-    $btnSave.Location = New-Object System.Drawing.Point(230, 275)
+    $btnSave.Location = New-Object System.Drawing.Point(230, $yPos)
     $btnSave.Size = New-Object System.Drawing.Size(80, 30)
     $btnSave.Add_Click({
         # Save .env values
@@ -384,7 +467,7 @@ function Show-SettingsDialog {
     # Cancel Button
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = "Cancel"
-    $btnCancel.Location = New-Object System.Drawing.Point(320, 275)
+    $btnCancel.Location = New-Object System.Drawing.Point(320, $yPos)
     $btnCancel.Size = New-Object System.Drawing.Size(80, 30)
     $btnCancel.Add_Click({
         $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
@@ -457,6 +540,28 @@ $stopItem = New-Object System.Windows.Forms.ToolStripMenuItem
 $stopItem.Text = "Stop Services"
 $stopItem.Add_Click({ Stop-Services })
 $contextMenu.Items.Add($stopItem) | Out-Null
+
+# Separator
+$contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+# Copy Public URL
+$copyUrlItem = New-Object System.Windows.Forms.ToolStripMenuItem
+$copyUrlItem.Text = "Copy Public URL"
+$copyUrlItem.Add_Click({
+    $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
+    if ($tunnelUrl) {
+        [System.Windows.Forms.Clipboard]::SetText($tunnelUrl)
+        $script:NotifyIcon.ShowBalloonTip(2000, "Copied", "Public URL copied to clipboard", [System.Windows.Forms.ToolTipIcon]::Info)
+    } else {
+        [System.Windows.Forms.MessageBox]::Show(
+            "No public URL available. Run setup first to register a tunnel.",
+            "No Public URL",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+    }
+})
+$contextMenu.Items.Add($copyUrlItem) | Out-Null
 
 # Separator
 $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null

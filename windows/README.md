@@ -18,8 +18,11 @@ A Windows application that sets up your machine as a remote-controllable AI assi
 git clone https://github.com/unifyai/unify-desktop-assistant.git
 cd unify-desktop-assistant/windows/tools
 
-# Run setup
+# Run setup (auto-registers tunnel & device)
 .\setup.ps1 -UnifyKey <your-unify-key>
+
+# Optionally name your device
+.\setup.ps1 -UnifyKey <your-unify-key> -DeviceName "My Windows PC"
 ```
 
 ## Using the Tray App
@@ -29,9 +32,9 @@ After installation, the **Unify Desktop Assistant** icon appears in your system 
 **Right-click the icon for options:**
 - **▶ Start Services** - Start all background services
 - **■ Stop Services** - Stop all services
-- **🖥 Open Desktop Viewer** - Opens the VNC web viewer
-- **🔗 Open API** - Opens the Agent Service endpoint
-- **⚙ Settings** - Configure your API keys
+- **📋 Copy Public URL** - Copy the tunnel URL to clipboard
+- **⚙ Settings** - Configure your API keys, view device/tunnel info
+- **📄 View Logs** - Open agent service logs
 - **❌ Exit** - Close the tray app
 
 **Status colors:**
@@ -47,6 +50,7 @@ After starting services:
 |---------|-----|
 | Desktop (noVNC) | `http://localhost:6080/custom.html?password=<your-key>` |
 | Agent Service API | `http://localhost:3000` |
+| Public Agent URL | `https://<tunnel-id>.tunnel.unify.ai` (via rathole tunnel) |
 
 ## What Gets Installed
 
@@ -59,42 +63,58 @@ The setup script installs these dependencies on first run:
 - **TightVNC** - VNC server (port 5900)
 - **noVNC** - Web-based VNC client (port 6080)
 - **websockify** - WebSocket to VNC proxy
+- **rathole** - Tunnel client for public HTTPS access
 - **Python 3.12** - For websockify
 - **Node.js LTS** - For agent service
 - **Chocolatey** - Package manager
 - **Git** - For cloning noVNC
 
+## How It Works
+
+1. **Setup** installs all dependencies and starts local services (VNC, websockify, Agent Service)
+2. **Tunnel registration** calls the communication service to allocate a public hostname (`*.tunnel.unify.ai`)
+3. **rathole client** connects to the tunnel server, exposing your local Agent Service (port 3000) via HTTPS
+4. **Device registration** registers this machine with Orchestra, storing the public URL and device ID
+5. Assistants in the Console can then select this device, and Unity uses the public URL to reach your desktop
+
 ## Configuration
 
-Settings are stored in two places:
+Settings are stored in the Agent Service `.env` file:
 
-**Agent Service (.env):**
 ```
+PORT=3000
 UNIFY_KEY=<your-key>
 ORCHESTRA_URL=https://api.unify.ai/v0
 UNITY_COMMS_URL=https://unity-comms-app-000000000000.us-central1.run.app
+
+# Managed by setup/registration (do not edit manually)
+TUNNEL_ID=<tunnel-id>
+TUNNEL_URL=https://<tunnel-id>.tunnel.unify.ai
+TUNNEL_TOKEN=<tunnel-token>
+DEVICE_ID=<device-id>
 ```
 
-**GUI Settings (settings.json):**
-```json
-{"AutoStartServices": false}
-```
-
-Both can be configured via **Settings** in the tray menu.
+Both API key and URLs can be configured via **Settings** in the tray menu. Device/tunnel info is displayed as read-only.
 
 ## Command Line Usage
 
 The setup script can also be run directly:
 
 ```powershell
-# Setup and start services
+# Setup and start services (includes tunnel + device registration)
 .\tools\setup.ps1 -UnifyKey <your-key>
 
-# With custom URLs
-.\tools\setup.ps1 -UnifyKey <your-key> -OrchestraUrl https://api.unify.ai/v0 -UnityCommsUrl https://unity-comms-app-000000000000.us-central1.run.app
+# With custom name and URLs
+.\tools\setup.ps1 -UnifyKey <your-key> -DeviceName "Work PC" -OrchestraUrl https://api.unify.ai/v0
 
-# Stop all services
+# Start all services (no install/config, no admin needed)
+.\tools\setup.ps1 -Start
+
+# Stop all services (includes tunnel)
 .\tools\setup.ps1 -Stop
+
+# Uninstall (stops services, unregisters device & tunnel, removes tasks)
+.\tools\setup.ps1 -Uninstall
 
 # Force reinstall dependencies
 .\tools\setup.ps1 -UnifyKey <your-key> -Force
@@ -107,7 +127,7 @@ The setup script can also be run directly:
 │                     Windows Desktop                          │
 │                                                              │
 │  ┌─────────────────┐   (Tray App)                           │
-│  │ UnifyAssistant  │◀─ Start/Stop/Settings                  │
+│  │ UnifyAssistant  │◀─ Start/Stop/Settings/Copy URL         │
 │  └─────────────────┘                                        │
 │                                                              │
 │  ┌─────────────┐     ┌─────────────┐     ┌───────────────┐  │
@@ -121,19 +141,11 @@ The setup script can also be run directly:
 │  │   │  Magnitude BrowserAgent (Playwright + LLM)        │ ││
 │  │   └───────────────────────────────────────────────────┘ ││
 │  └─────────────────────────────────────────────────────────┘│
+│                                                              │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │  rathole client ──▶ tunnel.unify.ai (public HTTPS)     ││
+│  └─────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────┘
-```
-
-## Optional: HTTPS Tunnels (Cloudflare)
-
-For remote access without setting up your own domain:
-
-```powershell
-# Tunnel Agent Service (port 3000)
-.\tools\tunnel.ps1
-
-# Tunnel VNC viewer (port 6080)
-.\tools\liveview.ps1
 ```
 
 ## Building the Installer
@@ -161,12 +173,13 @@ windows/
 │   └── .env                    # Created on setup
 ├── magnitude/                  # Browser automation (pre-packaged)
 │   └── packages/magnitude-core/
+├── rathole/                    # Tunnel client (downloaded on first run)
+│   ├── rathole.exe
+│   └── client.toml             # Generated on tunnel registration
 ├── gui/
 │   └── UnifyAssistant.ps1      # System tray app
 ├── tools/
 │   ├── setup.ps1               # Main setup script
-│   ├── tunnel.ps1              # Cloudflare tunnel (optional)
-│   ├── liveview.ps1            # Cloudflare VNC tunnel (optional)
 │   └── novnc/                  # Cloned on first run
 ├── installer/
 │   ├── setup.iss               # Inno Setup script
@@ -194,6 +207,18 @@ Check if ports are already in use:
 Get-NetTCPConnection -LocalPort 5900,6080,3000 -State Listen
 ```
 
+### Tunnel Not Connecting
+
+Check the rathole log:
+```
+rathole\rathole.log
+```
+
+Verify tunnel registration in `.env`:
+```powershell
+Get-Content agent-service\.env | Select-String "TUNNEL"
+```
+
 ### View Logs
 
 Agent service logs are saved to:
@@ -213,4 +238,8 @@ cd windows\tools\novnc
 # Start agent service manually
 cd windows\agent-service
 npx ts-node src/index.ts
+
+# Start tunnel manually
+cd windows\rathole
+.\rathole.exe client.toml
 ```

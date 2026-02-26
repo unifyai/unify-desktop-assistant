@@ -24,6 +24,7 @@ param(
     
     [string]$OrchestraUrl = "https://api.unify.ai/v0",
     [string]$UnityCommsUrl = "https://unity-comms-app-000000000000.us-central1.run.app",
+    [string]$DeviceName,
     
     [switch]$Start,
     [switch]$Stop,
@@ -40,6 +41,9 @@ $script:InstallDir = Split-Path -Parent $PSScriptRoot
 $script:NoVncDir = Join-Path $script:ToolsDir 'novnc'
 $script:MagnitudeDir = Join-Path $script:InstallDir 'magnitude'
 $script:AgentServiceDir = Join-Path $script:InstallDir 'agent-service'
+$script:RatholeDir = Join-Path $script:InstallDir 'rathole'
+$script:RatholeExe = Join-Path $script:RatholeDir 'rathole.exe'
+$script:RatholeConfig = Join-Path $script:RatholeDir 'client.toml'
 
 Write-Host ""
 Write-Host "=========================================="
@@ -171,7 +175,8 @@ function Test-FastMode {
     # Components that need installation
     $installChecks = @(
         @{ Path = 'C:\Program Files\TightVNC\tvnserver.exe'; Name = 'TightVNC' },
-        @{ Path = (Join-Path $script:NoVncDir 'vnc.html'); Name = 'noVNC' }
+        @{ Path = (Join-Path $script:NoVncDir 'vnc.html'); Name = 'noVNC' },
+        @{ Path = $script:RatholeExe; Name = 'Rathole' }
     )
     
     $allInstalled = $true
@@ -194,6 +199,9 @@ function Test-FastMode {
 function Stop-AllServices {
     Write-Host ""
     Write-Host "=== Stopping Services ===" -ForegroundColor Cyan
+    
+    # Stop tunnel first
+    Stop-Tunnel
     
     # Use WMI (Get-CimInstance) for reliable CommandLine access across sessions/contexts.
     # Get-Process.CommandLine is unreliable in Windows PowerShell 5.1 and elevated contexts.
@@ -219,12 +227,15 @@ function Stop-AllServices {
         Write-Host "  Stopped cmd.exe wrapper (PID $($proc.ProcessId))" -ForegroundColor Green
     }
     
-    # Stop TightVNC
+    # Stop TightVNC (only if actually running — avoids popup when no instance exists)
     $tvnExe = 'C:\Program Files\TightVNC\tvnserver.exe'
-    if (Test-Path $tvnExe) {
+    $tvnRunning = (Test-PortListening -Port 5900) -or (Get-Process -Name 'tvnserver' -ErrorAction SilentlyContinue)
+    if ($tvnRunning) {
         try { & $tvnExe -controlapp -shutdown 2>&1 | Out-Null } catch {}
         try { & net stop tvnserver 2>&1 | Out-Null } catch {}
         Write-Host "  Stopped TightVNC" -ForegroundColor Green
+    } else {
+        Write-Host "  TightVNC not running, skipping" -ForegroundColor Gray
     }
     
     # Final sweep: kill any remaining processes by port (catches anything the above missed)
@@ -244,10 +255,22 @@ function Uninstall-All {
     Write-Host ""
     Write-Host "=== Uninstalling Unify Desktop Assistant ===" -ForegroundColor Cyan
     
-    # 1. Stop all services
+    # 1. Stop all services (includes tunnel)
     Stop-AllServices
     
-    # 2. Remove scheduled tasks
+    # 2. Unregister desktop and tunnel from server
+    $unifyKey = Get-EnvValue -Key "UNIFY_KEY"
+    $orchestraUrl = Get-EnvValue -Key "ORCHESTRA_URL"
+    $commsUrl = Get-EnvValue -Key "UNITY_COMMS_URL"
+    
+    if ($unifyKey) {
+        Write-Host ""
+        Write-Host "Cleaning up remote registrations..." -ForegroundColor Cyan
+        if ($orchestraUrl) { Unregister-Desktop -UnifyKey $unifyKey -OrchestraUrl $orchestraUrl }
+        if ($commsUrl) { Unregister-Tunnel -UnifyKey $unifyKey -CommsUrl $commsUrl }
+    }
+    
+    # 3. Remove scheduled tasks
     Write-Host ""
     Write-Host "Removing scheduled tasks..." -ForegroundColor Cyan
     foreach ($taskName in @('UnifyWebsockify', 'UnifyAgentService', 'UnifyTightVNC')) {
@@ -258,7 +281,7 @@ function Uninstall-All {
         }
     }
     
-    # 3. Remove firewall rules
+    # 4. Remove firewall rules
     Write-Host ""
     Write-Host "Removing firewall rules..." -ForegroundColor Cyan
     foreach ($ruleName in @('Unify-noVNC', 'Unify-AgentService')) {
@@ -267,6 +290,12 @@ function Uninstall-All {
             Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
             Write-Host "  Removed: $ruleName" -ForegroundColor Green
         }
+    }
+    
+    # 5. Remove rathole directory
+    if (Test-Path $script:RatholeDir) {
+        Remove-Item -Recurse -Force $script:RatholeDir -ErrorAction SilentlyContinue
+        Write-Host "  Removed rathole directory" -ForegroundColor Green
     }
     
     Write-Host ""
@@ -664,6 +693,345 @@ function Install-AgentService {
 }
 
 # =============================================================================
+# Tunnel & Device Functions
+# =============================================================================
+
+function Install-Rathole {
+    Write-Host ""
+    Write-Host "=== Installing Rathole ===" -ForegroundColor Cyan
+    
+    if (Test-Path $script:RatholeExe) {
+        Write-Host "  Rathole already installed" -ForegroundColor Green
+        return
+    }
+    
+    if (-not (Test-Path $script:RatholeDir)) {
+        New-Item -ItemType Directory -Force -Path $script:RatholeDir | Out-Null
+    }
+    
+    Write-Host "  Adding Windows Defender exclusion for rathole directory..."
+    $ratholeVersion = "0.5.0"
+    $downloadUrl = "https://github.com/rapiz1/rathole/releases/download/v$ratholeVersion/rathole-x86_64-pc-windows-msvc.zip"
+    $zipPath = Join-Path $env:TEMP "rathole-$ratholeVersion.zip"
+    
+    Write-Host "  Downloading rathole v$ratholeVersion..."
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
+    
+    Write-Host "  Extracting..."
+    Expand-Archive -Path $zipPath -DestinationPath $script:RatholeDir -Force
+    
+    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+    
+    if (Test-Path $script:RatholeExe) {
+        Write-Host "  Rathole installed" -ForegroundColor Green
+    } else {
+        throw "Rathole installation failed — rathole.exe not found after extraction"
+    }
+}
+
+function Get-EnvValue {
+    param([string]$Key)
+    $envFile = Join-Path $script:AgentServiceDir '.env'
+    if (Test-Path $envFile) {
+        $content = Get-Content $envFile -ErrorAction SilentlyContinue
+        foreach ($line in $content) {
+            if ($line -match "^$Key=(.*)$") {
+                return $matches[1].Trim('"', "'")
+            }
+        }
+    }
+    return ""
+}
+
+function Set-EnvValue {
+    param([string]$Key, [string]$Value)
+    $envFile = Join-Path $script:AgentServiceDir '.env'
+    
+    $envDir = Split-Path -Parent $envFile
+    if (-not (Test-Path $envDir)) {
+        New-Item -ItemType Directory -Force -Path $envDir | Out-Null
+    }
+    
+    $lines = @()
+    $found = $false
+    
+    if (Test-Path $envFile) {
+        $lines = @(Get-Content $envFile -ErrorAction SilentlyContinue)
+    }
+    
+    $newLines = @()
+    foreach ($line in $lines) {
+        if ($line -match "^$Key=") {
+            $newLines += "$Key=$Value"
+            $found = $true
+        } else {
+            $newLines += $line
+        }
+    }
+    
+    if (-not $found) {
+        $newLines += "$Key=$Value"
+    }
+    
+    $newLines | Out-File -FilePath $envFile -Encoding UTF8
+}
+
+function Register-Tunnel {
+    param(
+        [string]$UnifyKey,
+        [string]$CommsUrl,
+        [int]$LocalPort = 3000,
+        [string]$TunnelName
+    )
+    
+    Write-Host ""
+    Write-Host "=== Registering Tunnel ===" -ForegroundColor Cyan
+    
+    # Check for existing tunnel
+    $existingTunnelId = Get-EnvValue -Key "TUNNEL_ID"
+    if ($existingTunnelId) {
+        Write-Host "  Tunnel already registered: $existingTunnelId" -ForegroundColor Green
+        $existingUrl = Get-EnvValue -Key "TUNNEL_URL"
+        if ($existingUrl) {
+            Write-Host "  URL: $existingUrl" -ForegroundColor Green
+        }
+        return
+    }
+    
+    $body = @{ local_port = $LocalPort }
+    if ($TunnelName) { $body.name = $TunnelName }
+    
+    $headers = @{
+        Authorization = "Bearer $UnifyKey"
+        'Content-Type' = 'application/json'
+    }
+    
+    try {
+        $resp = Invoke-RestMethod -Method POST `
+            -Uri "$CommsUrl/infra/tunnel/register" `
+            -Headers $headers `
+            -Body ($body | ConvertTo-Json -Compress) `
+            -ErrorAction Stop
+    } catch {
+        Write-Host "  ERROR: Tunnel registration failed: $_" -ForegroundColor Red
+        return
+    }
+    
+    $tunnelId = $resp.tunnel_id
+    $tunnelUrl = $resp.url
+    $clientConfig = $resp.client_config
+    $clientToken = $resp.client_token
+    
+    # Persist to .env
+    Set-EnvValue -Key "TUNNEL_ID" -Value $tunnelId
+    Set-EnvValue -Key "TUNNEL_URL" -Value $tunnelUrl
+    Set-EnvValue -Key "TUNNEL_TOKEN" -Value $clientToken
+    
+    # Write rathole client config
+    if (-not (Test-Path $script:RatholeDir)) {
+        New-Item -ItemType Directory -Force -Path $script:RatholeDir | Out-Null
+    }
+    $clientConfig | Out-File -FilePath $script:RatholeConfig -Encoding UTF8
+    
+    Write-Host "  Tunnel registered: $tunnelId" -ForegroundColor Green
+    Write-Host "  Public URL: $tunnelUrl" -ForegroundColor Green
+    Write-Host "  Config written to: $($script:RatholeConfig)" -ForegroundColor Gray
+}
+
+function Start-Tunnel {
+    Write-Host ""
+    Write-Host "=== Starting Tunnel ===" -ForegroundColor Cyan
+    
+    if (-not (Test-Path $script:RatholeExe)) {
+        Write-Host "  Rathole not installed, skipping tunnel start" -ForegroundColor Yellow
+        return
+    }
+    
+    if (-not (Test-Path $script:RatholeConfig)) {
+        Write-Host "  No tunnel config found, skipping tunnel start" -ForegroundColor Yellow
+        return
+    }
+    
+    # Check if rathole is already running
+    $existing = Get-CimInstance Win32_Process -Filter "Name = 'rathole.exe'" -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Host "  Tunnel already running (PID $($existing.ProcessId))" -ForegroundColor Green
+        return
+    }
+    
+    $ratholeLog = Join-Path $script:RatholeDir 'rathole.log'
+    
+    Write-Host "  Starting rathole tunnel client..." -ForegroundColor Gray
+    Start-Process cmd.exe -ArgumentList "/c `"`"$($script:RatholeExe)`" `"$($script:RatholeConfig)`" > `"$ratholeLog`" 2>&1`"" -WindowStyle Hidden
+    
+    # Wait briefly for the process to start
+    Start-Sleep -Seconds 2
+    
+    $running = Get-CimInstance Win32_Process -Filter "Name = 'rathole.exe'" -ErrorAction SilentlyContinue
+    if ($running) {
+        $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
+        Write-Host "  Tunnel running (PID $($running.ProcessId))" -ForegroundColor Green
+        if ($tunnelUrl) {
+            Write-Host "  Public URL: $tunnelUrl" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  WARNING: Tunnel may have failed to start. Check log: $ratholeLog" -ForegroundColor Yellow
+        if (Test-Path $ratholeLog) {
+            Get-Content $ratholeLog -Tail 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+        }
+    }
+}
+
+function Stop-Tunnel {
+    # Stop rathole process
+    $ratholeProcs = Get-CimInstance Win32_Process -Filter "Name = 'rathole.exe'" -ErrorAction SilentlyContinue
+    foreach ($proc in $ratholeProcs) {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host "  Stopped rathole tunnel (PID $($proc.ProcessId))" -ForegroundColor Green
+    }
+    
+    # Stop parent cmd.exe processes that launched rathole
+    $cmdProcs = Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe' AND CommandLine LIKE '%rathole%'" -ErrorAction SilentlyContinue
+    foreach ($proc in $cmdProcs) {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host "  Stopped rathole cmd wrapper (PID $($proc.ProcessId))" -ForegroundColor Green
+    }
+}
+
+function Unregister-Tunnel {
+    param(
+        [string]$UnifyKey,
+        [string]$CommsUrl
+    )
+    
+    $tunnelId = Get-EnvValue -Key "TUNNEL_ID"
+    if (-not $tunnelId) { return }
+    
+    Write-Host "  Deleting tunnel $tunnelId..." -ForegroundColor Gray
+    
+    $headers = @{ Authorization = "Bearer $UnifyKey" }
+    try {
+        Invoke-RestMethod -Method DELETE `
+            -Uri "$CommsUrl/infra/tunnel/$tunnelId" `
+            -Headers $headers `
+            -ErrorAction Stop | Out-Null
+        Write-Host "  Tunnel deleted from server" -ForegroundColor Green
+    } catch {
+        Write-Host "  WARNING: Could not delete tunnel from server: $_" -ForegroundColor Yellow
+    }
+    
+    # Clear local state
+    Set-EnvValue -Key "TUNNEL_ID" -Value ""
+    Set-EnvValue -Key "TUNNEL_URL" -Value ""
+    Set-EnvValue -Key "TUNNEL_TOKEN" -Value ""
+    
+    # Remove rathole config
+    if (Test-Path $script:RatholeConfig) {
+        Remove-Item $script:RatholeConfig -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Register-Desktop {
+    param(
+        [string]$UnifyKey,
+        [string]$OrchestraUrl,
+        [string]$DeviceName,
+        [string]$TunnelUrl
+    )
+    
+    Write-Host ""
+    Write-Host "=== Registering Desktop ===" -ForegroundColor Cyan
+    
+    # Check for existing device
+    $existingId = Get-EnvValue -Key "DEVICE_ID"
+    if ($existingId) {
+        Write-Host "  Desktop already registered: ID=$existingId" -ForegroundColor Green
+        # Update URL if it changed
+        if ($TunnelUrl) {
+            Write-Host "  Updating URL to: $TunnelUrl" -ForegroundColor Gray
+            $headers = @{
+                Authorization = "Bearer $UnifyKey"
+                'Content-Type' = 'application/json'
+            }
+            $body = @{ url = $TunnelUrl } | ConvertTo-Json -Compress
+            try {
+                Invoke-RestMethod -Method PATCH `
+                    -Uri "$OrchestraUrl/desktop/$existingId" `
+                    -Headers $headers `
+                    -Body $body `
+                    -ErrorAction Stop | Out-Null
+                Write-Host "  URL updated" -ForegroundColor Green
+            } catch {
+                Write-Host "  WARNING: Could not update desktop URL: $_" -ForegroundColor Yellow
+            }
+        }
+        return
+    }
+    
+    if (-not $TunnelUrl) {
+        Write-Host "  ERROR: No tunnel URL available for desktop registration" -ForegroundColor Red
+        return
+    }
+    
+    if (-not $DeviceName) {
+        $DeviceName = "$env:COMPUTERNAME"
+    }
+    
+    $headers = @{
+        Authorization = "Bearer $UnifyKey"
+        'Content-Type' = 'application/json'
+    }
+    $body = @{
+        name = $DeviceName
+        url = $TunnelUrl
+        os = "windows"
+    } | ConvertTo-Json -Compress
+    
+    try {
+        $resp = Invoke-RestMethod -Method POST `
+            -Uri "$OrchestraUrl/desktop" `
+            -Headers $headers `
+            -Body $body `
+            -ErrorAction Stop
+    } catch {
+        Write-Host "  ERROR: Desktop registration failed: $_" -ForegroundColor Red
+        return
+    }
+    
+    $deviceId = $resp.info.id
+    Set-EnvValue -Key "DEVICE_ID" -Value $deviceId
+    
+    Write-Host "  Desktop registered: ID=$deviceId" -ForegroundColor Green
+    Write-Host "  Name: $DeviceName" -ForegroundColor Gray
+    Write-Host "  URL: $TunnelUrl" -ForegroundColor Gray
+}
+
+function Unregister-Desktop {
+    param(
+        [string]$UnifyKey,
+        [string]$OrchestraUrl
+    )
+    
+    $deviceId = Get-EnvValue -Key "DEVICE_ID"
+    if (-not $deviceId) { return }
+    
+    Write-Host "  Deleting desktop $deviceId..." -ForegroundColor Gray
+    
+    $headers = @{ Authorization = "Bearer $UnifyKey" }
+    try {
+        Invoke-RestMethod -Method DELETE `
+            -Uri "$OrchestraUrl/desktop/$deviceId" `
+            -Headers $headers `
+            -ErrorAction Stop | Out-Null
+        Write-Host "  Desktop deleted from server" -ForegroundColor Green
+    } catch {
+        Write-Host "  WARNING: Could not delete desktop from server (may be assigned to an assistant): $_" -ForegroundColor Yellow
+    }
+    
+    Set-EnvValue -Key "DEVICE_ID" -Value ""
+}
+
+# =============================================================================
 # Configuration Functions
 # =============================================================================
 
@@ -679,6 +1047,12 @@ function Setup-AgentServiceEnv {
     
     $envFile = Join-Path $script:AgentServiceDir '.env'
     
+    # Preserve existing tunnel/device values if .env already exists
+    $existingTunnelId = Get-EnvValue -Key "TUNNEL_ID"
+    $existingTunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
+    $existingTunnelToken = Get-EnvValue -Key "TUNNEL_TOKEN"
+    $existingDeviceId = Get-EnvValue -Key "DEVICE_ID"
+    
     $envContent = @"
 # Agent Service Environment Configuration
 # Generated: $(Get-Date)
@@ -687,6 +1061,12 @@ PORT=3000
 UNIFY_KEY=$UnifyKey
 ORCHESTRA_URL=$OrchestraUrl
 UNITY_COMMS_URL=$UnityCommsUrl
+
+# Tunnel & Device (managed by setup/registration)
+TUNNEL_ID=$existingTunnelId
+TUNNEL_URL=$existingTunnelUrl
+TUNNEL_TOKEN=$existingTunnelToken
+DEVICE_ID=$existingDeviceId
 "@
     
     $envContent | Out-File -FilePath $envFile -Encoding UTF8
@@ -695,6 +1075,12 @@ UNITY_COMMS_URL=$UnityCommsUrl
     Write-Host "    UNIFY_KEY: $(if ($UnifyKey) { '(set)' } else { '(not set)' })" -ForegroundColor Gray
     Write-Host "    ORCHESTRA_URL: $OrchestraUrl" -ForegroundColor Gray
     Write-Host "    UNITY_COMMS_URL: $UnityCommsUrl" -ForegroundColor Gray
+    if ($existingDeviceId) {
+        Write-Host "    DEVICE_ID: $existingDeviceId (preserved)" -ForegroundColor Gray
+    }
+    if ($existingTunnelId) {
+        Write-Host "    TUNNEL_ID: $existingTunnelId (preserved)" -ForegroundColor Gray
+    }
 }
 
 function Setup-WebsockifyStartup {
@@ -935,6 +1321,11 @@ function Start-AllServices {
         Write-Host ""
         Write-Host "  Some services failed to start. Check the log files above for details." -ForegroundColor Yellow
     }
+    
+    # Start tunnel after local services are confirmed up
+    if ($allOk) {
+        Start-Tunnel
+    }
 }
 
 # =============================================================================
@@ -951,7 +1342,7 @@ function Show-Summary {
     Write-Host "  Setup Complete!"
     Write-Host "=========================================="
     Write-Host ""
-    Write-Host "Access URLs:" -ForegroundColor Cyan
+    Write-Host "Local URLs:" -ForegroundColor Cyan
     
     $vncUrl = "http://localhost:6080/custom.html"
     if ($UnifyKey) {
@@ -960,6 +1351,25 @@ function Show-Summary {
     
     Write-Host "  Desktop:       $vncUrl" -ForegroundColor Green
     Write-Host "  Agent Service: http://localhost:3000" -ForegroundColor Green
+    
+    # Tunnel & Device info
+    $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
+    $tunnelId = Get-EnvValue -Key "TUNNEL_ID"
+    $deviceId = Get-EnvValue -Key "DEVICE_ID"
+    
+    if ($tunnelUrl) {
+        Write-Host ""
+        Write-Host "Public Access:" -ForegroundColor Cyan
+        Write-Host "  Tunnel URL:  $tunnelUrl" -ForegroundColor Green
+        Write-Host "  Tunnel ID:   $tunnelId" -ForegroundColor Gray
+    }
+    
+    if ($deviceId) {
+        Write-Host ""
+        Write-Host "Device Registration:" -ForegroundColor Cyan
+        Write-Host "  Device ID:   $deviceId" -ForegroundColor Green
+    }
+    
     Write-Host ""
     Write-Host "Time elapsed: $([math]::Round($elapsed.TotalSeconds, 1)) seconds" -ForegroundColor Magenta
     Write-Host ""
@@ -1024,6 +1434,7 @@ try {
         Install-Websockify
         Install-Magnitude -Force:$Force
         Install-AgentService -Force:$Force
+        Install-Rathole
     }
 
     # Always run configuration
@@ -1034,8 +1445,18 @@ try {
     Setup-AgentServiceStartup
     Configure-Firewall
 
-    # Start services
+    # Start services (includes tunnel start after local services are up)
     Start-AllServices
+
+    # Register tunnel and desktop (final step after everything is running)
+    Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl -LocalPort 3000 -TunnelName $DeviceName
+    
+    $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
+    if ($tunnelUrl) {
+        # Ensure tunnel is running with the freshly-written config
+        Start-Tunnel
+        Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $tunnelUrl
+    }
 
     # Show summary
     Show-Summary -UnifyKey $UnifyKey
