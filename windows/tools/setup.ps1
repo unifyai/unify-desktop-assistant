@@ -227,7 +227,7 @@ function Stop-AllServices {
         Write-Host "  Stopped cmd.exe wrapper (PID $($proc.ProcessId))" -ForegroundColor Green
     }
     
-    # Stop TightVNC (only if actually running — avoids popup when no instance exists)
+    # Stop TightVNC (only if actually running - avoids popup when no instance exists)
     $tvnExe = 'C:\Program Files\TightVNC\tvnserver.exe'
     $tvnRunning = (Test-PortListening -Port 5900) -or (Get-Process -Name 'tvnserver' -ErrorAction SilentlyContinue)
     if ($tvnRunning) {
@@ -725,7 +725,7 @@ function Install-Rathole {
     if (Test-Path $script:RatholeExe) {
         Write-Host "  Rathole installed" -ForegroundColor Green
     } else {
-        throw "Rathole installation failed — rathole.exe not found after extraction"
+        throw "Rathole installation failed -- rathole.exe not found after extraction"
     }
 }
 
@@ -1255,7 +1255,7 @@ function Start-AllServices {
     $agentLog = Join-Path $script:AgentServiceDir 'agent.log'
     if (-not (Test-PortListening -Port 3000)) {
         Write-Host "  Starting Agent Service..." -ForegroundColor Gray
-        Start-Process cmd.exe -ArgumentList "/c cd /d `"$($script:AgentServiceDir)`" && npx -y ts-node src/index.ts > `"$agentLog`" 2>&1" -WindowStyle Hidden
+        Start-Process cmd.exe -ArgumentList "/c cd /d `"$($script:AgentServiceDir)`" & npx -y ts-node src/index.ts > `"$agentLog`" 2>&1" -WindowStyle Hidden
     }
     
     # Poll for services to come up (up to 20 seconds)
