@@ -1,8 +1,8 @@
 # Build Windows Installer
 #
 # Compiles the Inno Setup installer for Unify Desktop Assistant.
-# Manually triggered. Choose environment (main/staging) and optional version.
-# Uploads the .exe as a build artifact.
+# Manually triggered. Choose environment (main/staging) and version.
+# Publishes the .exe to a GitHub Release.
 
 name: Build Windows Installer
 
@@ -18,7 +18,7 @@ on:
           - staging
         default: main
       version:
-        description: 'Version override (e.g. 1.2.0). Leave empty to use default from setup.iss.'
+        description: 'Version (e.g. 1.2.0). Leave empty to use default from setup.iss.'
         required: false
         type: string
 
@@ -29,6 +29,8 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -62,10 +64,31 @@ jobs:
           Write-Host "Running: .\windows\installer\build.ps1 $($buildArgs -join ' ')"
           & .\windows\installer\build.ps1 @buildArgs
 
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+      - name: Determine version tag
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.version }}"
+          if ($version -eq '') {
+            $issContent = Get-Content windows/installer/setup.iss -Raw
+            if ($issContent -match '#define MyAppVersion\s+"([^"]+)"') {
+              $version = $Matches[1]
+            } else {
+              Write-Error "Could not determine version from setup.iss"
+              exit 1
+            }
+          }
+          $suffix = if ("${{ inputs.environment }}" -eq 'staging') { '-staging' } else { '' }
+          $tag = "v${version}-windows${suffix}"
+          Write-Host "Version: $version, Tag: $tag"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: windows-installer-${{ inputs.environment }}-${{ github.sha }}
-          path: windows/installer/output/*.exe
-          if-no-files-found: error
-          retention-days: 90
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Windows Installer ${{ steps.version.outputs.version }} (${{ inputs.environment }})
+          files: windows/installer/output/*.exe
+          prerelease: ${{ inputs.environment == 'staging' }}
+          generate_release_notes: false
