@@ -3,54 +3,78 @@
 # Each platform folder (windows/, macos/, ubuntu/) is self-contained with its
 # own copy of agent-service/ and magnitude/. This workflow keeps them in sync
 # with the canonical source in unifyai/unity.
+#
+# agent-service: synced from the matching branch (main->main, staging->staging)
+# magnitude: always synced from the unity-modifications branch
+#
+# Runs daily at midnight UTC on both main and staging branches,
+# or manually via workflow_dispatch.
 
 name: Sync shared components
 
-# on:
-#   workflow_dispatch:
-#   schedule:
-#     - cron: '0 0 * * *'   # daily at midnight UTC
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
-# permissions:
-#   contents: write
+permissions:
+  contents: write
 
-# jobs:
-#   sync:
-#     runs-on: ubuntu-latest
-#     strategy:
-#       matrix:
-#         platform: [windows, macos, ubuntu]
-#     steps:
-#       - name: Checkout this repository
-#         uses: actions/checkout@v4
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        branch: [main, staging]
+    steps:
+      - name: Checkout this repository (${{ matrix.branch }})
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
 
-#       - name: Checkout unifyai/unity
-#         uses: actions/checkout@v4
-#         with:
-#           repository: unifyai/unity
-#           ref: main
-#           token: ${{ secrets.CLONE_TOKEN }}
-#           path: _unity
-#           fetch-depth: 1
+      - name: Checkout agent-service from unifyai/unity (${{ matrix.branch }})
+        uses: actions/checkout@v4
+        with:
+          repository: unifyai/unity
+          ref: ${{ matrix.branch }}
+          token: ${{ secrets.CLONE_TOKEN }}
+          path: _unity_agent
+          sparse-checkout: agent-service
+          fetch-depth: 1
 
-#       - name: Copy agent-service
-#         run: |
-#           rm -rf ${{ matrix.platform }}/agent-service
-#           cp -a _unity/agent-service ${{ matrix.platform }}/agent-service
+      - name: Checkout magnitude from unifyai/magnitude (unity-modifications)
+        uses: actions/checkout@v4
+        with:
+          repository: unifyai/magnitude
+          ref: unity-modifications
+          token: ${{ secrets.CLONE_TOKEN }}
+          path: _magnitude
+          fetch-depth: 1
 
-#       - name: Copy magnitude
-#         run: |
-#           rm -rf ${{ matrix.platform }}/magnitude
-#           cp -a _unity/magnitude ${{ matrix.platform }}/magnitude
+      - name: Sync into platform folders
+        run: |
+          for platform in windows; do
+            echo "=== Syncing $platform ==="
 
-#       - name: Commit and push if changed
-#         run: |
-#           git config user.name "github-actions[bot]"
-#           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-#           git add ${{ matrix.platform }}/agent-service ${{ matrix.platform }}/magnitude
-#           if ! git diff --cached --quiet; then
-#             git commit -m "chore: sync agent-service & magnitude into ${{ matrix.platform }}/"
-#             git push
-#           else
-#             echo "No changes for ${{ matrix.platform }}"
-#           fi
+            rm -rf "$platform/agent-service"
+            cp -a _unity_agent/agent-service "$platform/agent-service"
+            echo "  agent-service copied (${{ matrix.branch }})"
+
+            rm -rf "$platform/magnitude"
+            cp -a _magnitude "$platform/magnitude"
+            rm -rf "$platform/magnitude/.git"
+            echo "  magnitude copied (unity-modifications)"
+          done
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add windows/
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: sync agent-service & magnitude from unity (${{ matrix.branch }})"
+            git push
+          else
+            echo "No changes detected on ${{ matrix.branch }}"
+          fi
