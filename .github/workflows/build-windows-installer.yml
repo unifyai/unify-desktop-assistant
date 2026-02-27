@@ -84,11 +84,17 @@ jobs:
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
 
+      - name: Rename installer
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem windows/installer/output/*.exe | Select-Object -First 1
+          Move-Item $exe.FullName windows/installer/output/unify-desktop-assistant.exe
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Windows Installer ${{ steps.version.outputs.version }} (${{ inputs.environment }})
-          files: windows/installer/output/*.exe
+          files: windows/installer/output/unify-desktop-assistant.exe
           prerelease: ${{ inputs.environment == 'staging' }}
           generate_release_notes: false
