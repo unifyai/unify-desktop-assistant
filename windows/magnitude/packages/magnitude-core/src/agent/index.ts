@@ -81,26 +81,28 @@ export class Agent {
     
     //public readonly memory: AgentMemory;
     private doneActing: boolean;
+    private _paused: boolean = false;
+    private _pauseResolve: (() => void) | null = null;
 
     protected latestTaskMemory: AgentMemory;// | null = null;
 
     private visualCacheConfig = {
-        enabled: process.env.CACHE_ENABLED === 'true',
+        enabled: process.env.UNITY_MAGNITUDE_CACHE_ENABLED === 'true',
         apiUrl: process.env.UNIFY_BASE_URL || 'http://localhost:8000/v0',
         project: process.env.UNIFY_PROJECT || 'Assistants',
-        context: process.env.CACHE_CONTEXT || 'VisualSemanticCache',
+        context: process.env.UNITY_MAGNITUDE_CACHE_CONTEXT || 'VisualSemanticCache',
         // Embedding-based caching (primary method when enabled)
-        useImageEmbedding: process.env.CACHE_USE_IMAGE_EMBEDDING === 'true', // Controls whether to use embeddings or pHash
-        imageEmbeddingThreshold: parseFloat(process.env.CACHE_IMAGE_EMBEDDING_THRESHOLD || '0.15'), // Max cosine distance for full image embedding
-        roiEmbeddingThreshold: parseFloat(process.env.CACHE_ROI_EMBEDDING_THRESHOLD || '0.15'), // Max cosine distance for ROI embedding
+        useImageEmbedding: process.env.UNITY_MAGNITUDE_CACHE_USE_IMAGE_EMBEDDING === 'true', // Controls whether to use embeddings or pHash
+        imageEmbeddingThreshold: parseFloat(process.env.UNITY_MAGNITUDE_CACHE_IMAGE_EMBEDDING_THRESHOLD || '0.15'), // Max cosine distance for full image embedding
+        roiEmbeddingThreshold: parseFloat(process.env.UNITY_MAGNITUDE_CACHE_ROI_EMBEDDING_THRESHOLD || '0.15'), // Max cosine distance for ROI embedding
         // pHash-based caching (fallback when embeddings disabled)
-        visualsimilarityThreshold: parseInt(process.env.CACHE_VISUAL_SIMILARITY_THRESHOLD || '35', 10), // Max hamming distance for pHash comparison
-        roiPhashThreshold: parseInt(process.env.CACHE_ROI_PHASH_THRESHOLD || '3', 10), // Max hamming distance for ROI pHash comparison
+        visualsimilarityThreshold: parseInt(process.env.UNITY_MAGNITUDE_CACHE_VISUAL_SIMILARITY_THRESHOLD || '35', 10), // Max hamming distance for pHash comparison
+        roiPhashThreshold: parseInt(process.env.UNITY_MAGNITUDE_CACHE_ROI_PHASH_THRESHOLD || '3', 10), // Max hamming distance for ROI pHash comparison
         // Common settings
-        textSimilarityThreshold: parseFloat(process.env.CACHE_TEXT_SIMILARITY_THRESHOLD || '0.1'), // Max cosine similarity for text comparison
+        textSimilarityThreshold: parseFloat(process.env.UNITY_MAGNITUDE_CACHE_TEXT_SIMILARITY_THRESHOLD || '0.1'), // Max cosine similarity for text comparison
         overwrite: process.env.UNIFY_OVERWRITE_PROJECT === 'true', // Whether to overwrite existing project/context
-        roiWidth: parseInt(process.env.CACHE_ROI_WIDTH || '100', 10), // Width of ROI around first interaction
-        roiHeight: parseInt(process.env.CACHE_ROI_HEIGHT || '100', 10), // Height of ROI around first interaction
+        roiWidth: parseInt(process.env.UNITY_MAGNITUDE_CACHE_ROI_WIDTH || '100', 10), // Width of ROI around first interaction
+        roiHeight: parseInt(process.env.UNITY_MAGNITUDE_CACHE_ROI_HEIGHT || '100', 10), // Height of ROI around first interaction
     };
     constructor(baseConfig: Partial<AgentOptions> = {}) {
         this.options = {
@@ -127,7 +129,7 @@ export class Agent {
         let doPromptCaching = false;
         for (const client of llms ) {
             // If any LLM is prompt-caching compatible, turn on prompt caching overall for memory etc.
-            if (isClaude(client) && (client.provider === 'anthropic' || client.provider === 'claude-code')) {
+            if (isClaude(client) && (client.provider === 'anthropic' || client.provider === 'claude-code' || client.provider === 'openai-generic')) {
                 // Prompt-caching compatible client
 
                 if ('promptCaching' in client.options && client.options.promptCaching !== undefined) {
@@ -144,6 +146,8 @@ export class Agent {
         this.models = new MultiModelHarness(llms);
         this.models.events.on('tokensUsed', (usage) => this.events.emit('tokensUsed', usage), this);
         this.doneActing = false;
+        this._paused = false;
+        this._pauseResolve = null;
 
         this.memoryOptions = {
             // TODO: maybe do if Gemini or other prompt caching supported providers as well
@@ -536,6 +540,9 @@ export class Agent {
 
             // Execute partial recipe
             for (const action of actions) {
+
+                await this._waitIfPaused();
+                if (this.doneActing) break;
                 if (signal.aborted) {
                     throw new AgentError("Action was interrupted by the user.", { variant: 'cancelled' });
                 }
@@ -552,6 +559,7 @@ export class Agent {
             // if (finished) {
             //     break;
             // }
+            await this._waitIfPaused();
             if (this.doneActing) {
                 if (this.visualCacheConfig.enabled && initialScreenshot && fullTrajectory.length > 0) {
                     logger.info("Task complete. Populating cache with full trajectory.");
@@ -1319,12 +1327,42 @@ export class Agent {
         this.doneActing = true;
     }
 
+    private async _waitIfPaused(): Promise<void> {
+        if (!this._paused) return;
+        this.events.emit('pause');
+        logger.info("Agent: Paused");
+        await new Promise<void>((resolve) => {
+            this._pauseResolve = resolve;
+        });
+    }
+
+    pause(): void {
+        this._paused = true;
+    }
+
+    resume(): void {
+        this._paused = false;
+        if (this._pauseResolve) {
+            this._pauseResolve();
+            this._pauseResolve = null;
+        }
+        this.events.emit('resume');
+        logger.info("Agent: Resumed");
+    }
+
+    get paused(): boolean {
+        return this._paused;
+    }
+
     async stop() {
         /**
          * Stop the agent and close the browser context.
          * May be called asynchronously and interrupt an agent in the middle of a action sequence.
          */
-        // set signal to cancelled?
+        this.doneActing = true;
+        if (this._paused) {
+            this.resume(); // unblock so loop can see doneActing and exit
+        }
         logger.info("Agent: Stopping connectors...");
         for (const connector of this.connectors) {
             try {

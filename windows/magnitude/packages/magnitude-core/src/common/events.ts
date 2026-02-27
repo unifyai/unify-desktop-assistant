@@ -19,5 +19,8 @@ export interface AgentEvents {
     'actionStarted': (action: Action) => void;
     'actionDone': (action: Action) => void;
 
+    'pause': () => void;
+    'resume': () => void;
+
     'tokensUsed': (usage: ModelUsage) => void;
 }

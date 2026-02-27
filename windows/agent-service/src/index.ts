@@ -4,7 +4,7 @@ import http from 'http';
 import expressWs from 'express-ws';
 import WebSocket from 'ws';
 import util from 'util';
-import { startBrowserAgent, BrowserAgent, BrowserConnector, AgentError, BrowserOptions } from 'magnitude-core';
+import { startBrowserAgent, BrowserAgent, BrowserConnector, AgentError, BrowserOptions, AgentMemory, Observation } from 'magnitude-core';
 import { z, ZodTypeAny, ZodAny, ZodType } from 'zod';
 import { partitionHtml, serializeToMarkdown, PartitionOptions, MarkdownSerializerOptions } from 'magnitude-extract';
 import dotenv from 'dotenv';
@@ -13,14 +13,19 @@ import os from 'os';
 import path from 'path';
 import fs from 'fs';
 import { randomUUID } from 'crypto';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import multer from 'multer';
 import { jsonSchemaToZod } from './jsonSchemaToZod';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // --- File System and Command Execution Utilities ---
-const UNITY_WORKSPACE_DIR = path.join(path.parse(process.cwd()).root, 'Unity');
+//
+// Workspace root for file operations, command execution, and browser downloads.
+// Matches Unity's get_local_root() default of ~/Unity/Local.
+// Override via UNITY_LOCAL_ROOT env var.
+const LOCAL_ROOT = process.env.UNITY_LOCAL_ROOT || path.join(os.homedir(), 'Unity', 'Local');
+try { fs.mkdirSync(LOCAL_ROOT, { recursive: true }); } catch (_e) { /* ignore */ }
 const DEFAULT_EXEC_TIMEOUT = 60 * 60 * 1000; // 1 hour
 
 
@@ -140,165 +145,9 @@ function executeCommand(command: string, cwd: string, timeout: number, shellMode
   });
 }
 
-// Execute command in interactive user session (for COM automation like Excel)
-async function executeCommandInUserSession(
-  command: string,
-  cwd: string,
-  timeout: number,
-  execId: string
-): Promise<ExecResult> {
-  const startTime = Date.now();
-  const taskName = `unity_exec_${execId}`;
-  const scriptFile = path.join(UNITY_WORKSPACE_DIR, `_script_${execId}.ps1`);
-  const resultFile = path.join(UNITY_WORKSPACE_DIR, `_result_${execId}.json`);
-
-  // Escape single quotes for PowerShell
-  const escapedCwd = cwd.replace(/\\/g, '\\\\').replace(/'/g, "''");
-  const escapedCommand = command.replace(/'/g, "''");
-  const escapedResultFile = resultFile.replace(/\\/g, '\\\\');
-
-  // PowerShell script that executes command and saves results to JSON
-  const scriptContent = `
-$ErrorActionPreference = 'Continue'
-$startTime = Get-Date
-$stdout = ''
-$stderr = ''
-$exitCode = 0
-
-try {
-    Set-Location -Path '${escapedCwd}'
-    $output = Invoke-Expression '${escapedCommand}' 2>&1
-    $stdout = ($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "\`n"
-    $stderr = ($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) -join "\`n"
-} catch {
-    $stderr = $_.Exception.Message
-    $exitCode = 1
-}
-
-$duration = ((Get-Date) - $startTime).TotalMilliseconds
-
-$resultJson = @{
-    exitCode = $exitCode
-    stdout = $stdout
-    stderr = $stderr
-    duration = [int]$duration
-} | ConvertTo-Json
-
-# Write without BOM (Out-File adds BOM which breaks JSON.parse in Node.js)
-[System.IO.File]::WriteAllText('${escapedResultFile}', $resultJson, [System.Text.UTF8Encoding]::new($false))
-`;
-
-  await writeFileWithEncoding(scriptFile, scriptContent, 'text');
-
-  const escapedScriptFile = scriptFile.replace(/\\/g, '\\\\');
-
-  // PowerShell script to create and run scheduled task in user session
-  const createTaskScript = `
-$taskName = '${taskName}'
-$scriptPath = '${escapedScriptFile}'
-
-# Get the currently logged-in user
-$loggedInUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName
-
-if (-not $loggedInUser) {
-    Write-Error 'No user logged in'
-    exit 1
-}
-
-Write-Host "Running task as user: $loggedInUser"
-
-# Create scheduled task action (hidden window)
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \`"$scriptPath\`""
-
-# Create principal for interactive user session
-$principal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType Interactive -RunLevel Highest
-
-# Register and run the task
-Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
-Start-ScheduledTask -TaskName $taskName
-
-# Wait for task to complete
-$maxWait = ${timeout}
-$waited = 0
-while ($waited -lt $maxWait) {
-    Start-Sleep -Milliseconds 500
-    $waited += 500
-    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($task.State -eq 'Ready') {
-        break
-    }
-}
-
-# Cleanup task
-Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-`;
-
-  return new Promise((resolve) => {
-    const proc = spawn(createTaskScript, [], {
-      shell: 'powershell.exe',
-      cwd: UNITY_WORKSPACE_DIR,
-      timeout,
-    });
-
-    let createStdout = '';
-    let createStderr = '';
-
-    proc.stdout.on('data', (data) => {
-      createStdout += data.toString();
-    });
-
-    proc.stderr.on('data', (data) => {
-      createStderr += data.toString();
-    });
-
-    proc.on('close', async () => {
-      let result: ExecResult = {
-        exitCode: 1,
-        stdout: createStdout,
-        stderr: createStderr || 'Task execution failed',
-        duration: Date.now() - startTime,
-      };
-
-      // Wait a moment for result file to be written
-      await new Promise(r => setTimeout(r, 1000));
-
-      try {
-        const resultJson = await fs.promises.readFile(resultFile, 'utf-8');
-        const parsed = JSON.parse(resultJson);
-        result = {
-          exitCode: parsed.exitCode ?? 0,
-          stdout: parsed.stdout ?? '',
-          stderr: parsed.stderr ?? '',
-          duration: parsed.duration ?? (Date.now() - startTime),
-        };
-      } catch (e) {
-        result.stderr += `\nFailed to read result file: ${e}`;
-      }
-
-      // Cleanup temp files
-      try {
-        await fs.promises.unlink(scriptFile);
-      } catch (_e) { /* ignore */ }
-      try {
-        await fs.promises.unlink(resultFile);
-      } catch (_e) { /* ignore */ }
-
-      resolve(result);
-    });
-  });
-}
-
 function getDefaultBrowserPaths() {
-  const base = path.join(UNITY_WORKSPACE_DIR, 'Local');
-  const downloadsPath = path.join(base, 'Downloads');
-  const tracesDir = path.join(base, 'Traces');
-  try {
-    fs.mkdirSync(downloadsPath, { recursive: true });
-    fs.mkdirSync(tracesDir, { recursive: true });
-  } catch (_e) {
-    // ignore directory creation errors; downstream may still handle
-  }
+  const downloadsPath = path.join(LOCAL_ROOT, 'Downloads');
+  const tracesDir = path.join(LOCAL_ROOT, 'Traces');
   return { downloadsPath, tracesDir };
 }
 
@@ -307,6 +156,21 @@ const defaultBrowserPaths = getDefaultBrowserPaths();
 const app = express();
 const wsInstance = expressWs(app);
 app.use(express.json({ limit: '100mb' }));
+
+const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || '').split(',').filter(Boolean);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 // --- Authorization (Bearer) middleware ---
 function verifyApiKeyWithUnify(apiKey: string): Promise<boolean> {
@@ -345,10 +209,7 @@ async function auth(req: Request, res: Response, next: Function) {
   if (!match) {
     return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid API key' });
   }
-  // Allow optional trailing metadata (e.g., assistant email) after the token.
-  // Clients may send: "Bearer <UNIFY_KEY> <ASSISTANT_EMAIL>".
-  const apiKeyRaw = match[1].trim();
-  const apiKey = apiKeyRaw.split(/\s+/)[0];
+  const apiKey = match[1].trim();
 
   // Check 1: Bearer token must match UNIFY_KEY
   if (apiKey !== process.env.UNIFY_KEY) {
@@ -370,12 +231,31 @@ async function auth(req: Request, res: Response, next: Function) {
 
 app.use(auth);
 
-// Session registry: maps sessionId to BrowserAgent
+// --- CLI argument parsing ---
+function parseIntArg(flag: string, defaultValue: number): number {
+  const idx = process.argv.indexOf(flag);
+  if (idx !== -1 && idx + 1 < process.argv.length) {
+    const val = parseInt(process.argv[idx + 1], 10);
+    return isNaN(val) ? defaultValue : val;
+  }
+  return defaultValue;
+}
+
+const ACT_HISTORY_DEPTH = parseIntArg('--history-depth', 5);
+console.log(`[memory-carryover] Act history depth: ${ACT_HISTORY_DEPTH}`);
+
+// --- Session registry ---
+interface ActHistoryEntry {
+  task: string;
+  observations: Observation[];
+}
+
 interface SessionInfo {
   agent: BrowserAgent;
-  mode: 'web' | 'desktop';
+  mode: 'web' | 'desktop' | 'web-vm';
   createdAt: Date;
   lastAccessed: Date;
+  actHistory: ActHistoryEntry[];
 }
 
 const activeSessions = new Map<string, SessionInfo>();
@@ -487,9 +367,18 @@ app.listen(port, () => {
 });
 
 const isAgentReady = (req: Request, res: Response, next: Function) => {
-  const sessionId = req.body.sessionId;
+  let sessionId = req.body.sessionId;
   if (!sessionId) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
+    // Desktop mode is singleton (one physical display, one session).
+    // Callers that omit sessionId are targeting the desktop.
+    const desktopEntry = [...activeSessions.entries()]
+      .find(([, s]) => s.mode === "desktop");
+    if (desktopEntry) {
+      sessionId = desktopEntry[0];
+      req.body.sessionId = sessionId;
+    } else {
+      return res.status(400).json({ error: 'no_desktop_session', message: 'No active desktop session. Call /start with mode=desktop first.' });
+    }
   }
   const session = activeSessions.get(sessionId);
   if (!session) {
@@ -516,8 +405,11 @@ const getLaunchOptions = (headless: boolean, downloadsPath: string | null = null
 
 const startDesktop = async (): Promise<BrowserAgent> => {
   try {
+    const encodedPassword = encodeURIComponent(process.env.UNIFY_KEY || '');
+    const desktopUrl = `http://localhost:6080/custom.html?password=${encodedPassword}`;
+    const desktopOrigin = new URL(desktopUrl).origin;
     const agent = await startBrowserAgent({
-      url: `http://localhost:6080/custom.html?password=${process.env.UNIFY_KEY}`,
+      url: desktopUrl,
       browser: getLaunchOptions(true),
       prompt: "You're controlling a noVNC virtual desktop page. Do not navigate to other page and use mouse and keyboard to control the browser and apps within the virtual desktop. There may be a terminal (xterm) app launched in the desktop for use.",
       narrate: true,
@@ -525,7 +417,7 @@ const startDesktop = async (): Promise<BrowserAgent> => {
       llm: {
         provider: 'openai-generic',
         options: {
-          model: 'claude-4.5-opus@anthropic',
+          model: 'claude-4.6-opus@anthropic',
           baseUrl: `${process.env.UNITY_COMMS_URL}/unillm`,
           headers: {
             'Authorization': `Bearer ${process.env.UNIFY_KEY}`,
@@ -535,6 +427,11 @@ const startDesktop = async (): Promise<BrowserAgent> => {
       }
     });
     agent.context.setDefaultNavigationTimeout(90000);
+    // Auto-grant clipboard permissions so the noVNC "Share clipboard?" popup is suppressed
+    await agent.context.grantPermissions(
+      ['clipboard-read', 'clipboard-write'],
+      { origin: desktopOrigin },
+    );
     console.log("✅ Desktop BrowserAgent started successfully.");
     return agent;
   } catch (err) {
@@ -553,7 +450,7 @@ const startBrowser = async (headless: boolean): Promise<BrowserAgent> => {
       llm: {
         provider: 'openai-generic',
         options: {
-          model: 'claude-4.5-opus@anthropic',
+          model: 'claude-4.6-opus@anthropic',
           baseUrl: `${process.env.UNITY_COMMS_URL}/unillm`,
           headers: {
             'Authorization': `Bearer ${process.env.UNIFY_KEY}`,
@@ -571,35 +468,93 @@ const startBrowser = async (headless: boolean): Promise<BrowserAgent> => {
   }
 }
 
+const startBrowserOnVm = async (): Promise<BrowserAgent> => {
+  try {
+    const agent = await startBrowserAgent({
+      url: "https://www.duckduckgo.com/",
+      browser: { launchOptions: {
+        headless: false,
+        args: [
+          "--disable-blink-features=AutomationControlled",
+          "--disable-features=IsolateOrigins,site-per-process",
+          '--auto-select-desktop-capture-source="Entire screen"',
+        ],
+        downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
+        tracesDir: defaultBrowserPaths.tracesDir || undefined,
+      }},
+      narrate: true,
+      llm: {
+        provider: 'openai-generic',
+        options: {
+          model: 'claude-4.6-opus@anthropic',
+          baseUrl: `${process.env.UNITY_COMMS_URL}/unillm`,
+          headers: {
+            'Authorization': `Bearer ${process.env.UNIFY_KEY}`,
+          },
+          temperature: 0.2,
+        }
+      }
+    });
+    agent.context.setDefaultNavigationTimeout(90000);
+    console.log("✅ Web-VM BrowserAgent started successfully.");
+    return agent;
+  } catch (err) {
+    console.error("❌ Failed to start Web-VM BrowserAgent:", err);
+    throw err;
+  }
+}
+
 // --- API Endpoints ---
 app.post('/start', async (req: Request, res: Response) => {
   const { headless, mode } = req.body;
-  if (!mode || (mode !== "desktop" && mode !== "web")) {
+  if (!mode || !['desktop', 'web', 'web-vm'].includes(mode)) {
     return res.status(400).json({
       error: 'bad_request',
       message:
-        'Mode is required and must be either "desktop" or "web".',
+        'Mode is required and must be "desktop", "web", or "web-vm".',
     });
   }
 
+  // Desktop mode is singleton -- one physical display, one session.
+  // Close any existing desktop session before creating a new one.
+  if (mode === "desktop") {
+    for (const [existingId, existing] of activeSessions.entries()) {
+      if (existing.mode === "desktop") {
+        console.log(`Replacing existing desktop session: ${existingId}`);
+        existing.agent.stop().catch((err: unknown) =>
+          console.error(`Error stopping old desktop session: ${err}`)
+        );
+        activeSessions.delete(existingId);
+      }
+    }
+  }
+
   const sessionId = randomUUID();
+  const t0 = Date.now();
+  console.log(`[start] BEGIN mode=${mode} sessionId=${sessionId}`);
   try {
     let agent: BrowserAgent;
     if (mode === "desktop") {
       agent = await startDesktop();
+    } else if (mode === "web-vm") {
+      agent = await startBrowserOnVm();
     } else {
       agent = await startBrowser(headless ?? false);
     }
+    console.log(`[start] agent_created=${Date.now() - t0}ms mode=${mode}`);
 
     activeSessions.set(sessionId, {
       agent,
       mode,
       createdAt: new Date(),
       lastAccessed: new Date(),
+      actHistory: [],
     });
 
+    console.log(`[start] DONE mode=${mode} sessionId=${sessionId} total=${Date.now() - t0}ms active_sessions=${activeSessions.size}`);
     res.json({ status: 'started', sessionId });
   } catch (err) {
+    console.error(`[start] ERROR mode=${mode} after ${Date.now() - t0}ms:`, err);
     handleAgentError(err, res);
   }
 });
@@ -621,7 +576,45 @@ app.post('/act', isAgentReady, async (req: Request, res: Response) => {
   if (!task) return res.status(400).json({ error: 'bad_request', message: 'Task description is required.' });
   try {
     const session = activeSessions.get(sessionId)!;
-    await session.agent.act(task, { override_cache: override_cache === true } as any);
+
+    const memory = new AgentMemory({ promptCaching: true });
+
+    if (session.actHistory.length > 0) {
+      let injectedCount = 0;
+      for (const entry of session.actHistory) {
+        memory.recordObservation(new Observation(
+          'thought' as any,
+          'user',
+          `Previously completed task: "${entry.task}"`
+        ));
+        injectedCount++;
+        for (const obs of entry.observations) {
+          memory.recordObservation(obs);
+          injectedCount++;
+        }
+      }
+      console.log(`[memory-carryover] Injecting history from ${session.actHistory.length} previous acts (${injectedCount} observations total)`);
+    } else {
+      console.log(`[memory-carryover] No prior act history in session`);
+    }
+
+    const boundary = memory.observationCount;
+
+    await session.agent.act(task, { memory, override_cache: override_cache === true } as any);
+
+    const newObservations = memory.getObservationsSlice(boundary);
+    const filtered = newObservations.filter(obs => {
+      const src = obs.source;
+      return src.startsWith('thought') || src.startsWith('action:taken:');
+    });
+
+    session.actHistory.push({ task, observations: filtered });
+    if (session.actHistory.length > ACT_HISTORY_DEPTH) {
+      session.actHistory = session.actHistory.slice(-ACT_HISTORY_DEPTH);
+    }
+
+    console.log(`[memory-carryover] Stored ${filtered.length} filtered observations for task "${task}" (history: ${session.actHistory.length}/${ACT_HISTORY_DEPTH})`);
+
     res.json({ status: 'success', message: `Task "${task}" completed.` });
   } catch (err) {
     handleAgentError(err, res);
@@ -678,23 +671,86 @@ app.post('/query', isAgentReady, async (req: Request, res: Response) => {
   try {
     const zodSchema: ZodTypeAny = schema ? jsonSchemaToZod(schema) : z.any();
     const session = activeSessions.get(sessionId)!;
-    const queryFn = (session.agent as unknown as { query: (q: unknown, s: ZodTypeAny) => Promise<unknown> }).query;
-    const dataUnknown: unknown = await queryFn(query, zodSchema);
-    res.json({ data: dataUnknown });
+    const data: unknown = await (session.agent as any).query(query, zodSchema);
+    res.json({ data });
   } catch (err) {
     handleAgentError(err, res);
   }
 });
 
+// --- Native desktop screenshot via OS commands ---
+
+function nativeScreenshotCommand(dest: string): string {
+  switch (process.platform) {
+    case 'win32':
+      // PowerShell: capture full primary screen using System.Drawing
+      return [
+        'powershell.exe -NoProfile -Command "',
+        'Add-Type -AssemblyName System.Windows.Forms;',
+        'Add-Type -AssemblyName System.Drawing;',
+        '$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds;',
+        '$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height);',
+        '$g = [System.Drawing.Graphics]::FromImage($bmp);',
+        '$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size);',
+        '$g.Dispose();',
+        `$bmp.Save('${dest.replace(/'/g, "''")}');`,
+        '$bmp.Dispose();"',
+      ].join(' ');
+    case 'darwin':
+      return `screencapture -x "${dest}"`;
+    default:
+      // Linux / other Unix — xfce4-screenshooter ships with xfce4-goodies
+      // (installed in the desktop Docker image). Falls back to scrot, then
+      // ImageMagick's import for non-XFCE environments.
+      return `xfce4-screenshooter -f -s "${dest}" 2>/dev/null || scrot "${dest}" 2>/dev/null || import -window root "${dest}"`;
+  }
+}
+
+function nativeScreenshot(): string {
+  const dest = path.join(os.tmpdir(), `unity-screenshot-${randomUUID()}.png`);
+  try {
+    execSync(nativeScreenshotCommand(dest), { timeout: 10_000 });
+    const buf = fs.readFileSync(dest);
+    return buf.toString('base64');
+  } finally {
+    try { fs.unlinkSync(dest); } catch (_) { /* already cleaned or never created */ }
+  }
+}
+
+let _screenshotInFlight = 0;
+
 app.post('/screenshot', isAgentReady, async (req: Request, res: Response) => {
   const { sessionId } = req.body;
+  _screenshotInFlight++;
+  const t0 = Date.now();
+  const session = activeSessions.get(sessionId)!;
+  console.log(`[screenshot] START session=${sessionId} mode=${session.mode} in_flight=${_screenshotInFlight}`);
   try {
-    const session = activeSessions.get(sessionId)!;
-    const harness = session.agent.require(BrowserConnector).getHarness();
-    const image = await harness.screenshot();
-    const base64Image = await image.toBase64();
+    let base64Image: string;
+
+    if (session.mode === 'desktop') {
+      // Native OS-level screenshot (works on Linux, macOS, Windows)
+      base64Image = nativeScreenshot();
+      console.log(`[screenshot] native_capture=${Date.now() - t0}ms b64_len=${base64Image.length}`);
+    } else {
+      // Playwright harness screenshot for web / web-vm modes
+      const harness = session.agent.require(BrowserConnector).getHarness();
+      const tHarness = Date.now();
+      console.log(`[screenshot] harness_acquired=${tHarness - t0}ms`);
+      const image = await harness.screenshot();
+      const tCapture = Date.now();
+      console.log(`[screenshot] playwright_capture=${tCapture - tHarness}ms`);
+      base64Image = await image.toBase64();
+      const tEncode = Date.now();
+      console.log(`[screenshot] base64_encode=${tEncode - tCapture}ms b64_len=${base64Image.length} total=${tEncode - t0}ms`);
+    }
+
     res.json({ screenshot: base64Image });
+    _screenshotInFlight--;
+    console.log(`[screenshot] DONE total=${Date.now() - t0}ms in_flight=${_screenshotInFlight}`);
   } catch (err) {
+    _screenshotInFlight--;
+    console.error(`[screenshot] ERROR after ${Date.now() - t0}ms in_flight=${_screenshotInFlight}:`, err);
     handleAgentError(err, res, 'screenshot_failed');
   }
 });
@@ -879,17 +935,38 @@ app.post('/interrupt_action', isAgentReady, async (req: Request, res: Response) 
   }
 });
 
+app.post('/pause', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  try {
+    const session = activeSessions.get(sessionId)!;
+    session.agent.pause();
+    res.json({ status: 'paused', message: 'The agent has been paused.' });
+  } catch (err) {
+    handleAgentError(err, res, 'pause_failed');
+  }
+});
+
+app.post('/resume', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  try {
+    const session = activeSessions.get(sessionId)!;
+    session.agent.resume();
+    res.json({ status: 'resumed', message: 'The agent has been resumed.' });
+  } catch (err) {
+    handleAgentError(err, res, 'resume_failed');
+  }
+});
+
 // --- /exec endpoint: Execute shell commands (use /files first to upload files) ---
-// Pass user_session=true for commands that need interactive session (Excel, COM automation)
-app.post('/exec', async (req: Request, res: Response) => {
-  const { command, cwd, timeout, shell_mode, user_session } = req.body;
+app.post('/exec', auth, async (req: Request, res: Response) => {
+  const { command, cwd, timeout, shell_mode } = req.body;
   const execId = randomUUID().slice(0, 8);
 
   if (!command || typeof command !== 'string') {
     return res.status(400).json({ error: 'bad_request', message: 'command is required and must be a string.' });
   }
 
-  const workDir = cwd || UNITY_WORKSPACE_DIR;
+  const workDir = cwd || LOCAL_ROOT;
   const execTimeout = typeof timeout === 'number' && timeout > 0 ? timeout : DEFAULT_EXEC_TIMEOUT;
   const shellMode: ShellMode = shell_mode === 'cmd' ? 'cmd' : 'powershell';
 
@@ -897,16 +974,8 @@ app.post('/exec', async (req: Request, res: Response) => {
     const resolvedWorkDir = path.resolve(workDir);
     await ensureDir(resolvedWorkDir);
 
-    let result: ExecResult;
-
-    // Use user_session=true for commands that need interactive session (Excel, COM, etc.)
-    if (user_session === true && process.platform === 'win32') {
-      console.log(`[exec] Running in USER SESSION: ${command} (cwd: ${resolvedWorkDir}, execId: ${execId})`);
-      result = await executeCommandInUserSession(command, resolvedWorkDir, execTimeout, execId);
-    } else {
-      console.log(`[exec] Running command: ${command} (cwd: ${resolvedWorkDir}, timeout: ${execTimeout}ms, shell: ${shellMode}, execId: ${execId})`);
-      result = await executeCommand(command, resolvedWorkDir, execTimeout, shellMode);
-    }
+    console.log(`[exec] Running command: ${command} (cwd: ${resolvedWorkDir}, timeout: ${execTimeout}ms, shell: ${shellMode}, execId: ${execId})`);
+    const result = await executeCommand(command, resolvedWorkDir, execTimeout, shellMode);
 
     res.json({
       status: result.exitCode === 0 ? 'success' : 'error',
@@ -916,7 +985,6 @@ app.post('/exec', async (req: Request, res: Response) => {
       duration: result.duration,
       cwd: resolvedWorkDir,
       execId,
-      userSession: user_session === true,
     });
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -939,7 +1007,7 @@ async function handleFilesJson(req: Request, res: Response) {
     return res.status(400).json({ error: 'bad_request', message: 'action is required.' });
   }
 
-  const baseDir = UNITY_WORKSPACE_DIR;
+  const baseDir = LOCAL_ROOT;
 
   try {
     switch (action) {
@@ -1054,7 +1122,7 @@ async function handleFilesMultipart(req: Request, res: Response) {
     return res.status(400).json({ error: 'bad_request', message: 'No files uploaded.' });
   }
 
-  const baseDir = UNITY_WORKSPACE_DIR;
+  const baseDir = LOCAL_ROOT;
   const savedFiles: string[] = [];
   const errors: string[] = [];
 

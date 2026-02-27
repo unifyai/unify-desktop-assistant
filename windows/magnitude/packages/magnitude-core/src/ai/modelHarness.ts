@@ -1,4 +1,4 @@
-import { convertToBamlClientOptions } from "./util";
+import { convertToBamlClientOptions, isClaude } from "./util";
 // Import ModularMemoryContext instead of old MemoryContext
 import { b, AgentContext } from "@/ai/baml_client"; 
 import { Image as BamlImage, Collector, ClientRegistry } from "@boundaryml/baml";
@@ -89,20 +89,22 @@ export class ModelHarness {
         let cacheWriteInputTokens: number = 0;
         let cacheReadInputTokens: number = 0;
 
-        if (this.options.llm.provider === 'anthropic' || this.options.llm.provider === 'claude-code') {
-            type AnthropicUsage = { input_tokens: number, cache_creation_input_tokens: number, cache_read_input_tokens: number, output_tokens: number, service_tier: string };
-            const usage = this.collector.last?.calls.at(-1)?.httpResponse?.body.json().usage as AnthropicUsage;
-            //console.log("Usage from Anthropic:", usage);
+        if (this.options.llm.provider === 'anthropic' || this.options.llm.provider === 'claude-code' || (this.options.llm.provider === 'openai-generic' && isClaude(this.options.llm))) {
+            type UnifiedUsage = {
+                input_tokens?: number, output_tokens?: number,
+                prompt_tokens?: number, completion_tokens?: number,
+                cache_creation_input_tokens?: number, cache_read_input_tokens?: number
+            };
+            const usage = this.collector.last?.calls.at(-1)?.httpResponse?.body.json().usage as UnifiedUsage;
             if (!usage) {
-                // Sometimes apparently this happens? Happened once after extract for example
-                logger.warn("No usage returned from Anthropic provider, cached cost may be inaccurate");
+                logger.warn("No usage returned from provider, cached cost may be inaccurate");
                 inputTokens = (this.collector.usage.inputTokens ?? 0) - this.prevTotalInputTokens;
                 outputTokens = (this.collector.usage.outputTokens ?? 0) - this.prevTotalOutputTokens;
             } else {
-                inputTokens = usage.input_tokens;
-                outputTokens = usage.output_tokens;
-                cacheWriteInputTokens = usage.cache_creation_input_tokens;
-                cacheReadInputTokens = usage.cache_read_input_tokens;
+                inputTokens = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+                outputTokens = usage.output_tokens ?? usage.completion_tokens ?? 0;
+                cacheWriteInputTokens = usage.cache_creation_input_tokens ?? 0;
+                cacheReadInputTokens = usage.cache_read_input_tokens ?? 0;
             }
             
         } else {
@@ -170,8 +172,8 @@ export class ModelHarness {
         this.events.emit('tokensUsed', usage);
         //console.log("Usage:", usage);
 
-        this.prevTotalInputTokens = inputTokens;
-        this.prevTotalOutputTokens = outputTokens;
+        this.prevTotalInputTokens += inputTokens;
+        this.prevTotalOutputTokens += outputTokens;
     }
 
     async partialAct<T>(

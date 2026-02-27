@@ -85,6 +85,7 @@ export async function convertToBamlClientOptions(client: LLMClient): Promise<Rec
             temperature: temp,
         };
     } else if (client.provider === 'openai-generic') {
+        const isClaudeModel = isClaude(client);
         options = {
             base_url: client.options.baseUrl,
             api_key: client.options.apiKey,
@@ -93,8 +94,10 @@ export async function convertToBamlClientOptions(client: LLMClient): Promise<Rec
             headers: {
                 "HTTP-Referer": "https://magnitude.run",
                 "X-Title": "Magnitude",
+                ...(isClaudeModel && client.options.promptCaching ? { 'anthropic-beta': 'prompt-caching-2024-07-31' } : {}),
                 ...client.options.headers
-            }
+            },
+            ...(isClaudeModel && client.options.promptCaching ? { allowed_role_metadata: "all" } : {}),
         };
     } else if (client.provider === 'azure-openai') {
         options = {
