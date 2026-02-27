@@ -682,12 +682,14 @@ function Install-AgentService {
         Write-Host "  Installing npm dependencies..."
         Invoke-NativeCommand { npm install }
         
+        Save-DependenciesHash -Dir $script:AgentServiceDir
+        Pop-Location
+        
         Write-Host "  Installing Patchright + Chromium (this may take a few minutes)..."
         [System.Environment]::SetEnvironmentVariable('PLAYWRIGHT_BROWSERS_PATH', 'C:\ms-playwright', 'Machine')
         $env:PLAYWRIGHT_BROWSERS_PATH = 'C:\ms-playwright'
-        Invoke-NativeCommand { npx -y patchright install chromium }
-        
-        Save-DependenciesHash -Dir $script:AgentServiceDir
+        Push-Location (Join-Path $script:MagnitudeDir 'packages\magnitude-core')
+        Invoke-NativeCommand { npx --yes patchright install chromium }
         Pop-Location
         
         Write-Host "  Dependencies installed" -ForegroundColor Green
@@ -1471,6 +1473,7 @@ try {
 
     # Show summary
     Show-Summary -UnifyKey $UnifyKey
+    exit 0
 } catch {
     Write-Host ""
     Write-Host "===========================================" -ForegroundColor Red
@@ -1480,6 +1483,6 @@ try {
     Write-Host "Error: $_" -ForegroundColor Red
     Write-Host ""
     Write-Host "Press any key to close this window..." -ForegroundColor Yellow
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    cmd /c pause | Out-Null
     exit 1
 }
