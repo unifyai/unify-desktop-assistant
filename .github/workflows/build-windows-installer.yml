@@ -78,8 +78,8 @@ jobs:
               exit 1
             }
           }
-          $suffix = if ("${{ inputs.environment }}" -eq 'staging') { '-staging' } else { '' }
-          $tag = "v${version}-windows${suffix}"
+          $branch = "${{ github.ref_name }}"
+          $tag = "v${version}-${branch}"
           Write-Host "Version: $version, Tag: $tag"
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
