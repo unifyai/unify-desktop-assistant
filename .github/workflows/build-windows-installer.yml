@@ -94,7 +94,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          name: Windows Installer ${{ steps.version.outputs.version }} (${{ inputs.environment }})
+          name: Unify Desktop Assistant ${{ steps.version.outputs.version }} (${{ inputs.environment }})
           files: windows/installer/output/unify-desktop-assistant.exe
           prerelease: ${{ inputs.environment == 'staging' }}
           generate_release_notes: false
