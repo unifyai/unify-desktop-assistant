@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        branch: [main, staging]
+        branch: [staging]
     steps:
       - name: Checkout this repository (${{ matrix.branch }})
         uses: actions/checkout@v4
