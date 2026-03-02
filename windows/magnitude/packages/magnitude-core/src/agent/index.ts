@@ -65,7 +65,11 @@ export class Agent {
     // maybe remove conns/actions from options since stored sep
     private options: Required<AgentOptions>//Omit<Required<AgentOptions>, 'actions'>;
     private connectors: AgentConnector[];
-    private actions: ActionDefinition<any>[]; // actions from connectors + any other additional ones configured
+    private _actions: ActionDefinition<any>[];
+
+    get actions(): ActionDefinition<any>[] {
+        return this._actions;
+    }
     private actionAbortController: AbortController | null = null;
 
     private memoryOptions: AgentMemoryOptions;
@@ -116,9 +120,9 @@ export class Agent {
 
         // Aggregate actions from connectors
         //const aggregatedActions = [...this.options.actions];
-        this.actions = [...this.options.actions];
+        this._actions = [...this.options.actions];
         for (const connector of this.connectors) {
-            this.actions.push(...(connector.getActionSpace ? connector.getActionSpace() : []));
+            this._actions.push(...(connector.getActionSpace ? connector.getActionSpace() : []));
         }
         // Deduplicate actions by name
         // TODO: maybe error instead, or automatically differentiate them?
@@ -204,14 +208,14 @@ export class Agent {
         logger.info("Agent: All connectors started.");
 
         // logger.info("Making initial observations...");
-        // await this._recordConnectorObservations();
+        // await this.recordConnectorObservations();
         // logger.info("Initial observations recorded");
         // Initial observations are handled by the first getObservations call in exec
     }
 
     identifyAction(action: Action) {
         // Get definition corresponding to an action
-        const actionDefinition = this.actions.find(def => def.name === action.variant);
+        const actionDefinition = this._actions.find(def => def.name === action.variant);
 
         if (!actionDefinition) {
             // It's possible the action name was from a connector that is no longer active,
@@ -291,11 +295,11 @@ export class Agent {
             }
 
             // Collect and record observations from connectors
-            await this._recordConnectorObservations(memory);
+            await this.recordConnectorObservations(memory);
         }
     }
 
-    protected async _recordConnectorObservations(memory: AgentMemory) {
+    async recordConnectorObservations(memory: AgentMemory) {
         for (const connector of this.connectors) {
             try {
                 // could do Promise.all if matters
@@ -331,7 +335,7 @@ export class Agent {
         
         // Optionally record initial observations (skip by default for max speed)
         if (recordObservations) {
-            await this._recordConnectorObservations(memory);
+            await this.recordConnectorObservations(memory);
         }
         
         // Execute actions directly without any cache or LLM overhead
@@ -379,7 +383,7 @@ export class Agent {
         })(task));
     }
 
-    private async _buildContext(memory: AgentMemory): Promise<AgentContext> {
+    async buildContext(memory: AgentMemory): Promise<AgentContext> {
         const messages = await memory.render();
 
         const connectorInstructions: ConnectorInstructions[] = [];
@@ -444,7 +448,7 @@ export class Agent {
 
         // record initial observations
         logger.info("Making initial observations...");
-        await this._recordConnectorObservations(memory);
+        await this.recordConnectorObservations(memory);
         logger.info("Initial observations recorded");
 
         const initialScreenshot = memory.getLatestScreenshot();
@@ -491,14 +495,14 @@ export class Agent {
             let actions: Action[] = [];
 
             try {
-                const memoryContext = await this._buildContext(memory);
+                const memoryContext = await this.buildContext(memory);
                 await retryOnError(
                     async () => {
                         ({ reasoning, actions } = await this.models.partialAct(
                             memoryContext,
                             description,
                             dataContentParts,
-                            this.actions 
+                            this._actions 
                         ));
                         if (actions.length === 0) {
                             // Empty action list behavior - default wait else ... err? what if not in action space?
@@ -1318,8 +1322,8 @@ export class Agent {
 
     async query<T extends z.Schema>(query: string, schema: T): Promise<z.infer<T>> {
         // Record observations in case no act() was used beforehand
-        await this._recordConnectorObservations(this.latestTaskMemory);
-        const memoryContext = await this._buildContext(this.memory);//this.memory.buildContext(this.connectors);
+        await this.recordConnectorObservations(this.latestTaskMemory);
+        const memoryContext = await this.buildContext(this.memory);//this.memory.buildContext(this.connectors);
         return await this.models.query(memoryContext, query, schema);
     }
 
