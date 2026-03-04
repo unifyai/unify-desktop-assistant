@@ -428,6 +428,10 @@ export class WebHarness { // implements StateComponent
         await this.stability.waitForStability(timeout);
     }
 
+    getCursorPosition(): { x: number; y: number } | null {
+        return this.visualizer.getCursorPosition();
+    }
+
     private getStatePath(name: string): string {
         const stateDir = path.join(os.homedir(), '.magnitude', 'browser_states');
         // Ensure directory exists

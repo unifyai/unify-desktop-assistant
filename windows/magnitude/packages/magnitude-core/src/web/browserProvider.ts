@@ -95,15 +95,17 @@ export class BrowserProvider {
 
         const context = await browser.newContext(contextOptions);
 
-        // Get viewport dimensions from context options or use defaults
-        const viewport = contextOptions?.viewport || { width: 1024, height: 768 };
-        const deviceScaleFactor = contextOptions?.deviceScaleFactor || 1;
-
-        // Apply emulation settings to any new pages created
-        context.on('page', async (page) => {
-            const cdpSession = await page.context().newCDPSession(page);
-            await this._applyEmulationSettings(cdpSession, viewport.width, viewport.height, deviceScaleFactor);
-        });
+        // When viewport is explicitly null the page follows the browser
+        // window size dynamically (resizing the window reflows content).
+        // Only pin the viewport via CDP when a fixed size is requested.
+        const resolvedViewport = contextOptions?.viewport;
+        if (resolvedViewport) {
+            const deviceScaleFactor = contextOptions?.deviceScaleFactor || 1;
+            context.on('page', async (page) => {
+                const cdpSession = await page.context().newCDPSession(page);
+                await this._applyEmulationSettings(cdpSession, resolvedViewport.width, resolvedViewport.height, deviceScaleFactor);
+            });
+        }
 
         activeBrowserEntry.activeContextsCount++;
 

@@ -488,7 +488,7 @@ const startDesktop = async (): Promise<BrowserAgent> => {
 const startBrowser = async (headless: boolean): Promise<BrowserAgent> => {
   try {
     const agent = await startBrowserAgent({
-      url: "https://www.duckduckgo.com/",
+      url: "https://www.google.com/",
       browser: getLaunchOptions(headless, defaultBrowserPaths.downloadsPath, defaultBrowserPaths.tracesDir),
       narrate: true,
       // Route LLM calls through Orchestra/UniLLM proxy for billing and caching
@@ -516,17 +516,20 @@ const startBrowser = async (headless: boolean): Promise<BrowserAgent> => {
 const startBrowserOnVm = async (): Promise<BrowserAgent> => {
   try {
     const agent = await startBrowserAgent({
-      url: "https://www.duckduckgo.com/",
-      browser: { launchOptions: {
-        headless: false,
-        args: [
-          "--disable-blink-features=AutomationControlled",
-          "--disable-features=IsolateOrigins,site-per-process",
-          '--auto-select-desktop-capture-source="Entire screen"',
-        ],
-        downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
-        tracesDir: defaultBrowserPaths.tracesDir || undefined,
-      }},
+      url: "https://www.google.com/",
+      browser: {
+        launchOptions: {
+          headless: false,
+          args: [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            '--auto-select-desktop-capture-source="Entire screen"',
+          ],
+          downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
+          tracesDir: defaultBrowserPaths.tracesDir || undefined,
+        },
+        contextOptions: { viewport: null },
+      },
       narrate: true,
       llm: {
         provider: 'openai-generic',
@@ -654,6 +657,19 @@ app.post('/act', isAgentReady, async (req: Request, res: Response) => {
       : '[desktop.act] ';
 
     const memory = new AgentMemory({ promptCaching: true });
+
+    // Fresh web/web-vm sessions already have a browser open and loaded.
+    // Tell the LLM so it can no-op (return an empty action list) if the
+    // task is simply asking to open a browser.
+    if (session.actHistory.length === 0 && session.mode !== 'desktop') {
+      memory.recordObservation(new Observation(
+        'thought' as any,
+        'user',
+        'This is a freshly created browser session — the browser is already open and loaded. '
+        + 'If the task is simply asking to open a browser, open a new browser window, or launch a browser, '
+        + 'this has already been accomplished. Return an empty actions list.'
+      ));
+    }
 
     if (session.actHistory.length > 0) {
       let injectedCount = 0;
@@ -834,6 +850,44 @@ app.post('/act', isAgentReady, async (req: Request, res: Response) => {
   }
 });
 
+app.post('/execute-actions', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId, actions } = req.body;
+  if (!actions || !Array.isArray(actions) || actions.length === 0) {
+    return res.status(400).json({
+      error: 'bad_request',
+      message: 'actions is required and must be a non-empty array of action objects.',
+    });
+  }
+
+  try {
+    const session = activeSessions.get(sessionId)!;
+    const agent = session.agent;
+    const t0 = Date.now();
+
+    console.log(`[execute-actions] Executing ${actions.length} direct action(s) for session ${sessionId}`);
+
+    await agent.executeTrajectory(actions, { memory: agent.memory, recordObservations: false });
+
+    const execMs = Date.now() - t0;
+    console.log(`[execute-actions] ${actions.length} action(s) executed [${execMs}ms]`);
+
+    let screenshot = '';
+    let cursorPosition: { x: number; y: number } | null = null;
+    try {
+      const harness = agent.require(BrowserConnector).getHarness();
+      const image = await harness.screenshot();
+      screenshot = await image.toBase64();
+      cursorPosition = harness.getCursorPosition();
+    } catch (screenshotErr) {
+      console.warn(`[execute-actions] Post-execution screenshot failed: ${screenshotErr}`);
+    }
+
+    res.json({ status: 'success', screenshot, cursorPosition });
+  } catch (err) {
+    handleAgentError(err, res);
+  }
+});
+
 app.post('/extract', isAgentReady, async (req: Request, res: Response) => {
   const { instructions, schema, bypassDomProcessing, sessionId } = req.body;
   if (!instructions) {
@@ -941,6 +995,8 @@ app.post('/screenshot', isAgentReady, async (req: Request, res: Response) => {
   try {
     let base64Image: string;
 
+    let cursorPosition: { x: number; y: number } | null = null;
+
     if (session.mode === 'desktop') {
       // Native OS-level screenshot (works on Linux, macOS, Windows)
       base64Image = nativeScreenshot();
@@ -954,11 +1010,12 @@ app.post('/screenshot', isAgentReady, async (req: Request, res: Response) => {
       const tCapture = Date.now();
       console.log(`[screenshot] playwright_capture=${tCapture - tHarness}ms`);
       base64Image = await image.toBase64();
+      cursorPosition = harness.getCursorPosition();
       const tEncode = Date.now();
       console.log(`[screenshot] base64_encode=${tEncode - tCapture}ms b64_len=${base64Image.length} total=${tEncode - t0}ms`);
     }
 
-    res.json({ screenshot: base64Image });
+    res.json({ screenshot: base64Image, cursorPosition });
     _screenshotInFlight--;
     console.log(`[screenshot] DONE total=${Date.now() - t0}ms in_flight=${_screenshotInFlight}`);
   } catch (err) {
