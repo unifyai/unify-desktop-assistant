@@ -131,8 +131,12 @@ export class BrowserProvider {
         let contextOptions: BrowserContextOptions = {
             ...DEFAULT_BROWSER_CONTEXT_OPTIONS,
             deviceScaleFactor: dpr,
-            ...(options && 'contextOptions' in options && options.contextOptions ? options.contextOptions : {})//options.browser?.contextOptions
+            ...(options && 'contextOptions' in options && options.contextOptions ? options.contextOptions : {})
         };
+
+        if (contextOptions.viewport === null) {
+            delete contextOptions.deviceScaleFactor;
+        }
 
         // INJECT STORAGE STATE IF PROVIDED
         if (options && 'storageStateName' in options && options.storageStateName) {
