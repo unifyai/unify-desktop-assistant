@@ -148,8 +148,8 @@ export function buildDefaultBrowserAgentOptions(
     { agentOptions, browserOptions }: { agentOptions: AgentOptions, browserOptions: BrowserConnectorOptions }
 ): { agentOptions: AgentOptions, browserOptions: BrowserConnectorOptions } {
     /**
-     * Given any provided options for agent or browser connector, fill out additional key fields using environment,
-     * or any model-specific constraints (e.g. Claude needing 1024x768 virtual screen space)
+     * Given any provided options for agent or browser connector, fill out additional key fields using environment.
+     * Screenshot scaling for large viewports is handled at runtime by the harness (aspect-ratio-aware).
      */
     const envLlm = tryDeriveUIGroundedClient();
 
@@ -159,22 +159,13 @@ export function buildDefaultBrowserAgentOptions(
         throw new Error("No LLM configured or available from environment. Set environment variable ANTHROPIC_API_KEY and try again. See https://docs.magnitude.run/customizing/llm-configuration for details");
     }
 
-    // Set reasonable temp if not provided
-    let virtualScreenDimensions = null;
     for (const llm of llms) {
         let llmOptions: LLMClient['options'] = { temperature: DEFAULT_BROWSER_AGENT_TEMP, ...(llm?.options ?? {}) };
-        //let modifiedLlm = {...llm, options: llmOptions as any }
         llm.options = llmOptions;
-
-        if (isClaude(llm)) {
-            // Claude only really works on 1024x768 screenshots
-            // if any model is claude, use virtual screen dimensions
-            virtualScreenDimensions = { width: 1024, height: 768 };
-        }
     }
 
     return {
         agentOptions: {...agentOptions, llm: llms },
-        browserOptions: {...browserOptions, virtualScreenDimensions: virtualScreenDimensions ?? undefined }
+        browserOptions: {...browserOptions }
     };
 }

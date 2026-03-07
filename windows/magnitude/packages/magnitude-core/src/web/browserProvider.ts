@@ -1,6 +1,7 @@
 import { Browser, BrowserContext, BrowserContextOptions, chromium, LaunchOptions, CDPSession } from "playwright";
 import objectHash from 'object-hash';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import logger from "@/logger";
 import { Logger } from 'pino';
 import * as fs from 'fs';
@@ -30,6 +31,7 @@ const DEFAULT_BROWSER_CONTEXT_OPTIONS: BrowserContextOptions = {
 export class BrowserProvider {
     private activeBrowsers: Record<string, ActiveBrowser> = {};
     private logger: Logger;
+    public events = new EventEmitter();
 
     private constructor() {
         this.logger = logger.child({ name: 'browser_provider' });
@@ -78,6 +80,7 @@ export class BrowserProvider {
 
             browser.on('disconnected', () => {
                 delete this.activeBrowsers[hash];
+                this.events.emit('browserDisconnected', { browser });
             });
 
             return activeBrowser;

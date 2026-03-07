@@ -43,6 +43,7 @@ export interface ActOptions {
 	data?: RenderableContent,//string | Record<string, string>
     memory?: AgentMemory,// optional memory starting point
     override_cache?: boolean // if true, delete matching cache entries before execution
+    verify?: boolean, // when true, re-plan after executing to verify task completion
 }
 
 // Options for the startAgent helper function
@@ -423,30 +424,13 @@ export class Agent {
         const signal = this.actionAbortController.signal;
         logger.info(`Act: ${description}`);
 
-        // for now simply add data to task
         let dataContentParts: MultiMediaContentPart[] = [];
         if (options.data) {
-            //description += "\nUse the following data where appropriate:\n";
-            // description += "\n<data>\n";
-            // // if (typeof options.data === 'string') {
-            // //     description += options.data;
-            // // } else {
-            // //     description += Object.entries(options.data).map(([k, v]) => `${k}: ${v}`).join("\n");
-            // // }
-            // const parts = renderParts(options.data);
-            // description += "\n</data>";
             dataContentParts = await renderContentParts(options.data, { mode: 'json', indent: 2 });
         }
-        //this.events.emit('stepStart', description);
 
-        //const testData = convertOptionsToTestData(options);
-
-        // Initialize task memory and record initial observations
-        // Combine any agent-level and task-level instructions
-        
         this.latestTaskMemory = memory;
 
-        // record initial observations
         logger.info("Making initial observations...");
         await this.recordConnectorObservations(memory);
         logger.info("Initial observations recorded");
@@ -459,43 +443,39 @@ export class Agent {
             const cachedResult = await this.queryCache(description, initialScreenshot);
             
             if (cachedResult && cachedResult.actions.length > 0) {
-                // Store log IDs for potential cache update
                 cacheEntryIdsToUpdate = cachedResult.logIds || [];
                 
-                // If override_cache is enabled, skip cache replay and execute fresh
                 if (options.override_cache) {
                     logger.info(`override_cache is enabled. Found ${cacheEntryIdsToUpdate.length} matching cache entries. Skipping cache replay and executing fresh.`);
-                    // Continue with normal execution below, which will update the cache entries later
                 } else {
-                    // Normal cache hit - replay the cached trajectory
                     console.log(yellowBright("⚡ CACHE HIT. Replaying full action trajectory."));
                     this.events.emit('thought', "Found a similar past situation in my cache. Replaying the full set of actions I took before.");
 
-                    // Replay the entire cached trajectory
                     for (const action of cachedResult.actions) {
                         if (signal.aborted) throw new AgentError("Action was interrupted.", { variant: 'cancelled' });
                         await this.exec(action, memory);
                     }
-                    return; // The task is complete, so we exit the _act method.
+                    return;
                 }
             }
         }
 
-        const fullTrajectory: Action[] = []; // To store all actions for this task
+        const fullTrajectory: Action[] = [];
 
         try {
             while (true) {
                 if (signal.aborted) {
                     throw new AgentError("Action was interrupted by the user.", { variant: 'cancelled' });
                 }
-                // Removed direct screenshot/tabState access here; it's part of memoryContext via connectors
                 logger.info(`Creating partial recipe`);
 
             let reasoning: string = "";
             let actions: Action[] = [];
 
+            const planStart = Date.now();
             try {
                 const memoryContext = await this.buildContext(memory);
+                logger.debug("Built memory context for planning");
                 await retryOnError(
                     async () => {
                         ({ reasoning, actions } = await this.models.partialAct(
@@ -505,13 +485,9 @@ export class Agent {
                             this._actions 
                         ));
                         if (actions.length === 0) {
-                            // Empty action list behavior - default wait else ... err? what if not in action space?
-                            //actions.push()
                             throw new AgentError(`No actions generated`);
                         }
                     },
-                    // HTTP body is not JSON - comes from Anthropic sometimes, weird error
-                    // Sometimes Anthropic will give 401 Unauthorized randomly even when authorized
                     {
                         mode: 'retry_on_partial_message',
                         errorSubstrings: ['HTTP body is not JSON', '401 Unauthorized', 'No actions generated'],
@@ -522,47 +498,56 @@ export class Agent {
                 );
             } catch (error: unknown) {
                 logger.error(`Error planning actions: ${error instanceof Error ? error.message : String(error)}`);
-                /**
-                 * (1) Failure to conform to JSON
-                 * (2) Misconfigured BAML client / bad API key
-                 * (3) Network error (past max retries)
-                 */
-                // this.fail({
-                //     variant: 'misalignment',
-                //     message: `Could not create partial recipe -> ${(error as Error).message}`
-                // });
                 throw new AgentError(
                     `Error planning actions: ${(error as Error).message}`, { variant: 'misalignment' }
                 )
             }
+            const planMs = Date.now() - planStart;
 
             logger.info({ reasoning, actions }, `Partial recipe created`);
-            
-            // Could be emitted in memory and bubbled up instead of recordThought was called in more places
+            logger.debug({ planMs, actionCount: actions.length, actionVariants: actions.map(a => a.variant) }, "Plan timing");
+
+            this.events.emit('debugPlan', {
+                reasoning,
+                actions,
+                planningMs: planMs,
+                observationCount: 0,
+            });
+
             this.events.emit('thought', reasoning);
             memory.recordThought(reasoning);
 
-            // Execute partial recipe
-            for (const action of actions) {
+            for (let i = 0; i < actions.length; i++) {
+                const action = actions[i];
+                const actionStart = Date.now();
+                let actionError: string | undefined;
 
                 await this._waitIfPaused();
                 if (this.doneActing) break;
                 if (signal.aborted) {
                     throw new AgentError("Action was interrupted by the user.", { variant: 'cancelled' });
                 }
-                await this.exec(action, memory);
-                fullTrajectory.push(action); // Add executed action to the full trajectory
 
-                // const postActionScreenshot = await this.screenshot();
-                // const actionDescriptor: ActionDescriptor = { ...action, screenshot: postActionScreenshot.image } as ActionDescriptor;
-                // this.events.emit('action', actionDescriptor);
-                logger.info({ action }, `Action taken`);
+                try {
+                    await this.exec(action, memory);
+                    fullTrajectory.push(action);
+                } catch (err) {
+                    actionError = err instanceof Error ? err.message : String(err);
+                    throw err;
+                } finally {
+                    const actionMs = Date.now() - actionStart;
+                    logger.info({ action, actionMs }, `Action taken`);
+
+                    this.events.emit('debugAction', {
+                        action,
+                        index: i,
+                        totalActions: actions.length,
+                        executionMs: actionMs,
+                        error: actionError,
+                    });
+                }
             }
 
-            // If macro expects these actions should complete the step, break
-            // if (finished) {
-            //     break;
-            // }
             await this._waitIfPaused();
             if (this.doneActing) {
                 if (this.visualCacheConfig.enabled && initialScreenshot && fullTrajectory.length > 0) {
@@ -614,8 +599,6 @@ export class Agent {
         }
 
         logger.info(`Done with step`);
-        //this.events.emit('stepSuccess');
-        //this.currentTaskMemory = null;
     }
 
     // --- CACHE HELPER METHODS ---
@@ -741,7 +724,7 @@ export class Agent {
 
             // Step 3: Create cache fields as mutable so they can be updated later
             const fieldsPayload = {
-                project: project,
+                project_name: project,
                 context: context,
                 fields: {
                     instruction: {
@@ -847,7 +830,7 @@ export class Agent {
             // }
             
             const queryPayload = {
-                project: project,
+                project_name: project,
                 context: context,
                 filter_expr: filterClauses.join(' and '),
                 limit: 10,
@@ -1225,7 +1208,7 @@ export class Agent {
         }
         
         const baseLogPayload = {
-            project,
+            project_name: project,
             context,
             entries
         };
@@ -1249,7 +1232,7 @@ export class Agent {
             
             const updatePayload = {
                 logs: logIdsToUpdate,
-                project: project,
+                project_name: project,
                 context: context,
                 entries: entries,
                 overwrite: true // Overwrite existing entries with new data
@@ -1297,7 +1280,7 @@ export class Agent {
         
         const createDerivedLog = async (key: string, equation: string) => {
             const derivedPayload = {
-                project, context, key, equation,
+                project_name: project, context, key, equation,
                 referenced_logs: { "log": [logEventId] }
             };
             
