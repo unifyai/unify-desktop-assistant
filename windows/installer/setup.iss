@@ -23,7 +23,7 @@
 #endif
 
 #if Environment == "staging"
-  #define OrchestraUrl "https://service.a.run.app/v0"
+  #define OrchestraUrl "https://internal.example.com/v0"
   #define CommsUrl "https://unity-comms-app-staging-000000000000.us-central1.run.app"
   #define EnvSuffix "-staging"
 #else
