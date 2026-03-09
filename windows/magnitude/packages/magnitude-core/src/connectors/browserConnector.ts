@@ -34,7 +34,8 @@ export interface BrowserConnectorOptions {
     //browserContextOptions?: BrowserContextOptions
     virtualScreenDimensions?: { width: number, height: number },
     minScreenshots?: number,
-    visuals?: ActionVisualizerOptions
+    visuals?: ActionVisualizerOptions,
+    urlMappings?: Record<string, string>
 }
 
 export interface BrowserConnectorStateData {
@@ -66,6 +67,39 @@ export class BrowserConnector implements AgentConnector {
         this.logger.info("Creating new browser context.");
 
         this.context = await BrowserProvider.getInstance().newContext(this.options.browser);
+
+        if (this.options.urlMappings) {
+            for (const [original, replacement] of Object.entries(this.options.urlMappings)) {
+                this.logger.info(`URL mapping: ${original} -> ${replacement}`);
+                await this.context.route(
+                    (url: URL) => url.href === original || url.href.startsWith(original + '/'),
+                    async (route) => {
+                        const rewritten = route.request().url().replace(original, replacement);
+                        try {
+                            const resp = await fetch(rewritten, {
+                                method: route.request().method(),
+                                headers: Object.fromEntries(
+                                    Object.entries(route.request().headers())
+                                        .filter(([k]) => !['host', 'origin', 'referer'].includes(k.toLowerCase()))
+                                ),
+                                redirect: 'manual',
+                            });
+                            await route.fulfill({
+                                status: resp.status,
+                                headers: Object.fromEntries(
+                                    [...resp.headers.entries()]
+                                        .filter(([k]) => k.toLowerCase() !== 'transfer-encoding')
+                                ),
+                                body: Buffer.from(await resp.arrayBuffer()),
+                            });
+                        } catch (err) {
+                            this.logger.error(`URL mapping fetch failed for ${rewritten}: ${err}`);
+                            await route.abort('connectionfailed');
+                        }
+                    }
+                );
+            }
+        }
 
         //const contextOptions = this.options.browser && 'contextOptions' in this.options.browser ? this.options.browser.contextOptions : {};
 
