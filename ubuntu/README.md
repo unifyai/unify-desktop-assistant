@@ -1,68 +1,273 @@
-# Linux Remote Client
+# Unify Desktop Assistant for Ubuntu/Linux
 
-## Installations
+A Linux application that sets up your machine as a remote-controllable AI assistant workstation. Includes a system tray GUI for easy service management.
 
-### Download Debian Package
+## Quick Start
 
-1. [Download](https://github.com/unifyai/unify-desktop-assistant/releases/latest/download/unify-desktop-assistant.deb) the `.deb` binary from GitHub.
+### Option 1: .deb Installer (Recommended)
 
-`https://github.com/unifyai/unify-desktop-assistant/releases/latest/download/unify-desktop-assistant.deb`
+1. Download `unify-desktop-assistant_x.x.x_amd64.deb` from [Releases](https://github.com/unifyai/unify-desktop-assistant/releases)
+2. Install:
+   ```bash
+   sudo dpkg -i unify-desktop-assistant_x.x.x_amd64.deb
+   ```
+3. Enter your Unify API Key when prompted
+4. The tray app will start automatically on next login
 
-2. Locate the download and install the Debian package.
-
-`sudo dpkg -i unify-desktop-assistant.deb`
-
-3. Proceed to local setup for starting the remote client.
-
-### Local Setup
-
-Watch this video for [local setup](https://www.loom.com/share/c3ad55e541634b478f50e0660d4e1017?sid=c1653138-dc7e-476a-b31a-5d4908e2a029).
-
-1. Add the required environment variables.
-
-`sudo unify-desktop-assistant add-env UNIFY_BASE_URL https://api.unify.ai/v0`
-
-`sudo unify-desktop-assistant add-env UNIFY_KEY <your-key-value>`
-
-`sudo unify-desktop-assistant add-env ANTHROPIC_API_KEY <your-key-value>`
-
-`sudo unify-desktop-assistant add-env ASSISTANT_NAME <first> <last>`
+### Option 2: Run from Source
 
 ```bash
-set -a
-source /opt/unify-desktop-assistant/agent-service/.env
-set +a
+# Clone the repo
+git clone https://github.com/unifyai/unify-desktop-assistant.git
+cd unify-desktop-assistant/ubuntu/tools
+
+# Run setup (requires sudo for dependency installation)
+sudo ./setup.sh --unify-key <your-unify-key>
 ```
 
-2. Install the dependencies
+## Using the Tray App
 
-`sudo unify-desktop-assistant install`
+After installation, the **Unify Desktop Assistant** icon appears in your system tray.
 
-3. Start the remote client app.
+**Right-click the icon for options:**
+- **▶ Start Services** - Start all background services
+- **■ Stop Services** - Stop all services
+- **🖥 Open Desktop Viewer** - Opens the VNC web viewer
+- **🔗 Open Agent API** - Opens the Agent Service endpoint
+- **⚙ Settings** - Configure your API keys
+- **❌ Exit** - Close the tray app
 
-`sudo unify-desktop-assistant start`
+**Status colors:**
+- 🟢 Green - All services running
+- 🟡 Yellow - Some services running
+- 🔴 Red - All services stopped
 
-### HTTPS Tunnel
+## Access URLs
 
-1. If there isn't a default and secure external IP for controls, tunnel the service to HTTPS.
+After starting services:
 
-a. For testing
+| Service | URL |
+|---------|-----|
+| Desktop (noVNC) | `http://localhost:6080/custom.html?password=<your-key>` |
+| Agent Service API | `http://localhost:3000` |
 
-- Start the tunnel. A URL for testing will be provided.
+## What Gets Installed
 
-`sudo unify-desktop-assistant tunnel`
+The installer includes:
 
-b. For production - WIP
+- **Magnitude** - Browser automation framework (pre-packaged)
+- **Agent Service** - AI agent API service (pre-packaged)
 
-- Login to Cloudflare. This is a one time step.
+The setup script installs these dependencies on first run:
+- **x11vnc** - VNC server (port 5900)
+- **noVNC** - Web-based VNC client (port 6080)
+- **websockify** - WebSocket to VNC proxy
+- **Python 3** - For websockify and tray app
+- **Node.js 22** - For agent service
+- **Bun** - Package manager for Magnitude
+- **GTK/AppIndicator** - For system tray app
+- **Playwright + Chromium** - For browser automation
 
-`cloudflared tunnel login`
+## Configuration
 
-- Start the tunnel.
+Settings are stored in the agent-service `.env` file:
 
-`TUNNEL_HOSTNAME=<prod_hostname> TUNNEL_NAME=<prod_appname> unify-desktop-assistant tunnel`
+```
+UNIFY_KEY=<your-key>
+ORCHESTRA_URL=https://api.unify.ai/v0
+UNITY_COMMS_URL=https://unity-comms-app-000000000000.us-central1.run.app
+PORT=3000
+```
 
-### Troubleshooting
+You can configure these via **Settings** in the tray menu, or by re-running:
+```bash
+sudo dpkg-reconfigure unify-desktop-assistant
+```
 
-- Make sure `ANTHROPIC_API_KEY`, `UNIFY_BASE_URL` and `UNIFY_KEY` are in your `.env` file when starting the Docker container.
-- When running with Actor, make sure `UNIFY_KEY` and at least `ASSISTANT_EMAIL=unity.agent@unity.ai` are present in your unity `.env` for the magnitude server auth to work.
+## Command Line Usage
+
+The CLI wrapper provides convenient access:
+
+```bash
+# Full setup and start services
+sudo unify-desktop-assistant setup --unify-key <your-key>
+
+# Start services only (no root needed)
+unify-desktop-assistant start
+
+# Stop all services
+unify-desktop-assistant stop
+
+# Check service status
+unify-desktop-assistant status
+
+# Force reinstall dependencies
+sudo unify-desktop-assistant setup --unify-key <your-key> --force
+
+# Uninstall cleanup
+sudo unify-desktop-assistant uninstall
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Ubuntu Desktop                           │
+│                                                              │
+│  ┌─────────────────┐   (Tray App)                           │
+│  │ unify-assistant  │◀─ Start/Stop/Settings                  │
+│  │   (Python/GTK)   │                                        │
+│  └─────────────────┘                                        │
+│                                                              │
+│  ┌─────────────┐     ┌─────────────┐     ┌───────────────┐  │
+│  │   x11vnc    │────▶│ websockify  │────▶│ noVNC (6080)  │  │
+│  │   (5900)    │     │             │     │ HTML5 Viewer  │  │
+│  └─────────────┘     └─────────────┘     └───────────────┘  │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │            Agent Service (Express, port 3000)           ││
+│  │   ┌───────────────────────────────────────────────────┐ ││
+│  │   │  Magnitude BrowserAgent (Playwright + LLM)        │ ││
+│  │   └───────────────────────────────────────────────────┘ ││
+│  └─────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Optional: HTTPS Tunnels (Cloudflare)
+
+For remote access without setting up your own domain:
+
+```bash
+# Tunnel Agent Service (port 3000)
+unify-desktop-assistant tunnel
+
+# Tunnel VNC viewer (port 6080)
+unify-desktop-assistant liveview
+```
+
+## Building the .deb Package
+
+To build the installer yourself:
+
+```bash
+cd ubuntu/installer
+./build.sh
+```
+
+Options:
+```bash
+./build.sh --staging        # Build with staging URLs
+./build.sh --version 1.2.0  # Custom version
+./build.sh --clean          # Clean output first
+```
+
+The `.deb` will be created in `ubuntu/installer/output/`.
+
+## Directory Structure
+
+```
+ubuntu/
+├── agent-service/              # AI agent API (pre-packaged)
+│   ├── src/index.ts
+│   ├── package.json
+│   └── .env                    # Created on setup
+├── magnitude/                  # Browser automation (pre-packaged)
+│   └── packages/magnitude-core/
+├── gui/
+│   └── unify-assistant.py      # System tray app (Python/GTK)
+├── tools/
+│   ├── setup.sh                # Main setup script
+│   ├── tunnel.sh               # Cloudflare tunnel (optional)
+│   ├── liveview.sh             # Cloudflare VNC tunnel (optional)
+│   └── novnc/                  # Cloned on first run
+├── systemd/
+│   ├── unify-vnc.service       # x11vnc systemd unit
+│   ├── unify-websockify.service
+│   ├── unify-agent.service
+│   └── unify-tray.service
+├── installer/
+│   ├── build.sh                # Build automation
+│   ├── DEBIAN/
+│   │   ├── control             # Package metadata
+│   │   ├── templates           # debconf templates (API key prompt)
+│   │   ├── config              # debconf config script
+│   │   ├── postinst            # Post-install script
+│   │   ├── prerm               # Pre-removal script
+│   │   └── postrm              # Post-removal script
+│   └── output/                 # Generated .deb files
+├── usr/
+│   └── bin/
+│       └── unify-desktop-assistant  # CLI wrapper
+├── logs/                       # Service log files
+└── README.md
+```
+
+## Uninstalling
+
+Via package manager:
+```bash
+sudo apt remove unify-desktop-assistant     # Remove (keep config)
+sudo apt purge unify-desktop-assistant      # Remove everything
+```
+
+Or via CLI:
+```bash
+sudo unify-desktop-assistant uninstall
+```
+
+## Troubleshooting
+
+### Services Not Starting
+
+Check if ports are already in use:
+```bash
+ss -tlnp 'sport = :5900 or sport = :6080 or sport = :3000'
+```
+
+### View Logs
+
+Service logs are saved to the `logs/` directory:
+```bash
+# Agent service
+cat /opt/unify-desktop-assistant/logs/agent.log
+
+# websockify
+cat /opt/unify-desktop-assistant/logs/websockify.log
+
+# x11vnc
+cat /opt/unify-desktop-assistant/logs/x11vnc.log
+```
+
+Or use **View Logs** from the tray menu.
+
+### Tray Icon Not Showing
+
+Make sure AppIndicator support is installed:
+```bash
+sudo apt install gir1.2-ayatanaappindicator3-0.1
+```
+
+For GNOME, you may also need the AppIndicator extension:
+```bash
+sudo apt install gnome-shell-extension-appindicator
+```
+
+### Manual Service Start
+
+```bash
+# Start x11vnc manually
+x11vnc -display :0 -nopw -forever -shared -rfbport 5900
+
+# Start websockify manually
+python3 -m websockify --web=/opt/unify-desktop-assistant/tools/novnc 6080 localhost:5900
+
+# Start agent service manually
+cd /opt/unify-desktop-assistant/agent-service
+npx ts-node src/index.ts
+```
+
+### Reconfigure API Key
+
+```bash
+sudo dpkg-reconfigure unify-desktop-assistant
+```

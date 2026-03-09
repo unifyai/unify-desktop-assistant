@@ -1,0 +1,15 @@
+[Unit]
+Description=Unify Desktop Assistant - System Tray GUI
+Documentation=https://unify.ai
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %INSTALL_DIR%/gui/unify-assistant.py
+Environment=DISPLAY=:0
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=Unify Desktop Assistant - x11vnc Server
+Documentation=https://unify.ai
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+ExecStart=/usr/bin/x11vnc -display :0 -nopw -forever -shared -rfbport 5900 -rfbportv6 -1 -noxdamage -nowf -nocursorshape -cursor arrow -nodpms
+ExecStop=/usr/bin/killall x11vnc
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

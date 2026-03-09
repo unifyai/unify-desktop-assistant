@@ -1,0 +1,18 @@
+[Unit]
+Description=Unify Desktop Assistant - Agent Service
+Documentation=https://unify.ai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%AGENT_SERVICE_DIR%
+ExecStart=/usr/bin/npx -y ts-node src/index.ts
+EnvironmentFile=%AGENT_SERVICE_DIR%/.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:%LOG_DIR%/agent.log
+StandardError=append:%LOG_DIR%/agent.log
+
+[Install]
+WantedBy=default.target

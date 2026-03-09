@@ -1,0 +1,17 @@
+[Unit]
+Description=Unify Desktop Assistant - websockify (noVNC proxy)
+Documentation=https://unify.ai
+After=unify-vnc.service
+Requires=unify-vnc.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m websockify --web=%NOVNC_DIR% 6080 localhost:5900
+WorkingDirectory=%NOVNC_DIR%
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:%LOG_DIR%/websockify.log
+StandardError=append:%LOG_DIR%/websockify.log
+
+[Install]
+WantedBy=default.target
