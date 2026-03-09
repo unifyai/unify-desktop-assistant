@@ -54,32 +54,6 @@ cleanup() {
 
 trap cleanup SIGTERM SIGINT
 
-# Pull latest magnitude-core and rebuild if the source has changed.
-# The install script clones magnitude and builds once; this ensures
-# subsequent VM boots pick up any new commits to unity-modifications.
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MAG_CORE="$BASE_DIR/magnitude/packages/magnitude-core"
-if [[ -d "$MAG_CORE/.git" ]] || [[ -d "$BASE_DIR/magnitude/.git" ]]; then
-  echo "[remote] Updating magnitude-core..."
-  pushd "$BASE_DIR/magnitude" >/dev/null
-  OLD_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "none")
-  git fetch origin unity-modifications --quiet 2>/dev/null || true
-  git checkout -B unity-modifications origin/unity-modifications --quiet 2>/dev/null || true
-  NEW_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "none")
-  popd >/dev/null
-
-  if [[ "$OLD_HEAD" != "$NEW_HEAD" ]]; then
-    echo "[remote] magnitude-core updated ($OLD_HEAD → $NEW_HEAD), rebuilding..."
-    pushd "$MAG_CORE" >/dev/null
-    npx baml-cli generate 2>/dev/null || true
-    npx pkgroll 2>/dev/null || true
-    popd >/dev/null
-    echo "[remote] magnitude-core rebuild complete."
-  else
-    echo "[remote] magnitude-core already up to date."
-  fi
-fi
-
 npx ts-node agent-service/src/index.ts &
 TS_PID=$!
 

@@ -99,34 +99,9 @@ echo "websockify started with PID ${WS_PID}. Logs: /tmp/novnc_websockify.log"
 
 echo "Done. Open: http://localhost:${NOVNC_PORT}/vnc.html"
 
-# Pull latest magnitude-core and rebuild if the source has changed.
-# The install script clones magnitude and builds once; this ensures
-# subsequent boots pick up any new commits to unity-modifications.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-MAG_CORE="$SCRIPT_DIR/magnitude/packages/magnitude-core"
-if [[ -d "$SCRIPT_DIR/magnitude/.git" ]]; then
-  echo "Updating magnitude-core..."
-  pushd "$SCRIPT_DIR/magnitude" >/dev/null
-  OLD_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "none")
-  git fetch origin unity-modifications --quiet 2>/dev/null || true
-  git checkout -B unity-modifications origin/unity-modifications --quiet 2>/dev/null || true
-  NEW_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "none")
-  popd >/dev/null
-
-  if [[ "$OLD_HEAD" != "$NEW_HEAD" ]]; then
-    echo "magnitude-core updated ($OLD_HEAD → $NEW_HEAD), rebuilding..."
-    pushd "$MAG_CORE" >/dev/null
-    npx baml-cli generate 2>/dev/null || true
-    npx pkgroll 2>/dev/null || true
-    popd >/dev/null
-    echo "magnitude-core rebuild complete."
-  else
-    echo "magnitude-core already up to date."
-  fi
-fi
-
 # Start magnitude agent-service (ts-node) like linux/remote.sh
 echo "Starting magnitude agent-service..."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AGENT_DIR="$SCRIPT_DIR/agent-service"
 if [[ ! -d "$AGENT_DIR" ]]; then
   echo "Error: agent-service not found at $AGENT_DIR. Did you run 'unify-desktop-assistant install'?" >&2
