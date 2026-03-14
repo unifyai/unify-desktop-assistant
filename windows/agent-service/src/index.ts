@@ -457,7 +457,24 @@ async function ensureDemoSites(urlMappings: Record<string, string>): Promise<voi
     return;
   }
 
-  for (const [, replacement] of Object.entries(urlMappings)) {
+  // Add /etc/hosts entries so the browser resolves mapped domains to localhost.
+  // This bypasses patchright's CDP interception blocking.
+  for (const [original] of Object.entries(urlMappings)) {
+    try {
+      const origHost = new URL(original).hostname;
+      const hostsFile = fs.readFileSync('/etc/hosts', 'utf-8');
+      if (!hostsFile.includes(origHost)) {
+        fs.appendFileSync('/etc/hosts', `\n127.0.0.1 ${origHost}\n`);
+        console.log(`[demo-sites] Added /etc/hosts entry: 127.0.0.1 ${origHost}`);
+      } else {
+        console.log(`[demo-sites] /etc/hosts already has entry for ${origHost}`);
+      }
+    } catch (e) {
+      console.warn(`[demo-sites] Could not update /etc/hosts: ${e}`);
+    }
+  }
+
+  for (const [original, replacement] of Object.entries(urlMappings)) {
     let parsed: URL;
     try { parsed = new URL(replacement); } catch { continue; }
 
@@ -529,6 +546,52 @@ async function ensureDemoSites(urlMappings: Record<string, string>): Promise<voi
       console.log(`[demo-sites] ${dirName} ready on port ${port}`);
     } else {
       console.error(`[demo-sites] ${dirName} failed to start on port ${port} within timeout`);
+    }
+
+    // Start proxy listeners on the ports the browser will actually hit.
+    // Handles both HTTP (80) and HTTPS (443) since Chrome may upgrade
+    // via HSTS. HTTPS uses a self-signed cert (browser context has
+    // ignoreHTTPSErrors=true).
+    const proxyHandler = (req: any, res: any) => {
+      const proxyReq = http.request(
+        { hostname: '127.0.0.1', port, path: req.url, method: req.method, headers: req.headers },
+        (proxyRes: any) => { res.writeHead(proxyRes.statusCode || 200, proxyRes.headers); proxyRes.pipe(res); }
+      );
+      req.pipe(proxyReq);
+      proxyReq.on('error', () => { res.writeHead(502); res.end(); });
+    };
+
+    for (const listenPort of [80, 443]) {
+      if (listenPort !== port && !(await isPortOpen(listenPort))) {
+        try {
+          if (listenPort === 443) {
+            const { generateKeyPairSync, createSign, createHash } = await import('crypto');
+            // Generate a self-signed cert on the fly
+            const tls = await import('tls');
+            const { execSync: execSyncLocal } = await import('child_process');
+            try {
+              execSyncLocal(
+                'openssl req -x509 -newkey rsa:2048 -keyout /tmp/demo-key.pem -out /tmp/demo-cert.pem -days 1 -nodes -subj "/CN=connect.zoho.com" 2>/dev/null',
+                { timeout: 5000 }
+              );
+              const httpsProxy = https.createServer(
+                { key: fs.readFileSync('/tmp/demo-key.pem'), cert: fs.readFileSync('/tmp/demo-cert.pem') },
+                proxyHandler
+              );
+              httpsProxy.listen(443, '0.0.0.0');
+              console.log(`[demo-sites] HTTPS proxy listening on port 443 -> ${port}`);
+            } catch (e) {
+              console.warn(`[demo-sites] Could not create HTTPS proxy: ${e}`);
+            }
+          } else {
+            const httpProxy = http.createServer(proxyHandler);
+            httpProxy.listen(listenPort, '0.0.0.0');
+            console.log(`[demo-sites] HTTP proxy listening on port ${listenPort} -> ${port}`);
+          }
+        } catch (e) {
+          console.warn(`[demo-sites] Could not start proxy on port ${listenPort}: ${e}`);
+        }
+      }
     }
   }
 }
@@ -670,7 +733,7 @@ const startBrowserOnVm = async (urlMappings?: Record<string, string>): Promise<B
           downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
           tracesDir: defaultBrowserPaths.tracesDir || undefined,
         },
-        contextOptions: { viewport: null },
+        contextOptions: { viewport: null, ignoreHTTPSErrors: true },
       },
       narrate: true,
       urlMappings,
@@ -740,6 +803,74 @@ app.post('/start', async (req: Request, res: Response) => {
       agent = await startBrowser(headless ?? false, mappings);
     }
     console.log(`[start] agent_created=${Date.now() - t0}ms mode=${mode}`);
+
+    // ── Diagnostic logging for URL mapping debugging ────────────────────
+    if (mappings) {
+      console.log(`[url-map-diag] urlMappings received by agent: ${JSON.stringify(mappings)}`);
+
+      // Verify each demo site is actually reachable right now
+      for (const [original, replacement] of Object.entries(mappings)) {
+        console.log(`[url-map-diag] Mapping: ${original} -> ${replacement}`);
+        try {
+          const testResp = await fetch(replacement, { redirect: 'manual' });
+          console.log(`[url-map-diag] Fetch test ${replacement} -> status=${testResp.status}, headers=${JSON.stringify(Object.fromEntries([...testResp.headers.entries()].filter(([k]) => ['content-type','location','content-length'].includes(k.toLowerCase()))))}`);
+        } catch (e) {
+          console.error(`[url-map-diag] Fetch test ${replacement} -> FAILED: ${e}`);
+        }
+      }
+
+      // Log all registered routes on the context (Playwright exposes them via internal state)
+      try {
+        // Check if magnitude registered any routes by inspecting the context
+        const page = agent.page;
+        console.log(`[url-map-diag] Current page URL after agent start: ${page.url()}`);
+      } catch (e) {
+        console.warn(`[url-map-diag] Could not read page URL: ${e}`);
+      }
+
+      // Add a catch-all diagnostic route that logs EVERY request the browser makes.
+      // Uses route.fallback() so it doesn't interfere with magnitude's routes --
+      // if magnitude's route already handled it, this won't fire.
+      // If this DOES fire for a mapped URL, it means magnitude's route did NOT catch it.
+      try {
+        await agent.context.route('**/*', async (route) => {
+          const req = route.request();
+          const url = req.url();
+          const isNav = req.isNavigationRequest();
+          const method = req.method();
+          const resourceType = req.resourceType();
+
+          // Log all navigation requests + anything hitting a mapped domain
+          const mappedEntries = Object.entries(mappings!);
+          let matchInfo = 'no-match';
+          for (const [orig] of mappedEntries) {
+            const origHost = new URL(orig).hostname;
+            if (url.includes(origHost)) {
+              matchInfo = `matches-domain:${origHost}`;
+              // This request matched a mapped domain but reached our fallback,
+              // meaning magnitude's context.route() did NOT intercept it.
+              console.warn(`[url-map-diag] ⚠️ LEAKED REQUEST: ${method} ${url} (magnitude route did NOT intercept this)`);
+              // Check if URL exactly matches what magnitude should catch
+              const urlObj = new URL(url);
+              console.warn(`[url-map-diag]   url.href=${urlObj.href}, original=${orig}, startsWith(orig+/)=${urlObj.href.startsWith(orig + '/')}, equals=${urlObj.href === orig}`);
+              break;
+            }
+          }
+
+          if (isNav) {
+            console.log(`[url-map-diag] NAV ${method} ${url} (type=${resourceType}, ${matchInfo})`);
+          }
+
+          await route.fallback();
+        });
+        console.log(`[url-map-diag] Diagnostic catch-all route installed`);
+      } catch (e) {
+        console.warn(`[url-map-diag] Failed to install diagnostic route: ${e}`);
+      }
+    } else {
+      console.log(`[url-map-diag] No urlMappings provided for this session`);
+    }
+    // ── End diagnostic logging ───────────────────────────────────────────
 
     if (label && mode === 'web-vm') {
       try {

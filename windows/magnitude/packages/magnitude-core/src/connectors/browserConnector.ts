@@ -70,34 +70,46 @@ export class BrowserConnector implements AgentConnector {
 
         if (this.options.urlMappings) {
             for (const [original, replacement] of Object.entries(this.options.urlMappings)) {
-                this.logger.info(`URL mapping: ${original} -> ${replacement}`);
-                await this.context.route(
-                    (url: URL) => url.href === original || url.href.startsWith(original + '/'),
-                    async (route) => {
-                        const rewritten = route.request().url().replace(original, replacement);
-                        try {
-                            const resp = await fetch(rewritten, {
-                                method: route.request().method(),
-                                headers: Object.fromEntries(
-                                    Object.entries(route.request().headers())
-                                        .filter(([k]) => !['host', 'origin', 'referer'].includes(k.toLowerCase()))
-                                ),
-                                redirect: 'manual',
-                            });
-                            await route.fulfill({
-                                status: resp.status,
-                                headers: Object.fromEntries(
-                                    [...resp.headers.entries()]
-                                        .filter(([k]) => k.toLowerCase() !== 'transfer-encoding')
-                                ),
-                                body: Buffer.from(await resp.arrayBuffer()),
-                            });
-                        } catch (err) {
-                            this.logger.error(`URL mapping fetch failed for ${rewritten}: ${err}`);
-                            await route.abort('connectionfailed');
+                console.log(`[url-mapping] Registering: ${original} -> ${replacement}`);
+
+                const handler = async (route: any) => {
+                    const rewritten = route.request().url().replace(original, replacement);
+                    console.log(`[url-mapping] Intercepted: ${route.request().url()} -> ${rewritten}`);
+                    try {
+                        const reqHeaders = route.request().headers() as Record<string, string>;
+                        const filteredHeaders: Record<string, string> = {};
+                        for (const [k, v] of Object.entries(reqHeaders)) {
+                            if (!['host', 'origin', 'referer'].includes(k.toLowerCase())) {
+                                filteredHeaders[k] = v;
+                            }
                         }
+                        const resp = await fetch(rewritten, {
+                            method: route.request().method(),
+                            headers: filteredHeaders,
+                            redirect: 'manual',
+                        });
+                        console.log(`[url-mapping] Fetched ${rewritten} -> status=${resp.status}`);
+                        const respHeaders: Record<string, string> = {};
+                        resp.headers.forEach((v: string, k: string) => {
+                            if (k.toLowerCase() !== 'transfer-encoding') {
+                                respHeaders[k] = v;
+                            }
+                        });
+                        await route.fulfill({
+                            status: resp.status,
+                            headers: respHeaders,
+                            body: Buffer.from(await resp.arrayBuffer()),
+                        });
+                    } catch (err) {
+                        console.error(`[url-mapping] Fetch failed for ${rewritten}: ${err}`);
+                        await route.abort('connectionfailed');
                     }
-                );
+                };
+
+                // Use glob patterns instead of function matcher for patchright compatibility
+                await this.context.route(original, handler);
+                await this.context.route(`${original}/**`, handler);
+                console.log(`[url-mapping] Routes registered for ${original}`);
             }
         }
 
