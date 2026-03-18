@@ -7,12 +7,14 @@ A Linux application that sets up your machine as a remote-controllable AI assist
 ### Option 1: .deb Installer (Recommended)
 
 1. Download `unify-desktop-assistant_x.x.x_amd64.deb` from [Releases](https://github.com/unifyai/unify-desktop-assistant/releases)
-2. Install:
+2. Install (resolves all dependencies automatically):
    ```bash
-   sudo dpkg -i unify-desktop-assistant_x.x.x_amd64.deb
+   sudo apt install ./unify-desktop-assistant_x.x.x_amd64.deb
    ```
 3. Enter your Unify API Key when prompted
 4. The tray app will start automatically on next login
+
+> **Headless VM?** Run `sudo ./tools/start-display.sh` first to create a virtual display, then `export DISPLAY=:0` before running setup.
 
 ### Option 2: Run from Source
 
@@ -177,6 +179,7 @@ ubuntu/
 │   └── unify-assistant.py      # System tray app (Python/GTK)
 ├── tools/
 │   ├── setup.sh                # Main setup script
+│   ├── start-display.sh        # Start virtual display (headless VMs)
 │   ├── tunnel.sh               # Cloudflare tunnel (optional)
 │   ├── liveview.sh             # Cloudflare VNC tunnel (optional)
 │   └── novnc/                  # Cloned on first run
@@ -264,6 +267,20 @@ python3 -m websockify --web=/opt/unify-desktop-assistant/tools/novnc 6080 localh
 # Start agent service manually
 cd /opt/unify-desktop-assistant/agent-service
 npx ts-node src/index.ts
+```
+
+### Headless VM (No Display)
+
+If x11vnc fails with "XOpenDisplay failed", you need a virtual display:
+```bash
+sudo ./tools/start-display.sh         # Start Xvfb + Fluxbox on :0
+export DISPLAY=:0
+sudo -E ./tools/setup.sh --unify-key "your-key"
+```
+
+To stop the virtual display later:
+```bash
+sudo ./tools/start-display.sh --stop
 ```
 
 ### Reconfigure API Key
