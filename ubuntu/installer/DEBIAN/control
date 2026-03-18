@@ -13,11 +13,14 @@ Depends: bash,
          git,
          python3,
          python3-pip,
+         python3-venv,
          python3-gi,
          gir1.2-gtk-3.0,
          x11vnc,
-         wget
-Recommends: gir1.2-ayatanaappindicator3-0.1
+         wget,
+         nodejs,
+         npm
+Recommends: gir1.2-ayatanaappindicator3-0.1, gdebi
 Description: Unify Desktop Assistant for Ubuntu/Linux
  Sets up your machine as a remote-controllable AI assistant workstation.
  Includes system tray GUI, VNC server, noVNC web viewer, websockify proxy,

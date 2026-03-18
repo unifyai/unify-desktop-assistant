@@ -1,11 +1,16 @@
 #!/bin/bash
 # postinst - Post-installation script
 # Runs setup.sh to install all dependencies and configure services.
+#
+# Flow:
+#   1. setup.sh --skip-apt --no-start: install non-apt deps, configure, don't start services
+#   2. Background process: wait for dpkg lock release → playwright install-deps → start services
 
 set -e
 
 APP_DIR="/opt/unify-desktop-assistant"
 SETUP_SCRIPT="$APP_DIR/tools/setup.sh"
+LOG_DIR="$APP_DIR/logs"
 
 case "$1" in
     configure)
@@ -25,9 +30,13 @@ case "$1" in
         # Ensure setup script is executable
         chmod +x "$SETUP_SCRIPT"
 
-        # Run the consolidated setup script
+        # Phase 1: Install non-apt deps, configure everything, but don't start services.
+        # --skip-apt: apt dependencies are already resolved via Depends: in control
+        # --no-start: services will be started after Playwright system deps are installed
         echo "Running Unify Desktop Assistant setup..."
         "$SETUP_SCRIPT" \
+            --skip-apt \
+            --no-start \
             --unify-key "$UNIFY_KEY" \
             --orchestra-url "$ORCHESTRA_URL" \
             --unity-comms-url "$UNITY_COMMS_URL" || {
@@ -37,6 +46,41 @@ case "$1" in
 
         # Stop debconf to avoid holding the pipe
         db_stop || true
+
+        # Phase 2: Deferred — install Playwright system deps + start services
+        # dpkg holds its lock until postinst exits, so we fork a background process
+        # that waits for the lock to be released, then runs the apt-dependent steps.
+        mkdir -p "$LOG_DIR"
+        (
+            # Wait for dpkg to release its lock
+            while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1; do
+                sleep 2
+            done
+
+            echo "[$(date)] dpkg lock released, installing Playwright system deps..."
+
+            # Install Playwright's system library dependencies (needs apt)
+            cd "$APP_DIR/agent-service"
+            npx playwright install-deps chromium || {
+                echo "[$(date)] WARNING: Playwright system deps install failed" >&2
+            }
+
+            echo "[$(date)] Starting services..."
+
+            # Start services via setup.sh --start
+            "$SETUP_SCRIPT" --start || {
+                echo "[$(date)] WARNING: Service start failed" >&2
+            }
+
+            echo "[$(date)] Post-install complete."
+        ) &>"$LOG_DIR/postinst-deferred.log" &
+        disown
+
+        echo ""
+        echo "Installation complete!"
+        echo "Playwright system deps and services are being set up in the background."
+        echo "Progress: tail -f $LOG_DIR/postinst-deferred.log"
+        echo ""
         ;;
 
     abort-upgrade|abort-remove|abort-deconfigure)

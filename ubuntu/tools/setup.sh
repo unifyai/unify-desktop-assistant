@@ -39,6 +39,8 @@ DO_START=false
 DO_STOP=false
 DO_UNINSTALL=false
 FORCE=false
+SKIP_APT=false
+NO_START=false
 
 # =============================================================================
 # Argument Parsing
@@ -55,6 +57,8 @@ Options:
   --start               Start services only (no install/config, no root needed)
   --stop                Stop all services
   --uninstall           Stop services, remove systemd units & firewall rules
+  --skip-apt            Skip apt-get operations (used by .deb postinst)
+  --no-start            Skip starting services at end (used by .deb postinst)
   --force               Force reinstall all components
   -h, --help            Show this help message
 
@@ -81,6 +85,10 @@ while [[ $# -gt 0 ]]; do
             DO_STOP=true; shift ;;
         --uninstall)
             DO_UNINSTALL=true; shift ;;
+        --skip-apt)
+            SKIP_APT=true; shift ;;
+        --no-start)
+            NO_START=true; shift ;;
         --force)
             FORCE=true; shift ;;
         -h|--help)
@@ -90,6 +98,12 @@ while [[ $# -gt 0 ]]; do
             usage ;;
     esac
 done
+
+# Auto-detect dpkg context: if running inside a dpkg maintainer script,
+# apt-get calls would deadlock (dpkg holds its own lock).
+if [[ -n "${DPKG_MAINTSCRIPT_PACKAGE:-}" ]]; then
+    SKIP_APT=true
+fi
 
 echo ""
 echo "=========================================="
@@ -304,6 +318,11 @@ install_system_deps() {
     echo ""
     echo "=== Installing System Dependencies ==="
 
+    if $SKIP_APT; then
+        echo "  Skipping apt-get (dependencies provided by .deb package)"
+        return
+    fi
+
     apt-get update -qq
 
     local packages=(
@@ -338,6 +357,11 @@ install_nodejs() {
 
     echo ""
     echo "=== Installing Node.js ==="
+
+    if $SKIP_APT; then
+        echo "  Skipping apt-get (nodejs provided by .deb package)"
+        return
+    fi
 
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
     apt-get install -y nodejs
@@ -542,7 +566,13 @@ install_agent_service() {
         npm install
 
         echo "  Installing Playwright + Chromium (this may take a few minutes)..."
-        npx -y playwright@1.52.0 install --with-deps chromium
+        if $SKIP_APT; then
+            # Download browser only — system deps come from .deb Depends or manual install
+            npx -y playwright@1.52.0 install chromium
+        else
+            # Download browser + install system libraries via apt
+            npx -y playwright@1.52.0 install --with-deps chromium
+        fi
 
         save_dependencies_hash "$AGENT_SERVICE_DIR"
         popd >/dev/null
@@ -908,8 +938,11 @@ if [[ -n "${SUDO_USER:-}" ]]; then
     chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$INSTALL_DIR" 2>/dev/null || true
 fi
 
-# Start services
-start_all_services
-
-# Show summary
-show_summary
+# Start services (unless --no-start, e.g. when called from .deb postinst)
+if $NO_START; then
+    echo ""
+    echo "Setup complete (services not started — use --start or the installer will handle it)."
+else
+    start_all_services
+    show_summary
+fi
