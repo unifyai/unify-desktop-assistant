@@ -19,7 +19,8 @@ Depends: bash,
          x11vnc,
          wget,
          nodejs,
-         npm
+         npm,
+         whiptail
 Recommends: gir1.2-ayatanaappindicator3-0.1, gdebi
 Description: Unify Desktop Assistant for Ubuntu/Linux
  Sets up your machine as a remote-controllable AI assistant workstation.

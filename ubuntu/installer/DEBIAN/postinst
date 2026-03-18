@@ -17,15 +17,17 @@ case "$1" in
         # Source debconf
         . /usr/share/debconf/confmodule
 
-        # Get values from debconf
+        # Get API key from debconf
         db_get unify-desktop-assistant/unify-key
         UNIFY_KEY="$RET"
 
-        db_get unify-desktop-assistant/orchestra-url
-        ORCHESTRA_URL="${RET:-https://api.unify.ai/v0}"
-
-        db_get unify-desktop-assistant/unity-comms-url
-        UNITY_COMMS_URL="${RET:-https://unity-comms-app-000000000000.us-central1.run.app}"
+        # URLs are baked at build time (main vs staging) in environment.conf
+        ENV_CONF="$APP_DIR/environment.conf"
+        if [ -f "$ENV_CONF" ]; then
+            . "$ENV_CONF"
+        fi
+        ORCHESTRA_URL="${ORCHESTRA_URL:-https://api.unify.ai/v0}"
+        UNITY_COMMS_URL="${UNITY_COMMS_URL:-https://unity-comms-app-000000000000.us-central1.run.app}"
 
         # Ensure setup script is executable
         chmod +x "$SETUP_SCRIPT"
@@ -35,6 +37,7 @@ case "$1" in
         # --no-start: services will be started after Playwright system deps are installed
         echo "Running Unify Desktop Assistant setup..."
         "$SETUP_SCRIPT" \
+            --force \
             --skip-apt \
             --no-start \
             --unify-key "$UNIFY_KEY" \

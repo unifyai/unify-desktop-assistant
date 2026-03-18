@@ -1,7 +1,8 @@
 #!/bin/bash
 # config - debconf configuration script
-# Called BEFORE postinst to collect user input (e.g., API key).
-# This script can be re-run (dpkg-reconfigure) to change settings.
+# Called BEFORE postinst to collect user input (API key only).
+# URLs are determined at build time (main vs staging), not user-configurable.
+# This script can be re-run (dpkg-reconfigure) to change the API key.
 
 set -e
 
@@ -16,16 +17,6 @@ if [ -f "$ENV_FILE" ]; then
     if [ -n "$existing_key" ]; then
         db_set unify-desktop-assistant/unify-key "$existing_key"
     fi
-
-    existing_orchestra=$(grep -oP '^ORCHESTRA_URL=\K.*' "$ENV_FILE" 2>/dev/null || true)
-    if [ -n "$existing_orchestra" ]; then
-        db_set unify-desktop-assistant/orchestra-url "$existing_orchestra"
-    fi
-
-    existing_comms=$(grep -oP '^UNITY_COMMS_URL=\K.*' "$ENV_FILE" 2>/dev/null || true)
-    if [ -n "$existing_comms" ]; then
-        db_set unify-desktop-assistant/unity-comms-url "$existing_comms"
-    fi
 fi
 
 # Ask for API key (required)
@@ -39,8 +30,3 @@ while [ -z "$RET" ]; do
     db_go || true
     db_get unify-desktop-assistant/unify-key
 done
-
-# Ask for URLs (optional, have defaults)
-db_input low unify-desktop-assistant/orchestra-url || true
-db_input low unify-desktop-assistant/unity-comms-url || true
-db_go || true
