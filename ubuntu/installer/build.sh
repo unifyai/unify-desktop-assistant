@@ -184,21 +184,16 @@ cp "$PROJECT_DIR/systemd/"*.service "$APP_ROOT/systemd/" 2>/dev/null || true
 # --- magnitude/ (excluding node_modules, .git) ---
 echo "  Copying magnitude/ (excluding node_modules, .git)..."
 mkdir -p "$APP_ROOT/magnitude"
-rsync -a \
-    --exclude='node_modules' \
-    --exclude='.git' \
-    --exclude='*.log' \
-    "$PROJECT_DIR/magnitude/" "$APP_ROOT/magnitude/"
+tar -C "$PROJECT_DIR/magnitude" \
+    --exclude='node_modules' --exclude='.git' --exclude='*.log' \
+    -cf - . | tar -C "$APP_ROOT/magnitude" -xf -
 
 # --- agent-service/ (excluding node_modules, .git, .env, logs) ---
 echo "  Copying agent-service/ (excluding node_modules, .git, .env, logs)..."
 mkdir -p "$APP_ROOT/agent-service"
-rsync -a \
-    --exclude='node_modules' \
-    --exclude='.git' \
-    --exclude='.env' \
-    --exclude='*.log' \
-    "$PROJECT_DIR/agent-service/" "$APP_ROOT/agent-service/"
+tar -C "$PROJECT_DIR/agent-service" \
+    --exclude='node_modules' --exclude='.git' --exclude='.env' --exclude='*.log' \
+    -cf - . | tar -C "$APP_ROOT/agent-service" -xf -
 
 # --- logs/ directory ---
 mkdir -p "$APP_ROOT/logs"
