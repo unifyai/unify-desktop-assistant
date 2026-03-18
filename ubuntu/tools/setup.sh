@@ -354,29 +354,38 @@ install_bun() {
     echo ""
     echo "=== Installing Bun ==="
 
-    # Install for the actual user (not root) if running under sudo
+    # Prefer npm global install (works reliably under sudo, system-wide PATH)
+    if command -v npm &>/dev/null; then
+        echo "  Installing bun via npm (global)..."
+        npm install -g bun && {
+            echo "  Bun installed ($(bun --version))"
+            return
+        }
+        echo "  npm global install failed, trying curl installer..." >&2
+    fi
+
+    # Fallback: curl installer for the real user
     local target_user="${SUDO_USER:-$USER}"
     local target_home
     target_home=$(eval echo "~$target_user")
 
     if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
-        # Install as the real user
         su - "$SUDO_USER" -c 'curl -fsSL https://bun.sh/install | bash' || {
-            echo "  WARNING: Bun install failed (optional)" >&2
-            return
+            echo "  ERROR: Bun install failed" >&2
+            return 1
         }
     else
         curl -fsSL https://bun.sh/install | bash || {
-            echo "  WARNING: Bun install failed (optional)" >&2
-            return
+            echo "  ERROR: Bun install failed" >&2
+            return 1
         }
     fi
 
-    # Add to PATH for current session
+    # Add user-local bun to PATH for current session
     export BUN_INSTALL="$target_home/.bun"
     export PATH="$BUN_INSTALL/bin:$PATH"
 
-    echo "  Bun installed"
+    echo "  Bun installed ($(bun --version 2>/dev/null || echo 'unknown'))"
 }
 
 install_websockify() {
@@ -471,6 +480,21 @@ install_magnitude() {
         return 1
     fi
 
+    # Find bun binary — check PATH, npm global, and user-local install
+    local bun_exe=""
+    if command -v bun &>/dev/null; then
+        bun_exe="$(command -v bun)"
+    else
+        # Check user-local install (may not be in sudo's PATH)
+        local target_home
+        target_home=$(eval echo "~${SUDO_USER:-$USER}")
+        if [[ -x "$target_home/.bun/bin/bun" ]]; then
+            bun_exe="$target_home/.bun/bin/bun"
+            export BUN_INSTALL="$target_home/.bun"
+            export PATH="$BUN_INSTALL/bin:$PATH"
+        fi
+    fi
+
     # Check if deps need install
     if test_dependencies_installed "$MAGNITUDE_DIR" && [[ "$FORCE" == "false" ]]; then
         echo "  Dependencies up-to-date"
@@ -479,13 +503,17 @@ install_magnitude() {
 
         pushd "$MAGNITUDE_DIR" >/dev/null
 
-        # Install at monorepo root - postinstall runs "turbo run build"
-        if command -v bun &>/dev/null; then
+        # Magnitude declares "packageManager": "bun@..." so turbo requires bun
+        if [[ -n "$bun_exe" ]]; then
             echo "  Running bun install (includes build via postinstall)..."
-            bun install || npm install
+            echo "  Using: $bun_exe"
+            "$bun_exe" install
         else
-            echo "  Running npm install (includes build via postinstall)..."
-            npm install
+            echo "  ERROR: bun is required for magnitude (packageManager: bun)" >&2
+            echo "  Checked: command -v bun, ~/.bun/bin/bun" >&2
+            echo "  Try: npm install -g bun  OR  curl -fsSL https://bun.sh/install | bash" >&2
+            popd >/dev/null
+            return 1
         fi
 
         save_dependencies_hash "$MAGNITUDE_DIR"
