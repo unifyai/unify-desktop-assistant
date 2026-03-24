@@ -63,4 +63,12 @@ export class ActionVisualizer {
     async showAll() {
         await this.cursor.show();
     }
+
+    async ensureCursorDrawn() {
+        await this.cursor.ensureDrawn();
+    }
+
+    getCursorPosition(): { x: number; y: number } | null {
+        return this.cursor.getLastPosition();
+    }
 }

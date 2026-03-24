@@ -1,4 +1,4 @@
-import { convertToBamlClientOptions } from "./util";
+import { convertToBamlClientOptions, isClaude } from "./util";
 // Import ModularMemoryContext instead of old MemoryContext
 import { b, AgentContext } from "@/ai/baml_client"; 
 import { Image as BamlImage, Collector, ClientRegistry } from "@boundaryml/baml";
@@ -62,9 +62,16 @@ export class ModelHarness {
         this.collector = new Collector("macro");
         this.cr = new ClientRegistry();
         let bamlClientOptions = await convertToBamlClientOptions(this.options.llm);
+        const bamlProvider = this.options.llm.provider === 'claude-code' ? 'anthropic' : this.options.llm.provider;
+        console.log('\n========== BAML CLIENT SETUP ==========');
+        console.log('Provider (raw):', this.options.llm.provider);
+        console.log('Provider (BAML):', bamlProvider);
+        console.log('promptCaching on client:', (this.options.llm.options as any).promptCaching);
+        console.log('BAML client options:', JSON.stringify(bamlClientOptions, null, 2));
+        console.log('========================================\n');
         this.cr.addLlmClient(
             'Magnus', 
-            this.options.llm.provider === 'claude-code' ? 'anthropic' : this.options.llm.provider,
+            bamlProvider,
             bamlClientOptions,
             'DefaultRetryPolicy'
         );
@@ -78,31 +85,78 @@ export class ModelHarness {
     }
 
     private _reportUsage(): void {
-        // console.log('this.collector.last', this.collector.last)
-        // if (this.collector.last) console.log("calls:", this.collector.last.calls)//console.log("Response: ", this.collector.last.calls[-1].httpResponse);
-        //console.log('last call:', this.collector.last?.calls.at(-1)?.httpResponse?.body.json());
-        // Get tokens used since last call to reportUsage
-        //console.log(this.collector.usage);
+        const lastCall = this.collector.last?.calls.at(-1);
+        if (lastCall) {
+            try {
+                const req = (lastCall as any).httpRequest;
+                if (req) {
+                    const reqBody = typeof req.body?.json === 'function' ? req.body.json() : req.body;
+                    console.log('\n========== OUTGOING REQUEST TO LLM PROXY ==========');
+                    console.log('URL:', req.url);
+                    console.log('Headers:', JSON.stringify(req.headers, null, 2));
+                    if (reqBody) {
+                        const sanitized = {
+                            ...reqBody,
+                            messages: reqBody.messages?.map((m: any) => ({
+                                ...m,
+                                content: Array.isArray(m.content)
+                                    ? m.content.map((c: any) => {
+                                        if (c.type === 'image_url' || c.type === 'image') {
+                                            return { ...c, image_url: c.image_url ? { ...c.image_url, url: '[IMG]' } : undefined, source: c.source ? { ...c.source, data: '[IMG]' } : undefined };
+                                        }
+                                        return c;
+                                    })
+                                    : m.content
+                            }))
+                        };
+                        console.log('Body (images truncated):', JSON.stringify(sanitized, null, 2));
+                    }
+                    console.log('====================================================\n');
+                } else {
+                    console.log('[DEBUG] httpRequest not available on collector call. Keys:', Object.keys(lastCall));
+                }
+
+                const res = (lastCall as any).httpResponse;
+                if (res) {
+                    const resBody = typeof res.body?.json === 'function' ? res.body.json() : res.body;
+                    console.log('\n========== RESPONSE FROM LLM PROXY ==========');
+                    console.log('Status:', res.status);
+                    if (resBody) {
+                        console.log('Usage:', JSON.stringify(resBody.usage, null, 2));
+                        console.log('Model:', resBody.model);
+                        console.log('cache_creation_input_tokens:', resBody.usage?.cache_creation_input_tokens ?? 'NOT PRESENT');
+                        console.log('cache_read_input_tokens:', resBody.usage?.cache_read_input_tokens ?? 'NOT PRESENT');
+                    }
+                    console.log('===============================================\n');
+                } else {
+                    console.log('[DEBUG] httpResponse not available on collector call. Keys:', Object.keys(lastCall));
+                }
+            } catch (e) {
+                console.log('[DEBUG] Error logging request/response:', e);
+            }
+        }
 
         let inputTokens: number = 0;
         let outputTokens: number = 0;
         let cacheWriteInputTokens: number = 0;
         let cacheReadInputTokens: number = 0;
 
-        if (this.options.llm.provider === 'anthropic' || this.options.llm.provider === 'claude-code') {
-            type AnthropicUsage = { input_tokens: number, cache_creation_input_tokens: number, cache_read_input_tokens: number, output_tokens: number, service_tier: string };
-            const usage = this.collector.last?.calls.at(-1)?.httpResponse?.body.json().usage as AnthropicUsage;
-            //console.log("Usage from Anthropic:", usage);
+        if (this.options.llm.provider === 'anthropic' || this.options.llm.provider === 'claude-code' || (this.options.llm.provider === 'openai-generic' && isClaude(this.options.llm))) {
+            type UnifiedUsage = {
+                input_tokens?: number, output_tokens?: number,
+                prompt_tokens?: number, completion_tokens?: number,
+                cache_creation_input_tokens?: number, cache_read_input_tokens?: number
+            };
+            const usage = this.collector.last?.calls.at(-1)?.httpResponse?.body.json().usage as UnifiedUsage;
             if (!usage) {
-                // Sometimes apparently this happens? Happened once after extract for example
-                logger.warn("No usage returned from Anthropic provider, cached cost may be inaccurate");
+                logger.warn("No usage returned from provider, cached cost may be inaccurate");
                 inputTokens = (this.collector.usage.inputTokens ?? 0) - this.prevTotalInputTokens;
                 outputTokens = (this.collector.usage.outputTokens ?? 0) - this.prevTotalOutputTokens;
             } else {
-                inputTokens = usage.input_tokens;
-                outputTokens = usage.output_tokens;
-                cacheWriteInputTokens = usage.cache_creation_input_tokens;
-                cacheReadInputTokens = usage.cache_read_input_tokens;
+                inputTokens = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+                outputTokens = usage.output_tokens ?? usage.completion_tokens ?? 0;
+                cacheWriteInputTokens = usage.cache_creation_input_tokens ?? 0;
+                cacheReadInputTokens = usage.cache_read_input_tokens ?? 0;
             }
             
         } else {
@@ -170,8 +224,8 @@ export class ModelHarness {
         this.events.emit('tokensUsed', usage);
         //console.log("Usage:", usage);
 
-        this.prevTotalInputTokens = inputTokens;
-        this.prevTotalOutputTokens = outputTokens;
+        this.prevTotalInputTokens += inputTokens;
+        this.prevTotalOutputTokens += outputTokens;
     }
 
     async partialAct<T>(
