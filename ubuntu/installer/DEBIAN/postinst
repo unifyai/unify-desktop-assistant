@@ -81,11 +81,18 @@ ENVFILE
                 echo "[$(date)] WARNING: setup.sh encountered errors" >&2
             }
 
-            # Start services
-            echo "[$(date)] Starting services..."
-            "$SETUP_SCRIPT" --start || {
+            # Start services as the target user (so they can be stopped without root)
+            TARGET_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+            echo "[$(date)] Starting services as $TARGET_USER..."
+            su - "$TARGET_USER" -c "DISPLAY=:0 $SETUP_SCRIPT --start" || {
                 echo "[$(date)] WARNING: Service start failed" >&2
             }
+
+            # Launch tray app if a display is available
+            if [ -f "$APP_DIR/gui/unify-assistant.py" ]; then
+                echo "[$(date)] Launching tray app..."
+                su - "$TARGET_USER" -c "DISPLAY=:0 nohup python3 $APP_DIR/gui/unify-assistant.py &>/dev/null &" || true
+            fi
 
             echo "[$(date)] Post-install complete."
         ) &>"$LOG_DIR/postinst-deferred.log" &

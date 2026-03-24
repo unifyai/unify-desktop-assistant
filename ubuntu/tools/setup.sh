@@ -625,15 +625,18 @@ setup_systemd_services() {
     echo "=== Setting up systemd user services ==="
 
     local systemd_dir="$INSTALL_DIR/systemd"
-    local user_systemd_dir="$HOME/.config/systemd/user"
-    mkdir -p "$user_systemd_dir"
 
     # Determine the actual user (handle sudo)
     local target_user="${SUDO_USER:-$USER}"
     local target_home
     target_home=$(eval echo "~$target_user")
+    local target_group
+    target_group=$(id -gn "$target_user")
     local target_systemd_dir="$target_home/.config/systemd/user"
-    mkdir -p "$target_systemd_dir"
+    install -d -o "$target_user" -g "$target_group" \
+        "$target_home/.config" \
+        "$target_home/.config/systemd" \
+        "$target_systemd_dir"
 
     # Install systemd unit files from the systemd/ directory
     if [[ -d "$systemd_dir" ]]; then
@@ -672,8 +675,12 @@ setup_autostart() {
     local target_user="${SUDO_USER:-$USER}"
     local target_home
     target_home=$(eval echo "~$target_user")
+    local target_group
+    target_group=$(id -gn "$target_user")
     local autostart_dir="$target_home/.config/autostart"
-    mkdir -p "$autostart_dir"
+    install -d -o "$target_user" -g "$target_group" \
+        "$target_home/.config" \
+        "$autostart_dir"
 
     cat > "$autostart_dir/unify-desktop-assistant.desktop" <<DESKTOP
 [Desktop Entry]
@@ -690,7 +697,7 @@ DESKTOP
 
     # Fix ownership if running as sudo
     if [[ -n "${SUDO_USER:-}" ]]; then
-        chown "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$autostart_dir/unify-desktop-assistant.desktop"
+        chown "$target_user":"$target_group" "$autostart_dir/unify-desktop-assistant.desktop"
     fi
 
     echo "  Autostart entry created"
