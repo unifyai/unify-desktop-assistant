@@ -26,7 +26,7 @@ ENVIRONMENT="main"
 
 # Environment-specific URLs
 ORCHESTRA_URL_MAIN="https://api.unify.ai/v0"
-ORCHESTRA_URL_STAGING="https://service.a.run.app/v0"
+ORCHESTRA_URL_STAGING="https://internal.example.com/v0"
 COMMS_URL_MAIN="https://unity-comms-app-000000000000.us-central1.run.app"
 COMMS_URL_STAGING="https://unity-comms-app-staging-000000000000.us-central1.run.app"
 
