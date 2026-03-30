@@ -377,6 +377,10 @@ export class WebHarness { // implements StateComponent
         await this.page.keyboard.press('Tab')
     }
 
+    async keyPress(key: string) {
+        await this.page.keyboard.press(key);
+    }
+
     async goBack() {
         // Initiate the back navigation. On SPAs, this may time out while waiting for an
         // event that never fires. We'll catch this specific error and proceed.
