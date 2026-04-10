@@ -43,6 +43,7 @@ export interface ActOptions {
 	data?: RenderableContent,//string | Record<string, string>
     memory?: AgentMemory,// optional memory starting point
     override_cache?: boolean // if true, delete matching cache entries before execution
+    verify?: boolean, // when true, re-plan after executing to verify task completion
 }
 
 // Options for the startAgent helper function
@@ -65,7 +66,11 @@ export class Agent {
     // maybe remove conns/actions from options since stored sep
     private options: Required<AgentOptions>//Omit<Required<AgentOptions>, 'actions'>;
     private connectors: AgentConnector[];
-    private actions: ActionDefinition<any>[]; // actions from connectors + any other additional ones configured
+    private _actions: ActionDefinition<any>[];
+
+    get actions(): ActionDefinition<any>[] {
+        return this._actions;
+    }
     private actionAbortController: AbortController | null = null;
 
     private memoryOptions: AgentMemoryOptions;
@@ -81,26 +86,28 @@ export class Agent {
     
     //public readonly memory: AgentMemory;
     private doneActing: boolean;
+    private _paused: boolean = false;
+    private _pauseResolve: (() => void) | null = null;
 
     protected latestTaskMemory: AgentMemory;// | null = null;
 
     private visualCacheConfig = {
-        enabled: process.env.CACHE_ENABLED === 'true',
+        enabled: process.env.UNITY_MAGNITUDE_CACHE_ENABLED === 'true',
         apiUrl: process.env.UNIFY_BASE_URL || 'http://localhost:8000/v0',
         project: process.env.UNIFY_PROJECT || 'Assistants',
-        context: process.env.CACHE_CONTEXT || 'VisualSemanticCache',
+        context: process.env.UNITY_MAGNITUDE_CACHE_CONTEXT || 'VisualSemanticCache',
         // Embedding-based caching (primary method when enabled)
-        useImageEmbedding: process.env.CACHE_USE_IMAGE_EMBEDDING === 'true', // Controls whether to use embeddings or pHash
-        imageEmbeddingThreshold: parseFloat(process.env.CACHE_IMAGE_EMBEDDING_THRESHOLD || '0.15'), // Max cosine distance for full image embedding
-        roiEmbeddingThreshold: parseFloat(process.env.CACHE_ROI_EMBEDDING_THRESHOLD || '0.15'), // Max cosine distance for ROI embedding
+        useImageEmbedding: process.env.UNITY_MAGNITUDE_CACHE_USE_IMAGE_EMBEDDING === 'true', // Controls whether to use embeddings or pHash
+        imageEmbeddingThreshold: parseFloat(process.env.UNITY_MAGNITUDE_CACHE_IMAGE_EMBEDDING_THRESHOLD || '0.15'), // Max cosine distance for full image embedding
+        roiEmbeddingThreshold: parseFloat(process.env.UNITY_MAGNITUDE_CACHE_ROI_EMBEDDING_THRESHOLD || '0.15'), // Max cosine distance for ROI embedding
         // pHash-based caching (fallback when embeddings disabled)
-        visualsimilarityThreshold: parseInt(process.env.CACHE_VISUAL_SIMILARITY_THRESHOLD || '35', 10), // Max hamming distance for pHash comparison
-        roiPhashThreshold: parseInt(process.env.CACHE_ROI_PHASH_THRESHOLD || '3', 10), // Max hamming distance for ROI pHash comparison
+        visualsimilarityThreshold: parseInt(process.env.UNITY_MAGNITUDE_CACHE_VISUAL_SIMILARITY_THRESHOLD || '35', 10), // Max hamming distance for pHash comparison
+        roiPhashThreshold: parseInt(process.env.UNITY_MAGNITUDE_CACHE_ROI_PHASH_THRESHOLD || '3', 10), // Max hamming distance for ROI pHash comparison
         // Common settings
-        textSimilarityThreshold: parseFloat(process.env.CACHE_TEXT_SIMILARITY_THRESHOLD || '0.1'), // Max cosine similarity for text comparison
+        textSimilarityThreshold: parseFloat(process.env.UNITY_MAGNITUDE_CACHE_TEXT_SIMILARITY_THRESHOLD || '0.1'), // Max cosine similarity for text comparison
         overwrite: process.env.UNIFY_OVERWRITE_PROJECT === 'true', // Whether to overwrite existing project/context
-        roiWidth: parseInt(process.env.CACHE_ROI_WIDTH || '100', 10), // Width of ROI around first interaction
-        roiHeight: parseInt(process.env.CACHE_ROI_HEIGHT || '100', 10), // Height of ROI around first interaction
+        roiWidth: parseInt(process.env.UNITY_MAGNITUDE_CACHE_ROI_WIDTH || '100', 10), // Width of ROI around first interaction
+        roiHeight: parseInt(process.env.UNITY_MAGNITUDE_CACHE_ROI_HEIGHT || '100', 10), // Height of ROI around first interaction
     };
     constructor(baseConfig: Partial<AgentOptions> = {}) {
         this.options = {
@@ -114,9 +121,9 @@ export class Agent {
 
         // Aggregate actions from connectors
         //const aggregatedActions = [...this.options.actions];
-        this.actions = [...this.options.actions];
+        this._actions = [...this.options.actions];
         for (const connector of this.connectors) {
-            this.actions.push(...(connector.getActionSpace ? connector.getActionSpace() : []));
+            this._actions.push(...(connector.getActionSpace ? connector.getActionSpace() : []));
         }
         // Deduplicate actions by name
         // TODO: maybe error instead, or automatically differentiate them?
@@ -127,7 +134,7 @@ export class Agent {
         let doPromptCaching = false;
         for (const client of llms ) {
             // If any LLM is prompt-caching compatible, turn on prompt caching overall for memory etc.
-            if (isClaude(client) && (client.provider === 'anthropic' || client.provider === 'claude-code')) {
+            if (isClaude(client) && (client.provider === 'anthropic' || client.provider === 'claude-code' || client.provider === 'openai-generic')) {
                 // Prompt-caching compatible client
 
                 if ('promptCaching' in client.options && client.options.promptCaching !== undefined) {
@@ -144,6 +151,8 @@ export class Agent {
         this.models = new MultiModelHarness(llms);
         this.models.events.on('tokensUsed', (usage) => this.events.emit('tokensUsed', usage), this);
         this.doneActing = false;
+        this._paused = false;
+        this._pauseResolve = null;
 
         this.memoryOptions = {
             // TODO: maybe do if Gemini or other prompt caching supported providers as well
@@ -200,14 +209,14 @@ export class Agent {
         logger.info("Agent: All connectors started.");
 
         // logger.info("Making initial observations...");
-        // await this._recordConnectorObservations();
+        // await this.recordConnectorObservations();
         // logger.info("Initial observations recorded");
         // Initial observations are handled by the first getObservations call in exec
     }
 
     identifyAction(action: Action) {
         // Get definition corresponding to an action
-        const actionDefinition = this.actions.find(def => def.name === action.variant);
+        const actionDefinition = this._actions.find(def => def.name === action.variant);
 
         if (!actionDefinition) {
             // It's possible the action name was from a connector that is no longer active,
@@ -287,11 +296,11 @@ export class Agent {
             }
 
             // Collect and record observations from connectors
-            await this._recordConnectorObservations(memory);
+            await this.recordConnectorObservations(memory);
         }
     }
 
-    protected async _recordConnectorObservations(memory: AgentMemory) {
+    async recordConnectorObservations(memory: AgentMemory) {
         for (const connector of this.connectors) {
             try {
                 // could do Promise.all if matters
@@ -327,7 +336,7 @@ export class Agent {
         
         // Optionally record initial observations (skip by default for max speed)
         if (recordObservations) {
-            await this._recordConnectorObservations(memory);
+            await this.recordConnectorObservations(memory);
         }
         
         // Execute actions directly without any cache or LLM overhead
@@ -375,7 +384,7 @@ export class Agent {
         })(task));
     }
 
-    private async _buildContext(memory: AgentMemory): Promise<AgentContext> {
+    async buildContext(memory: AgentMemory): Promise<AgentContext> {
         const messages = await memory.render();
 
         const connectorInstructions: ConnectorInstructions[] = [];
@@ -415,32 +424,15 @@ export class Agent {
         const signal = this.actionAbortController.signal;
         logger.info(`Act: ${description}`);
 
-        // for now simply add data to task
         let dataContentParts: MultiMediaContentPart[] = [];
         if (options.data) {
-            //description += "\nUse the following data where appropriate:\n";
-            // description += "\n<data>\n";
-            // // if (typeof options.data === 'string') {
-            // //     description += options.data;
-            // // } else {
-            // //     description += Object.entries(options.data).map(([k, v]) => `${k}: ${v}`).join("\n");
-            // // }
-            // const parts = renderParts(options.data);
-            // description += "\n</data>";
             dataContentParts = await renderContentParts(options.data, { mode: 'json', indent: 2 });
         }
-        //this.events.emit('stepStart', description);
 
-        //const testData = convertOptionsToTestData(options);
-
-        // Initialize task memory and record initial observations
-        // Combine any agent-level and task-level instructions
-        
         this.latestTaskMemory = memory;
 
-        // record initial observations
         logger.info("Making initial observations...");
-        await this._recordConnectorObservations(memory);
+        await this.recordConnectorObservations(memory);
         logger.info("Initial observations recorded");
 
         const initialScreenshot = memory.getLatestScreenshot();
@@ -451,59 +443,51 @@ export class Agent {
             const cachedResult = await this.queryCache(description, initialScreenshot);
             
             if (cachedResult && cachedResult.actions.length > 0) {
-                // Store log IDs for potential cache update
                 cacheEntryIdsToUpdate = cachedResult.logIds || [];
                 
-                // If override_cache is enabled, skip cache replay and execute fresh
                 if (options.override_cache) {
                     logger.info(`override_cache is enabled. Found ${cacheEntryIdsToUpdate.length} matching cache entries. Skipping cache replay and executing fresh.`);
-                    // Continue with normal execution below, which will update the cache entries later
                 } else {
-                    // Normal cache hit - replay the cached trajectory
                     console.log(yellowBright("⚡ CACHE HIT. Replaying full action trajectory."));
                     this.events.emit('thought', "Found a similar past situation in my cache. Replaying the full set of actions I took before.");
 
-                    // Replay the entire cached trajectory
                     for (const action of cachedResult.actions) {
                         if (signal.aborted) throw new AgentError("Action was interrupted.", { variant: 'cancelled' });
                         await this.exec(action, memory);
                     }
-                    return; // The task is complete, so we exit the _act method.
+                    return;
                 }
             }
         }
 
-        const fullTrajectory: Action[] = []; // To store all actions for this task
+        const fullTrajectory: Action[] = [];
 
         try {
             while (true) {
                 if (signal.aborted) {
                     throw new AgentError("Action was interrupted by the user.", { variant: 'cancelled' });
                 }
-                // Removed direct screenshot/tabState access here; it's part of memoryContext via connectors
                 logger.info(`Creating partial recipe`);
 
             let reasoning: string = "";
             let actions: Action[] = [];
 
+            const planStart = Date.now();
             try {
-                const memoryContext = await this._buildContext(memory);
+                const memoryContext = await this.buildContext(memory);
+                logger.debug("Built memory context for planning");
                 await retryOnError(
                     async () => {
                         ({ reasoning, actions } = await this.models.partialAct(
                             memoryContext,
                             description,
                             dataContentParts,
-                            this.actions 
+                            this._actions 
                         ));
                         if (actions.length === 0) {
-                            // Empty action list behavior - default wait else ... err? what if not in action space?
-                            //actions.push()
                             throw new AgentError(`No actions generated`);
                         }
                     },
-                    // HTTP body is not JSON - comes from Anthropic sometimes, weird error
-                    // Sometimes Anthropic will give 401 Unauthorized randomly even when authorized
                     {
                         mode: 'retry_on_partial_message',
                         errorSubstrings: ['HTTP body is not JSON', '401 Unauthorized', 'No actions generated'],
@@ -514,44 +498,57 @@ export class Agent {
                 );
             } catch (error: unknown) {
                 logger.error(`Error planning actions: ${error instanceof Error ? error.message : String(error)}`);
-                /**
-                 * (1) Failure to conform to JSON
-                 * (2) Misconfigured BAML client / bad API key
-                 * (3) Network error (past max retries)
-                 */
-                // this.fail({
-                //     variant: 'misalignment',
-                //     message: `Could not create partial recipe -> ${(error as Error).message}`
-                // });
                 throw new AgentError(
                     `Error planning actions: ${(error as Error).message}`, { variant: 'misalignment' }
                 )
             }
+            const planMs = Date.now() - planStart;
 
             logger.info({ reasoning, actions }, `Partial recipe created`);
-            
-            // Could be emitted in memory and bubbled up instead of recordThought was called in more places
+            logger.debug({ planMs, actionCount: actions.length, actionVariants: actions.map(a => a.variant) }, "Plan timing");
+
+            this.events.emit('debugPlan', {
+                reasoning,
+                actions,
+                planningMs: planMs,
+                observationCount: 0,
+            });
+
             this.events.emit('thought', reasoning);
             memory.recordThought(reasoning);
 
-            // Execute partial recipe
-            for (const action of actions) {
+            for (let i = 0; i < actions.length; i++) {
+                const action = actions[i];
+                const actionStart = Date.now();
+                let actionError: string | undefined;
+
+                await this._waitIfPaused();
+                if (this.doneActing) break;
                 if (signal.aborted) {
                     throw new AgentError("Action was interrupted by the user.", { variant: 'cancelled' });
                 }
-                await this.exec(action, memory);
-                fullTrajectory.push(action); // Add executed action to the full trajectory
 
-                // const postActionScreenshot = await this.screenshot();
-                // const actionDescriptor: ActionDescriptor = { ...action, screenshot: postActionScreenshot.image } as ActionDescriptor;
-                // this.events.emit('action', actionDescriptor);
-                logger.info({ action }, `Action taken`);
+                try {
+                    await this.exec(action, memory);
+                    fullTrajectory.push(action);
+                } catch (err) {
+                    actionError = err instanceof Error ? err.message : String(err);
+                    throw err;
+                } finally {
+                    const actionMs = Date.now() - actionStart;
+                    logger.info({ action, actionMs }, `Action taken`);
+
+                    this.events.emit('debugAction', {
+                        action,
+                        index: i,
+                        totalActions: actions.length,
+                        executionMs: actionMs,
+                        error: actionError,
+                    });
+                }
             }
 
-            // If macro expects these actions should complete the step, break
-            // if (finished) {
-            //     break;
-            // }
+            await this._waitIfPaused();
             if (this.doneActing) {
                 if (this.visualCacheConfig.enabled && initialScreenshot && fullTrajectory.length > 0) {
                     logger.info("Task complete. Populating cache with full trajectory.");
@@ -602,8 +599,6 @@ export class Agent {
         }
 
         logger.info(`Done with step`);
-        //this.events.emit('stepSuccess');
-        //this.currentTaskMemory = null;
     }
 
     // --- CACHE HELPER METHODS ---
@@ -729,7 +724,7 @@ export class Agent {
 
             // Step 3: Create cache fields as mutable so they can be updated later
             const fieldsPayload = {
-                project: project,
+                project_name: project,
                 context: context,
                 fields: {
                     instruction: {
@@ -835,7 +830,7 @@ export class Agent {
             // }
             
             const queryPayload = {
-                project: project,
+                project_name: project,
                 context: context,
                 filter_expr: filterClauses.join(' and '),
                 limit: 10,
@@ -1213,7 +1208,7 @@ export class Agent {
         }
         
         const baseLogPayload = {
-            project,
+            project_name: project,
             context,
             entries
         };
@@ -1237,7 +1232,7 @@ export class Agent {
             
             const updatePayload = {
                 logs: logIdsToUpdate,
-                project: project,
+                project_name: project,
                 context: context,
                 entries: entries,
                 overwrite: true // Overwrite existing entries with new data
@@ -1285,7 +1280,7 @@ export class Agent {
         
         const createDerivedLog = async (key: string, equation: string) => {
             const derivedPayload = {
-                project, context, key, equation,
+                project_name: project, context, key, equation,
                 referenced_logs: { "log": [logEventId] }
             };
             
@@ -1310,8 +1305,8 @@ export class Agent {
 
     async query<T extends z.Schema>(query: string, schema: T): Promise<z.infer<T>> {
         // Record observations in case no act() was used beforehand
-        await this._recordConnectorObservations(this.latestTaskMemory);
-        const memoryContext = await this._buildContext(this.memory);//this.memory.buildContext(this.connectors);
+        await this.recordConnectorObservations(this.latestTaskMemory);
+        const memoryContext = await this.buildContext(this.memory);//this.memory.buildContext(this.connectors);
         return await this.models.query(memoryContext, query, schema);
     }
 
@@ -1319,12 +1314,42 @@ export class Agent {
         this.doneActing = true;
     }
 
+    private async _waitIfPaused(): Promise<void> {
+        if (!this._paused) return;
+        this.events.emit('pause');
+        logger.info("Agent: Paused");
+        await new Promise<void>((resolve) => {
+            this._pauseResolve = resolve;
+        });
+    }
+
+    pause(): void {
+        this._paused = true;
+    }
+
+    resume(): void {
+        this._paused = false;
+        if (this._pauseResolve) {
+            this._pauseResolve();
+            this._pauseResolve = null;
+        }
+        this.events.emit('resume');
+        logger.info("Agent: Resumed");
+    }
+
+    get paused(): boolean {
+        return this._paused;
+    }
+
     async stop() {
         /**
          * Stop the agent and close the browser context.
          * May be called asynchronously and interrupt an agent in the middle of a action sequence.
          */
-        // set signal to cancelled?
+        this.doneActing = true;
+        if (this._paused) {
+            this.resume(); // unblock so loop can see doneActing and exit
+        }
         logger.info("Agent: Stopping connectors...");
         for (const connector of this.connectors) {
             try {

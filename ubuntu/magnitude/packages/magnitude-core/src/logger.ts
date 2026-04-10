@@ -1,7 +1,13 @@
 import pino from 'pino';
 
+function resolveLogLevel(): string {
+    if (process.env.MAGNITUDE_LOG_LEVEL) return process.env.MAGNITUDE_LOG_LEVEL;
+    if (process.env.MAGNITUDE_DEBUG === 'true') return 'debug';
+    return 'warn';
+}
+
 export const logger = pino({
-    level: process.env.MAGNITUDE_LOG_LEVEL || 'warn',
+    level: resolveLogLevel(),
     transport: process.stdout.isTTY ? {
         target: 'pino-pretty',
         options: {

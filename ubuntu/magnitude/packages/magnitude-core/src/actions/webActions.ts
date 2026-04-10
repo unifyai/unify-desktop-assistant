@@ -107,6 +107,18 @@ export const keyboardSelectAllAction = createAction({
     render: () => `⬚ select all`
 });
 
+export const keyboardKeyAction = createAction({
+    name: 'keyboard:key',
+    description: "Press a key or key combination (for non-text keys like F11, Escape, arrows, or combos like Control+c). Use '+' to combine modifier keys.",
+    schema: z.object({
+        key: z.string().describe("Key or combo to press (e.g., 'F11', 'Escape', 'ArrowDown', 'Control+c', 'Control+Shift+t')"),
+    }),
+    resolver: async ({ input: { key }, agent }) => {
+        await agent.require(BrowserConnector).getHarness().keyPress(key);
+    },
+    render: ({ key }) => key.includes('+') ? `⌨ hotkey ${key}` : `⌨ key '${key}'`
+});
+
 export const scrollCoordAction = createAction({
     name: 'mouse:scroll',
     description: "Hover mouse over target and scroll",
@@ -234,6 +246,7 @@ export const webActions = [
     keyboardTabAction,
     keyboardBackspaceAction,
     keyboardSelectAllAction,
+    keyboardKeyAction,
     waitAction,
     saveStateAction,
 ] as const;

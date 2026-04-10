@@ -297,6 +297,36 @@ interface SessionInfo {
   createdAt: Date;
   lastAccessed: Date;
   actHistory: ActHistoryEntry[];
+  latestScreenshot: string;
+  latestCursorPosition: { x: number; y: number } | null;
+}
+
+function cacheScreenshot(sessionId: string, screenshot: string, cursorPosition: { x: number; y: number } | null) {
+  const session = activeSessions.get(sessionId);
+  if (session && screenshot) {
+    session.latestScreenshot = screenshot;
+    session.latestCursorPosition = cursorPosition;
+  }
+}
+
+function refreshDesktopCache(triggerSessionId: string) {
+  const triggerSession = activeSessions.get(triggerSessionId);
+  if (!triggerSession || triggerSession.mode !== "web-vm") return;
+  const desktopEntry = [...activeSessions.entries()].find(([, s]) => s.mode === "desktop");
+  if (!desktopEntry) return;
+  const [deskId, deskSession] = desktopEntry;
+  (async () => {
+    try {
+      const connector = deskSession.agent.require(BrowserConnector);
+      const harness = connector.getHarness();
+      const rawImage = await harness.screenshot();
+      const image = await connector.transformScreenshot(rawImage);
+      const deskScreenshot = await image.toBase64();
+      cacheScreenshot(deskId, deskScreenshot, harness.getCursorPosition());
+    } catch (err) {
+      console.warn(`[cache] Desktop screenshot refresh failed: ${err}`);
+    }
+  })();
 }
 
 const activeSessions = new Map<string, SessionInfo>();
@@ -722,6 +752,325 @@ const startBrowserOnVm = async (urlMappings?: Record<string, string>): Promise<B
   }
 }
 
+// --- Google Meet browser launcher ---
+const startGoogleMeetBrowser = async (meetUrl: string): Promise<BrowserAgent> => {
+  try {
+    const agent = await startBrowserAgent({
+      url: meetUrl,
+      browser: {
+        launchOptions: {
+          headless: false,
+          args: [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            '--auto-select-desktop-capture-source="Entire screen"',
+          ],
+          env: {
+            ...process.env,
+            PULSE_SINK: "agent_sink",
+            PULSE_SOURCE: "meet_mic",
+          },
+          downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
+          tracesDir: defaultBrowserPaths.tracesDir || undefined,
+        },
+        contextOptions: {
+          viewport: null,
+          ignoreHTTPSErrors: true,
+          permissions: ['camera', 'microphone'],
+        },
+      },
+      narrate: true,
+      llm: {
+        provider: 'openai-generic',
+        options: {
+          model: 'claude-4.6-sonnet@anthropic',
+          baseUrl: `${process.env.UNITY_COMMS_URL}/unillm`,
+          headers: {
+            'Authorization': `Bearer ${process.env.UNIFY_KEY}`,
+          },
+          temperature: 0.2,
+        }
+      }
+    });
+    agent.context.setDefaultNavigationTimeout(90000);
+    console.log("✅ Google Meet BrowserAgent started successfully.");
+    return agent;
+  } catch (err) {
+    console.error("❌ Failed to start Google Meet BrowserAgent:", err);
+    throw err;
+  }
+};
+
+// --- Google Meet session management ---
+type GoogleMeetStatus = 'joining' | 'lobby' | 'active' | 'ended' | 'removed' | 'error';
+
+interface GoogleMeetParticipant {
+  name: string;
+  isSpeaking: boolean;
+}
+
+interface GoogleMeetSessionInfo {
+  agent: BrowserAgent;
+  status: GoogleMeetStatus;
+  meetUrl: string;
+  displayName: string;
+  createdAt: Date;
+  participants: GoogleMeetParticipant[];
+  activeSpeaker: string | null;
+  pollIntervalId: ReturnType<typeof setInterval> | null;
+}
+
+const googleMeetSessions = new Map<string, GoogleMeetSessionInfo>();
+
+type GoogleMeetJoinResult =
+  | { status: 'active' | 'lobby' }
+  | { status: 'error'; reason: string };
+
+const MEET_PREPARE_TASK = (displayName: string) =>
+  `You are on a Google Meet pre-join screen. Complete these steps in order:\n` +
+  `1. Dismiss any popups, tooltips, or overlays (e.g. "Got it" button, cookie banners).\n` +
+  `2. If there is a "Your name" text input, clear it and type: ${displayName}\n` +
+  `3. Turn OFF the camera if it is on (click its toggle button). Leave the microphone ON.\n` +
+  `Do NOT change audio device selections — they are handled separately.\n` +
+  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
+  `If the page shows a fatal error like "invalid meeting link" or "this meeting has ended", do nothing — just stop.`;
+
+const MEET_CLICK_JOIN_TASK =
+  `You are on a Google Meet pre-join screen. The audio devices have already been configured.\n` +
+  `Click the "Ask to join" or "Join now" button to enter the meeting.\n` +
+  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
+  `If the page shows a fatal error like "invalid meeting link" or "this meeting has ended", do nothing — just stop.`;
+
+const MEET_PREPARE_MAX_ITERATIONS = 3;
+const MEET_JOIN_MAX_ITERATIONS = 3;
+
+async function runMagnitudeLoop(
+  agent: BrowserAgent,
+  task: string,
+  maxIterations: number,
+  label: string,
+): Promise<void> {
+  const memory = new AgentMemory({ promptCaching: true });
+
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    if (iteration > 0) {
+      console.log(`[${label}] Iteration ${iteration + 1}: re-observing...`);
+    }
+
+    await agent.recordConnectorObservations(memory);
+    const context = await agent.buildContext(memory);
+    const { reasoning, actions } = await agent.models.partialAct(context, task, [], agent.actions);
+
+    console.log(`[${label}] Iteration ${iteration + 1} reasoning: ${reasoning}`);
+    console.log(`[${label}] Planned ${actions.length} action(s): ${actions.map(a => a.variant).join(', ')}`);
+    memory.recordThought(reasoning);
+
+    if (actions.length === 0) {
+      console.log(`[${label}] LLM planned zero actions — stopping.`);
+      break;
+    }
+
+    const taskDone = actions.some(a => a.variant === 'task:done');
+
+    for (const action of actions) {
+      const actionDef = agent.identifyAction(action);
+      console.log(`[${label}] Executing: ${actionDef.render(action)}`);
+      await agent.exec(action, memory);
+    }
+
+    if (taskDone) {
+      console.log(`[${label}] LLM signalled task:done.`);
+      break;
+    }
+  }
+}
+
+/**
+ * Open Google Meet Settings dialog via Playwright (deterministic), then hand
+ * off to the LLM to navigate the Audio tab and select devices (visual).
+ */
+async function openMeetSettings(page: any): Promise<boolean> {
+  const tag = '[googlemeet/devices]';
+
+  try {
+    const moreBtn = page.locator(
+      'button[aria-label*="More options" i], button[aria-label*="more actions" i], button[aria-label*="More" i][aria-haspopup]'
+    ).first();
+    if (!await moreBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      console.log(`${tag} Triple-dots menu button not found`);
+      return false;
+    }
+    console.log(`${tag} Opening More options menu...`);
+    await moreBtn.click();
+    await page.waitForTimeout(500);
+
+    const settingsItem = page.locator(
+      'li:has-text("Settings"), [role="menuitem"]:has-text("Settings"), span:has-text("Settings")'
+    ).first();
+    if (!await settingsItem.isVisible({ timeout: 2000 }).catch(() => false)) {
+      console.log(`${tag} "Settings" menu item not found — closing menu`);
+      await page.keyboard.press('Escape');
+      return false;
+    }
+    console.log(`${tag} Clicking Settings...`);
+    await settingsItem.click();
+    await page.waitForTimeout(800);
+    console.log(`${tag} Settings dialog opened`);
+    return true;
+  } catch (err) {
+    console.log(`${tag} Error opening Settings: ${err}`);
+    await page.keyboard.press('Escape').catch(() => {});
+    return false;
+  }
+}
+
+const MEET_AUDIO_TAB_TASK =
+  `You are in the Google Meet Settings dialog.\n` +
+  `Click the "Audio" tab on the left side of the dialog.\n` +
+  `Do NOT close the dialog.`;
+
+const MEET_SELECT_MIC_TASK = (micLabel: string) =>
+  `You are in the Google Meet Settings dialog, on the Audio tab.\n` +
+  `Click the Microphone dropdown and select the option containing "${micLabel}".\n` +
+  `Do NOT close the dialog.`;
+
+const MEET_SELECT_SPEAKER_TASK = (speakerLabel: string) =>
+  `You are in the Google Meet Settings dialog, on the Audio tab.\n` +
+  `Click the Speakers dropdown and select the option containing "${speakerLabel}".\n` +
+  `Then close the settings dialog by clicking the X button.`;
+
+const MEET_AUDIO_MAX_ITERATIONS = 3;
+
+async function googleMeetJoinFlow(agent: BrowserAgent, displayName: string): Promise<GoogleMeetJoinResult> {
+  const page = agent.page;
+  await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+
+  const pageUrl = page.url?.() ?? 'unknown';
+  console.log(`[googlemeet/join] Page loaded: url=${pageUrl}`);
+
+  // Phase 1: LLM handles variable UI (popups, name, camera)
+  console.log('[googlemeet/join] Phase 1: prepare...');
+  await runMagnitudeLoop(agent, MEET_PREPARE_TASK(displayName), MEET_PREPARE_MAX_ITERATIONS, 'googlemeet/prepare');
+
+  // Phase 1b: Audio device selection — Playwright opens Settings, LLM handles each step
+  console.log('[googlemeet/join] Phase 1b: opening Settings for audio device selection...');
+  const settingsOpened = await openMeetSettings(page);
+  if (settingsOpened) {
+    console.log('[googlemeet/join] Phase 1b-i: navigating to Audio tab...');
+    await runMagnitudeLoop(agent, MEET_AUDIO_TAB_TASK, MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/audio-tab');
+
+    console.log('[googlemeet/join] Phase 1b-ii: selecting microphone...');
+    await runMagnitudeLoop(agent, MEET_SELECT_MIC_TASK('agent_sink'), MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/select-mic');
+
+    console.log('[googlemeet/join] Phase 1b-iii: selecting speaker + closing...');
+    await runMagnitudeLoop(agent, MEET_SELECT_SPEAKER_TASK('meet_sink'), MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/select-speaker');
+  } else {
+    console.log('[googlemeet/join] Phase 1b: Could not open Settings — using default devices');
+  }
+
+  // Phase 2: click join
+  console.log('[googlemeet/join] Phase 2: clicking join...');
+  await runMagnitudeLoop(agent, MEET_CLICK_JOIN_TASK, MEET_JOIN_MAX_ITERATIONS, 'googlemeet/click-join');
+
+  // Determine outcome by checking the page state after the agent finished
+  await sleep(2000);
+
+  const meetingActive = await page.locator(
+    '[data-meeting-title], [aria-label*="meeting details" i], [data-call-duration]'
+  ).first().isVisible({ timeout: 5000 }).catch(() => false);
+  if (meetingActive) return { status: 'active' };
+
+  const inLobby = await page.locator(
+    'text=/waiting|asking to join|let you in/i'
+  ).first().isVisible({ timeout: 3000 }).catch(() => false);
+  if (inLobby) return { status: 'lobby' };
+
+  const hasError = await page.locator(
+    'text=/invalid meeting|meeting has ended|no longer available|meeting not found/i'
+  ).first().isVisible({ timeout: 1000 }).catch(() => false);
+  if (hasError) {
+    const errorMsg = await page.locator('text=/invalid meeting|meeting has ended|no longer available|meeting not found/i').first().textContent().catch(() => 'unknown');
+    return { status: 'error', reason: `meet_page_error: "${errorMsg}" (url=${pageUrl})` };
+  }
+
+  const hasJoinBtn = await page.locator(
+    'button:has-text("Ask to join"), button:has-text("Join now"), button:has-text("Join")'
+  ).first().isVisible({ timeout: 1000 }).catch(() => false);
+  if (hasJoinBtn) {
+    return { status: 'error', reason: `join_button_still_visible: Agent completed but join button was not clicked (url=${pageUrl})` };
+  }
+
+  // No definitive signal — assume we're waiting for admission
+  return { status: 'lobby' };
+}
+
+async function googleMeetPollState(sessionId: string): Promise<void> {
+  const session = googleMeetSessions.get(sessionId);
+  if (!session || session.status === 'ended' || session.status === 'error') return;
+
+  try {
+    const page = session.agent.page;
+
+    // Detect if meeting has ended
+    const meetingEnded = await page.locator(
+      'text=/meeting has ended|you left the meeting|removed from the meeting|kicked/i'
+    ).first().isVisible({ timeout: 500 }).catch(() => false);
+
+    if (meetingEnded) {
+      session.status = 'ended';
+      return;
+    }
+
+    // If we were in the lobby, check if we're admitted now
+    if (session.status === 'lobby') {
+      const admitted = await page.locator(
+        '[data-meeting-title], [aria-label*="meeting details" i], [data-call-duration]'
+      ).first().isVisible({ timeout: 500 }).catch(() => false);
+      if (admitted) session.status = 'active';
+
+      // Check if denied
+      const denied = await page.locator(
+        'text=/denied|not allowed|can\'t join/i'
+      ).first().isVisible({ timeout: 500 }).catch(() => false);
+      if (denied) {
+        session.status = 'removed';
+        return;
+      }
+    }
+
+    // Scrape participants and active speaker from the DOM
+    const participants: GoogleMeetParticipant[] = [];
+    let activeSpeaker: string | null = null;
+
+    // Google Meet shows participant tiles; the active speaker has a highlighted border
+    const speakerElements = await page.locator(
+      '[data-self-name], [data-participant-id]'
+    ).all().catch(() => []);
+
+    for (const el of speakerElements) {
+      const name = await el.getAttribute('data-self-name').catch(() => null)
+        || await el.innerText().catch(() => null);
+      if (!name) continue;
+
+      const parentClasses = await el.evaluate(
+        (node: Element) => node.closest('[class]')?.className || ''
+      ).catch(() => '');
+      const isSpeaking = parentClasses.includes('speaking') ||
+        (await el.locator('[class*="speaking" i]').first().isVisible({ timeout: 100 }).catch(() => false));
+
+      const cleanName = name.split('\n')[0].trim();
+      participants.push({ name: cleanName, isSpeaking });
+      if (isSpeaking) activeSpeaker = cleanName;
+    }
+
+    session.participants = participants;
+    session.activeSpeaker = activeSpeaker;
+  } catch {
+    // Browser may have disconnected
+    session.status = 'error';
+  }
+}
+
 // --- API Endpoints ---
 app.post('/start', async (req: Request, res: Response) => {
   const { headless, mode, label, urlMappings } = req.body;
@@ -864,6 +1213,8 @@ app.post('/start', async (req: Request, res: Response) => {
       createdAt: new Date(),
       lastAccessed: new Date(),
       actHistory: [],
+      latestScreenshot: '',
+      latestCursorPosition: null,
     });
 
     console.log(`[start] DONE mode=${mode} sessionId=${sessionId} total=${Date.now() - t0}ms active_sessions=${activeSessions.size}`);
@@ -1080,11 +1431,13 @@ app.post('/act', isAgentReady, async (req: Request, res: Response) => {
       const rawImage = await harness.screenshot();
       const image = await connector.transformScreenshot(rawImage);
       screenshot = await image.toBase64();
+      cacheScreenshot(sessionId, screenshot, harness.getCursorPosition());
     } catch (screenshotErr) {
       console.warn(`[act] Post-act screenshot failed: ${screenshotErr}`);
     }
 
     res.json({ status: 'success', summary: thoughts, screenshot });
+    refreshDesktopCache(sessionId);
   } catch (err) {
     handleAgentError(err, res);
   }
@@ -1104,7 +1457,8 @@ app.post('/execute-actions', isAgentReady, async (req: Request, res: Response) =
     const agent = session.agent;
     const t0 = Date.now();
 
-    console.log(`[execute-actions] Executing ${actions.length} direct action(s) for session ${sessionId}`);
+    const variants = actions.map((a: any) => a.variant).join(', ');
+    console.log(`[execute-actions] Executing ${actions.length} action(s) [${variants}] for session ${sessionId}`);
 
     await agent.executeTrajectory(actions, { memory: agent.memory, recordObservations: false });
 
@@ -1120,11 +1474,13 @@ app.post('/execute-actions', isAgentReady, async (req: Request, res: Response) =
       const image = await connector.transformScreenshot(rawImage);
       screenshot = await image.toBase64();
       cursorPosition = harness.getCursorPosition();
+      cacheScreenshot(sessionId, screenshot, cursorPosition);
     } catch (screenshotErr) {
       console.warn(`[execute-actions] Post-execution screenshot failed: ${screenshotErr}`);
     }
 
     res.json({ status: 'success', screenshot, cursorPosition });
+    refreshDesktopCache(sessionId);
   } catch (err) {
     handleAgentError(err, res);
   }
@@ -1257,6 +1613,7 @@ app.post('/screenshot', isAgentReady, async (req: Request, res: Response) => {
     const tEncode = Date.now();
     console.log(`[screenshot] base64_encode=${tEncode - tCapture}ms b64_len=${base64Image.length} total=${tEncode - t0}ms`);
 
+    cacheScreenshot(sessionId, base64Image, cursorPosition);
     res.json({ screenshot: base64Image, cursorPosition });
     _screenshotInFlight--;
     console.log(`[screenshot] DONE total=${Date.now() - t0}ms in_flight=${_screenshotInFlight}`);
@@ -1264,6 +1621,27 @@ app.post('/screenshot', isAgentReady, async (req: Request, res: Response) => {
     _screenshotInFlight--;
     console.error(`[screenshot] ERROR after ${Date.now() - t0}ms in_flight=${_screenshotInFlight}:`, err);
     handleAgentError(err, res, 'screenshot_failed');
+  }
+});
+
+app.post('/screenshot/latest', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  const session = activeSessions.get(sessionId)!;
+  if (session.latestScreenshot) {
+    res.json({ screenshot: session.latestScreenshot, cursorPosition: session.latestCursorPosition });
+  } else {
+    try {
+      const connector = session.agent.require(BrowserConnector);
+      const harness = connector.getHarness();
+      const rawImage = await harness.screenshot();
+      const image = await connector.transformScreenshot(rawImage);
+      const screenshot = await image.toBase64();
+      const cursorPosition = harness.getCursorPosition();
+      cacheScreenshot(sessionId!, screenshot, cursorPosition);
+      res.json({ screenshot, cursorPosition });
+    } catch (err) {
+      handleAgentError(err, res, 'screenshot_failed');
+    }
   }
 });
 
@@ -1532,6 +1910,132 @@ app.post('/resume', isAgentReady, async (req: Request, res: Response) => {
   } catch (err) {
     handleAgentError(err, res, 'resume_failed');
   }
+});
+
+// --- Google Meet endpoints ---
+
+app.post('/googlemeet/join', auth, async (req: Request, res: Response) => {
+  const { meetUrl, displayName } = req.body;
+  if (!meetUrl) {
+    return res.status(400).json({ error: 'bad_request', message: 'meetUrl is required.' });
+  }
+
+  const name = displayName || 'Unity Assistant';
+  const sessionId = randomUUID();
+  const t0 = Date.now();
+  console.log(`[googlemeet/join] BEGIN sessionId=${sessionId} url=${meetUrl}`);
+
+  try {
+    const agent = await startGoogleMeetBrowser(meetUrl);
+
+    const result = await googleMeetJoinFlow(agent, name);
+    console.log(`[googlemeet/join] Join flow completed: status=${result.status}${result.status === 'error' ? ` reason="${result.reason}"` : ''} [${Date.now() - t0}ms]`);
+
+    if (result.status === 'error') {
+      await agent.stop().catch(() => {});
+      return res.status(400).json({
+        error: 'join_failed',
+        reason: result.reason,
+        message: `Could not join Google Meet: ${result.reason}`,
+      });
+    }
+
+    const sessionInfo: GoogleMeetSessionInfo = {
+      agent,
+      status: result.status,
+      meetUrl,
+      displayName: name,
+      createdAt: new Date(),
+      participants: [],
+      activeSpeaker: null,
+      pollIntervalId: null,
+    };
+
+    // Start polling the DOM for meeting state and active speaker
+    sessionInfo.pollIntervalId = setInterval(() => {
+      googleMeetPollState(sessionId).then(() => {
+        const s = googleMeetSessions.get(sessionId);
+        if (s && (s.status === 'ended' || s.status === 'removed' || s.status === 'error')) {
+          if (s.pollIntervalId) clearInterval(s.pollIntervalId);
+          s.pollIntervalId = null;
+          console.log(`[googlemeet] Session ${sessionId} ended (status=${s.status}), polling stopped.`);
+        }
+      });
+    }, 2000);
+
+    googleMeetSessions.set(sessionId, sessionInfo);
+
+    console.log(`[googlemeet/join] DONE sessionId=${sessionId} status=${result.status} [${Date.now() - t0}ms]`);
+    res.json({ status: result.status, sessionId });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    console.error(`[googlemeet/join] EXCEPTION after ${Date.now() - t0}ms: ${message}`, stack ? `\n${stack}` : '');
+    res.status(500).json({ error: 'join_exception', message });
+  }
+});
+
+app.post('/googlemeet/leave', auth, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
+  }
+
+  const session = googleMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
+  }
+
+  try {
+    if (session.pollIntervalId) {
+      clearInterval(session.pollIntervalId);
+      session.pollIntervalId = null;
+    }
+
+    await session.agent.stop();
+    session.status = 'ended';
+    googleMeetSessions.delete(sessionId);
+
+    console.log(`[googlemeet/leave] Session ${sessionId} stopped.`);
+    res.json({ status: 'left' });
+  } catch (err) {
+    console.error(`[googlemeet/leave] Error stopping session ${sessionId}:`, err);
+    googleMeetSessions.delete(sessionId);
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'leave_failed', message });
+  }
+});
+
+app.get('/googlemeet/sessions', auth, async (_req: Request, res: Response) => {
+  const sessions = Array.from(googleMeetSessions.entries()).map(([sessionId, session]) => ({
+    sessionId,
+    meetUrl: session.meetUrl,
+    status: session.status,
+    displayName: session.displayName,
+    createdAt: session.createdAt,
+  }));
+  res.json({ sessions });
+});
+
+app.get('/googlemeet/state', auth, async (req: Request, res: Response) => {
+  const sessionId = req.query.sessionId as string;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId query parameter is required.' });
+  }
+
+  const session = googleMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
+  }
+
+  res.json({
+    status: session.status,
+    meetUrl: session.meetUrl,
+    displayName: session.displayName,
+    createdAt: session.createdAt,
+    participants: session.participants,
+    activeSpeaker: session.activeSpeaker,
+  });
 });
 
 // --- /exec endpoint: Execute shell commands (use /files first to upload files) ---

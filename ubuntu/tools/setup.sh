@@ -205,7 +205,14 @@ test_fast_mode() {
     fi
 
     if command -v node &>/dev/null; then
-        echo "  [OK] Node.js" >&2
+        local node_major
+        node_major=$(node --version | sed 's/v\([0-9]*\).*/\1/')
+        if [[ "$node_major" -ge 22 ]]; then
+            echo "  [OK] Node.js ($(node --version))" >&2
+        else
+            echo "  [--] Node.js $(node --version) < v22 (will upgrade)" >&2
+            all_ok=false
+        fi
     else
         echo "  [--] Node.js (will install)" >&2
         all_ok=false
@@ -351,15 +358,21 @@ install_system_deps() {
 
 install_nodejs() {
     if command -v node &>/dev/null; then
-        echo "  Node.js already installed ($(node --version))"
-        return
+        local node_major
+        node_major=$(node --version | sed 's/v\([0-9]*\).*/\1/')
+        if [[ "$node_major" -ge 22 ]]; then
+            echo "  Node.js already installed ($(node --version))"
+            return
+        fi
+        echo "  Node.js $(node --version) found, but v22+ required. Upgrading..."
     fi
 
     echo ""
-    echo "=== Installing Node.js ==="
+    echo "=== Installing Node.js 22 ==="
 
     if $SKIP_APT; then
-        echo "  Skipping apt-get (nodejs provided by .deb package)"
+        echo "  WARNING: Cannot install Node.js v22 (apt unavailable in this context)." >&2
+        echo "  Node.js will be installed in the deferred setup phase." >&2
         return
     fi
 
@@ -565,13 +578,13 @@ install_agent_service() {
         echo "  Installing npm dependencies..."
         npm install
 
-        echo "  Installing Playwright + Chromium (this may take a few minutes)..."
+        echo "  Installing Patchright + Chromium (this may take a few minutes)..."
         if $SKIP_APT; then
             # Download browser only — system deps come from .deb Depends or manual install
-            npx -y playwright@1.52.0 install chromium
+            npx -y patchright@1.52.0 install chromium
         else
             # Download browser + install system libraries via apt
-            npx -y playwright@1.52.0 install --with-deps chromium
+            npx -y patchright@1.52.0 install --with-deps chromium
         fi
 
         save_dependencies_hash "$AGENT_SERVICE_DIR"
@@ -612,15 +625,18 @@ setup_systemd_services() {
     echo "=== Setting up systemd user services ==="
 
     local systemd_dir="$INSTALL_DIR/systemd"
-    local user_systemd_dir="$HOME/.config/systemd/user"
-    mkdir -p "$user_systemd_dir"
 
     # Determine the actual user (handle sudo)
     local target_user="${SUDO_USER:-$USER}"
     local target_home
     target_home=$(eval echo "~$target_user")
+    local target_group
+    target_group=$(id -gn "$target_user")
     local target_systemd_dir="$target_home/.config/systemd/user"
-    mkdir -p "$target_systemd_dir"
+    install -d -o "$target_user" -g "$target_group" \
+        "$target_home/.config" \
+        "$target_home/.config/systemd" \
+        "$target_systemd_dir"
 
     # Install systemd unit files from the systemd/ directory
     if [[ -d "$systemd_dir" ]]; then
@@ -659,8 +675,12 @@ setup_autostart() {
     local target_user="${SUDO_USER:-$USER}"
     local target_home
     target_home=$(eval echo "~$target_user")
+    local target_group
+    target_group=$(id -gn "$target_user")
     local autostart_dir="$target_home/.config/autostart"
-    mkdir -p "$autostart_dir"
+    install -d -o "$target_user" -g "$target_group" \
+        "$target_home/.config" \
+        "$autostart_dir"
 
     cat > "$autostart_dir/unify-desktop-assistant.desktop" <<DESKTOP
 [Desktop Entry]
@@ -677,7 +697,7 @@ DESKTOP
 
     # Fix ownership if running as sudo
     if [[ -n "${SUDO_USER:-}" ]]; then
-        chown "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$autostart_dir/unify-desktop-assistant.desktop"
+        chown "$target_user":"$target_group" "$autostart_dir/unify-desktop-assistant.desktop"
     fi
 
     echo "  Autostart entry created"

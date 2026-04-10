@@ -4,7 +4,7 @@ import http from 'http';
 import expressWs from 'express-ws';
 import WebSocket from 'ws';
 import util from 'util';
-import { startBrowserAgent, BrowserAgent, BrowserConnector, AgentError, BrowserOptions } from 'magnitude-core';
+import { startBrowserAgent, BrowserAgent, BrowserConnector, AgentError, BrowserOptions, AgentMemory, Observation } from 'magnitude-core';
 import { z, ZodTypeAny, ZodAny, ZodType } from 'zod';
 import { partitionHtml, serializeToMarkdown, PartitionOptions, MarkdownSerializerOptions } from 'magnitude-extract';
 import dotenv from 'dotenv';
@@ -12,15 +12,61 @@ dotenv.config();
 import os from 'os';
 import path from 'path';
 import fs from 'fs';
+import net from 'net';
 import { randomUUID } from 'crypto';
-import { spawn } from 'child_process';
+import { ChildProcess, spawn, execSync } from 'child_process';
 import multer from 'multer';
 import { jsonSchemaToZod } from './jsonSchemaToZod';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// --- Debug logging helpers ---
+const MAGNITUDE_DEBUG = process.env.MAGNITUDE_DEBUG === 'true';
+const MAGNITUDE_LOG_DIR = process.env.MAGNITUDE_LOG_DIR || '';
+
+function makeActId(task: string): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const slug = task.slice(0, 40).replace(/[^a-zA-Z0-9]+/g, '_').replace(/_+$/, '');
+  return `${ts}_${slug}`;
+}
+
+function debugSaveImage(actId: string, label: string, base64Data: string): void {
+  if (!MAGNITUDE_DEBUG || !MAGNITUDE_LOG_DIR) return;
+  try {
+    const imgPath = path.join(MAGNITUDE_LOG_DIR, 'acts', actId, `${label}.png`);
+    fs.mkdirSync(path.dirname(imgPath), { recursive: true });
+    fs.writeFileSync(imgPath, Buffer.from(base64Data, 'base64'));
+  } catch (err) {
+    console.warn(`[debug] Failed to save image ${label}: ${err}`);
+  }
+}
+
+function debugSaveTrace(actId: string, trace: Record<string, any>): void {
+  if (!MAGNITUDE_DEBUG || !MAGNITUDE_LOG_DIR) return;
+  try {
+    const tracePath = path.join(MAGNITUDE_LOG_DIR, 'acts', actId, 'act_trace.json');
+    fs.mkdirSync(path.dirname(tracePath), { recursive: true });
+    fs.writeFileSync(tracePath, JSON.stringify(trace, null, 2));
+  } catch (err) {
+    console.warn(`[debug] Failed to save trace: ${err}`);
+  }
+}
+
+function debugLog(line: string): void {
+  if (!MAGNITUDE_DEBUG || !MAGNITUDE_LOG_DIR) return;
+  try {
+    fs.mkdirSync(MAGNITUDE_LOG_DIR, { recursive: true });
+    fs.appendFileSync(path.join(MAGNITUDE_LOG_DIR, 'magnitude.log'), line + '\n');
+  } catch (_) { /* best-effort */ }
+}
+
 // --- File System and Command Execution Utilities ---
-const UNITY_WORKSPACE_DIR = path.join(path.parse(process.cwd()).root, 'Unity');
+//
+// Workspace root for file operations, command execution, and browser downloads.
+// Matches Unity's get_local_root() default of ~/Unity/Local.
+// Override via UNITY_LOCAL_ROOT env var.
+const LOCAL_ROOT = process.env.UNITY_LOCAL_ROOT || path.join(os.homedir(), 'Unity', 'Local');
+try { fs.mkdirSync(LOCAL_ROOT, { recursive: true }); } catch (_e) { /* ignore */ }
 const DEFAULT_EXEC_TIMEOUT = 60 * 60 * 1000; // 1 hour
 
 
@@ -140,165 +186,9 @@ function executeCommand(command: string, cwd: string, timeout: number, shellMode
   });
 }
 
-// Execute command in interactive user session (for COM automation like Excel)
-async function executeCommandInUserSession(
-  command: string,
-  cwd: string,
-  timeout: number,
-  execId: string
-): Promise<ExecResult> {
-  const startTime = Date.now();
-  const taskName = `unity_exec_${execId}`;
-  const scriptFile = path.join(UNITY_WORKSPACE_DIR, `_script_${execId}.ps1`);
-  const resultFile = path.join(UNITY_WORKSPACE_DIR, `_result_${execId}.json`);
-
-  // Escape single quotes for PowerShell
-  const escapedCwd = cwd.replace(/\\/g, '\\\\').replace(/'/g, "''");
-  const escapedCommand = command.replace(/'/g, "''");
-  const escapedResultFile = resultFile.replace(/\\/g, '\\\\');
-
-  // PowerShell script that executes command and saves results to JSON
-  const scriptContent = `
-$ErrorActionPreference = 'Continue'
-$startTime = Get-Date
-$stdout = ''
-$stderr = ''
-$exitCode = 0
-
-try {
-    Set-Location -Path '${escapedCwd}'
-    $output = Invoke-Expression '${escapedCommand}' 2>&1
-    $stdout = ($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "\`n"
-    $stderr = ($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) -join "\`n"
-} catch {
-    $stderr = $_.Exception.Message
-    $exitCode = 1
-}
-
-$duration = ((Get-Date) - $startTime).TotalMilliseconds
-
-$resultJson = @{
-    exitCode = $exitCode
-    stdout = $stdout
-    stderr = $stderr
-    duration = [int]$duration
-} | ConvertTo-Json
-
-# Write without BOM (Out-File adds BOM which breaks JSON.parse in Node.js)
-[System.IO.File]::WriteAllText('${escapedResultFile}', $resultJson, [System.Text.UTF8Encoding]::new($false))
-`;
-
-  await writeFileWithEncoding(scriptFile, scriptContent, 'text');
-
-  const escapedScriptFile = scriptFile.replace(/\\/g, '\\\\');
-
-  // PowerShell script to create and run scheduled task in user session
-  const createTaskScript = `
-$taskName = '${taskName}'
-$scriptPath = '${escapedScriptFile}'
-
-# Get the currently logged-in user
-$loggedInUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName
-
-if (-not $loggedInUser) {
-    Write-Error 'No user logged in'
-    exit 1
-}
-
-Write-Host "Running task as user: $loggedInUser"
-
-# Create scheduled task action (hidden window)
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \`"$scriptPath\`""
-
-# Create principal for interactive user session
-$principal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType Interactive -RunLevel Highest
-
-# Register and run the task
-Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
-Start-ScheduledTask -TaskName $taskName
-
-# Wait for task to complete
-$maxWait = ${timeout}
-$waited = 0
-while ($waited -lt $maxWait) {
-    Start-Sleep -Milliseconds 500
-    $waited += 500
-    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($task.State -eq 'Ready') {
-        break
-    }
-}
-
-# Cleanup task
-Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-`;
-
-  return new Promise((resolve) => {
-    const proc = spawn(createTaskScript, [], {
-      shell: 'powershell.exe',
-      cwd: UNITY_WORKSPACE_DIR,
-      timeout,
-    });
-
-    let createStdout = '';
-    let createStderr = '';
-
-    proc.stdout.on('data', (data) => {
-      createStdout += data.toString();
-    });
-
-    proc.stderr.on('data', (data) => {
-      createStderr += data.toString();
-    });
-
-    proc.on('close', async () => {
-      let result: ExecResult = {
-        exitCode: 1,
-        stdout: createStdout,
-        stderr: createStderr || 'Task execution failed',
-        duration: Date.now() - startTime,
-      };
-
-      // Wait a moment for result file to be written
-      await new Promise(r => setTimeout(r, 1000));
-
-      try {
-        const resultJson = await fs.promises.readFile(resultFile, 'utf-8');
-        const parsed = JSON.parse(resultJson);
-        result = {
-          exitCode: parsed.exitCode ?? 0,
-          stdout: parsed.stdout ?? '',
-          stderr: parsed.stderr ?? '',
-          duration: parsed.duration ?? (Date.now() - startTime),
-        };
-      } catch (e) {
-        result.stderr += `\nFailed to read result file: ${e}`;
-      }
-
-      // Cleanup temp files
-      try {
-        await fs.promises.unlink(scriptFile);
-      } catch (_e) { /* ignore */ }
-      try {
-        await fs.promises.unlink(resultFile);
-      } catch (_e) { /* ignore */ }
-
-      resolve(result);
-    });
-  });
-}
-
 function getDefaultBrowserPaths() {
-  const base = path.join(UNITY_WORKSPACE_DIR, 'Local');
-  const downloadsPath = path.join(base, 'Downloads');
-  const tracesDir = path.join(base, 'Traces');
-  try {
-    fs.mkdirSync(downloadsPath, { recursive: true });
-    fs.mkdirSync(tracesDir, { recursive: true });
-  } catch (_e) {
-    // ignore directory creation errors; downstream may still handle
-  }
+  const downloadsPath = path.join(LOCAL_ROOT, 'Downloads');
+  const tracesDir = path.join(LOCAL_ROOT, 'Traces');
   return { downloadsPath, tracesDir };
 }
 
@@ -307,6 +197,21 @@ const defaultBrowserPaths = getDefaultBrowserPaths();
 const app = express();
 const wsInstance = expressWs(app);
 app.use(express.json({ limit: '100mb' }));
+
+const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || '').split(',').filter(Boolean);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 // --- Authorization (Bearer) middleware ---
 function verifyApiKeyWithUnify(apiKey: string): Promise<boolean> {
@@ -345,10 +250,7 @@ async function auth(req: Request, res: Response, next: Function) {
   if (!match) {
     return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid API key' });
   }
-  // Allow optional trailing metadata (e.g., assistant email) after the token.
-  // Clients may send: "Bearer <UNIFY_KEY> <ASSISTANT_EMAIL>".
-  const apiKeyRaw = match[1].trim();
-  const apiKey = apiKeyRaw.split(/\s+/)[0];
+  const apiKey = match[1].trim();
 
   // Check 1: Bearer token must match UNIFY_KEY
   if (apiKey !== process.env.UNIFY_KEY) {
@@ -370,12 +272,61 @@ async function auth(req: Request, res: Response, next: Function) {
 
 app.use(auth);
 
-// Session registry: maps sessionId to BrowserAgent
+// --- CLI argument parsing ---
+function parseIntArg(flag: string, defaultValue: number): number {
+  const idx = process.argv.indexOf(flag);
+  if (idx !== -1 && idx + 1 < process.argv.length) {
+    const val = parseInt(process.argv[idx + 1], 10);
+    return isNaN(val) ? defaultValue : val;
+  }
+  return defaultValue;
+}
+
+const ACT_HISTORY_DEPTH = parseIntArg('--history-depth', 5);
+console.log(`[memory-carryover] Act history depth: ${ACT_HISTORY_DEPTH}`);
+
+// --- Session registry ---
+interface ActHistoryEntry {
+  task: string;
+  observations: Observation[];
+}
+
 interface SessionInfo {
   agent: BrowserAgent;
-  mode: 'web' | 'desktop';
+  mode: 'web' | 'desktop' | 'web-vm';
   createdAt: Date;
   lastAccessed: Date;
+  actHistory: ActHistoryEntry[];
+  latestScreenshot: string;
+  latestCursorPosition: { x: number; y: number } | null;
+}
+
+function cacheScreenshot(sessionId: string, screenshot: string, cursorPosition: { x: number; y: number } | null) {
+  const session = activeSessions.get(sessionId);
+  if (session && screenshot) {
+    session.latestScreenshot = screenshot;
+    session.latestCursorPosition = cursorPosition;
+  }
+}
+
+function refreshDesktopCache(triggerSessionId: string) {
+  const triggerSession = activeSessions.get(triggerSessionId);
+  if (!triggerSession || triggerSession.mode !== "web-vm") return;
+  const desktopEntry = [...activeSessions.entries()].find(([, s]) => s.mode === "desktop");
+  if (!desktopEntry) return;
+  const [deskId, deskSession] = desktopEntry;
+  (async () => {
+    try {
+      const connector = deskSession.agent.require(BrowserConnector);
+      const harness = connector.getHarness();
+      const rawImage = await harness.screenshot();
+      const image = await connector.transformScreenshot(rawImage);
+      const deskScreenshot = await image.toBase64();
+      cacheScreenshot(deskId, deskScreenshot, harness.getCursorPosition());
+    } catch (err) {
+      console.warn(`[cache] Desktop screenshot refresh failed: ${err}`);
+    }
+  })();
 }
 
 const activeSessions = new Map<string, SessionInfo>();
@@ -389,6 +340,7 @@ setInterval(() => {
       console.log(`Cleaning up inactive session: ${sessionId}`);
       session.agent.stop().catch((err: unknown) => console.error(`Error stopping session ${sessionId}:`, err));
       activeSessions.delete(sessionId);
+      broadcastSessionEvent(sessionId, 'timeout');
     }
   }
 }, 5 * 60 * 1000); // Check every 5 minutes
@@ -404,6 +356,10 @@ function broadcastLog(message: string) {
       client.send(message);
     }
   });
+}
+
+function broadcastSessionEvent(sessionId: string, reason: string) {
+  broadcastLog(JSON.stringify({ __type: 'session:closed', sessionId, reason }));
 }
 
 // Monkey-patch console methods to capture and broadcast logs
@@ -480,6 +436,173 @@ wsInstance.app.ws('/logs/stream', async (ws: WebSocket, req: Request) => {
 });
 
 
+// --- Demo Sites ---
+const DEMO_SITE_BASE_PORT = 4001;
+const demoSiteProcesses: Map<number, ChildProcess> = new Map();
+
+function isPortOpen(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ port, host: '127.0.0.1' });
+    sock.setTimeout(500);
+    sock.on('connect', () => { sock.destroy(); resolve(true); });
+    sock.on('error', () => { sock.destroy(); resolve(false); });
+    sock.on('timeout', () => { sock.destroy(); resolve(false); });
+  });
+}
+
+function waitForPort(port: number, timeoutMs = 5000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const check = async () => {
+      if (await isPortOpen(port)) return resolve(true);
+      if (Date.now() >= deadline) return resolve(false);
+      setTimeout(check, 200);
+    };
+    check();
+  });
+}
+
+function findDemoSitesRoot(): string | null {
+  // demo-sites/ lives inside agent-service/ so it's always co-located
+  const candidates = [
+    path.resolve(__dirname, '..', 'demo-sites'),           // dev: agent-service/src/../demo-sites
+    path.resolve(__dirname, '..', '..', 'demo-sites'),     // compiled: agent-service/dist/../../demo-sites
+    '/app/agent-service/demo-sites',                        // Docker
+  ];
+  for (const dir of candidates) {
+    if (fs.existsSync(dir)) return dir;
+  }
+  return null;
+}
+
+async function findFreePort(startFrom: number): Promise<number> {
+  let port = startFrom;
+  while (await isPortOpen(port) || demoSiteProcesses.has(port)) {
+    port++;
+  }
+  return port;
+}
+
+async function ensureDemoSites(urlMappings: Record<string, string>): Promise<Record<string, string>> {
+  const resolved: Record<string, string> = {};
+  const demoSitesRoot = findDemoSitesRoot();
+  if (!demoSitesRoot) {
+    console.warn('[demo-sites] No demo-sites directory found, skipping');
+    return resolved;
+  }
+
+  let nextPort = DEMO_SITE_BASE_PORT;
+
+  for (const [originalUrl, dirName] of Object.entries(urlMappings)) {
+    const siteDir = path.join(demoSitesRoot, dirName);
+    if (!fs.existsSync(siteDir)) {
+      console.warn(`[demo-sites] Directory '${dirName}' not found in ${demoSitesRoot}, skipping`);
+      continue;
+    }
+
+    const serverJs = path.join(siteDir, 'server.js');
+    const indexHtml = path.join(siteDir, 'index.html');
+
+    if (!fs.existsSync(serverJs) && !fs.existsSync(indexHtml)) {
+      console.warn(`[demo-sites] ${dirName} has no server.js or index.html, skipping`);
+      continue;
+    }
+
+    const port = await findFreePort(nextPort);
+    nextPort = port + 1;
+
+    if (fs.existsSync(serverJs)) {
+      console.log(`[demo-sites] Starting ${dirName} on port ${port} (node server.js)`);
+      const proc = spawn('node', [serverJs, String(port)], {
+        cwd: siteDir,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      proc.stdout?.on('data', (d: Buffer) => console.log(`[demo-sites:${dirName}] ${d.toString().trim()}`));
+      proc.stderr?.on('data', (d: Buffer) => console.error(`[demo-sites:${dirName}] ${d.toString().trim()}`));
+      proc.on('exit', (code) => console.log(`[demo-sites] ${dirName} exited with code ${code}`));
+      demoSiteProcesses.set(port, proc);
+    } else {
+      console.log(`[demo-sites] Starting static server for ${dirName} on port ${port}`);
+      const staticServer = http.createServer((req, res) => {
+        const filePath = path.join(siteDir, req.url === '/' ? 'index.html' : req.url || 'index.html');
+        fs.readFile(filePath, (err, data) => {
+          if (err) { res.writeHead(404); res.end('Not found'); return; }
+          const ext = path.extname(filePath).toLowerCase();
+          const mimeTypes: Record<string, string> = {'.html':'text/html','.css':'text/css','.js':'text/javascript','.json':'application/json','.png':'image/png','.jpg':'image/jpeg','.svg':'image/svg+xml'};
+          res.writeHead(200, { 'Content-Type': mimeTypes[ext] || 'application/octet-stream' });
+          res.end(data);
+        });
+      });
+      staticServer.listen(port, '0.0.0.0');
+      const fakeProc = { exitCode: null, kill: () => { staticServer.close(); } } as unknown as ChildProcess;
+      demoSiteProcesses.set(port, fakeProc);
+    }
+
+    const ready = await waitForPort(port);
+    if (ready) {
+      console.log(`[demo-sites] ${dirName} ready on port ${port}`);
+    } else {
+      console.error(`[demo-sites] ${dirName} failed to start on port ${port} within timeout`);
+    }
+
+    const localhostUrl = `http://localhost:${port}`;
+    resolved[originalUrl] = localhostUrl;
+
+    // /etc/hosts + Caddy setup so the real domain resolves to the demo site
+    try {
+      const origUrl = new URL(originalUrl);
+      const origHost = origUrl.hostname;
+
+      const hostsFile = fs.readFileSync('/etc/hosts', 'utf-8');
+      if (!hostsFile.includes(origHost)) {
+        fs.appendFileSync('/etc/hosts', `\n127.0.0.1 ${origHost}\n`);
+        console.log(`[demo-sites] Added /etc/hosts entry: 127.0.0.1 ${origHost}`);
+      } else {
+        console.log(`[demo-sites] /etc/hosts already has entry for ${origHost}`);
+      }
+
+      if (origUrl.protocol === 'https:') {
+        const caddyFile = fs.existsSync('/etc/caddy/Caddyfile')
+          ? fs.readFileSync('/etc/caddy/Caddyfile', 'utf-8') : '';
+        if (!caddyFile.includes(origHost + ' {')) {
+          const caddyBlock = `\n${origHost} {\n    tls internal\n    reverse_proxy localhost:${port}\n}\n`;
+          fs.appendFileSync('/etc/caddy/Caddyfile', caddyBlock);
+          console.log(`[demo-sites] Added Caddy block: ${origHost} -> localhost:${port}`);
+        } else {
+          console.log(`[demo-sites] Caddy already has block for ${origHost}`);
+        }
+      }
+    } catch (e) {
+      console.warn(`[demo-sites] Could not configure hosts/Caddy for ${originalUrl}: ${e}`);
+    }
+  }
+
+  // Reload Caddy if any new blocks were added
+  try {
+    if (fs.existsSync('/etc/caddy/Caddyfile')) {
+      execSync('caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1', { timeout: 10000 });
+      console.log('[demo-sites] Caddy reloaded with new demo site routes');
+    }
+  } catch (e) {
+    console.warn(`[demo-sites] Caddy reload failed: ${e}`);
+  }
+
+  return resolved;
+}
+
+// Cleanup demo site processes on exit
+function cleanupDemoSites() {
+  for (const [port, proc] of demoSiteProcesses) {
+    try { proc.kill(); } catch {}
+    console.log(`[demo-sites] Stopped process on port ${port}`);
+  }
+  demoSiteProcesses.clear();
+}
+process.on('SIGTERM', cleanupDemoSites);
+process.on('SIGINT', cleanupDemoSites);
+process.on('exit', cleanupDemoSites);
+
+
 // --- Agent Initialization ---
 console.log(`Starting Magnitude BrowserAgent...`);
 app.listen(port, () => {
@@ -487,9 +610,18 @@ app.listen(port, () => {
 });
 
 const isAgentReady = (req: Request, res: Response, next: Function) => {
-  const sessionId = req.body.sessionId;
+  let sessionId = req.body.sessionId;
   if (!sessionId) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
+    // Desktop mode is singleton (one physical display, one session).
+    // Callers that omit sessionId are targeting the desktop.
+    const desktopEntry = [...activeSessions.entries()]
+      .find(([, s]) => s.mode === "desktop");
+    if (desktopEntry) {
+      sessionId = desktopEntry[0];
+      req.body.sessionId = sessionId;
+    } else {
+      return res.status(400).json({ error: 'no_desktop_session', message: 'No active desktop session. Call /start with mode=desktop first.' });
+    }
   }
   const session = activeSessions.get(sessionId);
   if (!session) {
@@ -516,8 +648,11 @@ const getLaunchOptions = (headless: boolean, downloadsPath: string | null = null
 
 const startDesktop = async (): Promise<BrowserAgent> => {
   try {
+    const encodedPassword = encodeURIComponent(process.env.UNIFY_KEY || '');
+    const desktopUrl = `http://localhost:6080/custom.html?password=${encodedPassword}`;
+    const desktopOrigin = new URL(desktopUrl).origin;
     const agent = await startBrowserAgent({
-      url: `http://localhost:6080/custom.html?password=${process.env.UNIFY_KEY}`,
+      url: desktopUrl,
       browser: getLaunchOptions(true),
       prompt: "You're controlling a noVNC virtual desktop page. Do not navigate to other page and use mouse and keyboard to control the browser and apps within the virtual desktop. There may be a terminal (xterm) app launched in the desktop for use.",
       narrate: true,
@@ -525,7 +660,7 @@ const startDesktop = async (): Promise<BrowserAgent> => {
       llm: {
         provider: 'openai-generic',
         options: {
-          model: 'claude-4.5-opus@anthropic',
+          model: 'claude-4.6-sonnet@anthropic',
           baseUrl: `${process.env.UNITY_COMMS_URL}/unillm`,
           headers: {
             'Authorization': `Bearer ${process.env.UNIFY_KEY}`,
@@ -535,6 +670,11 @@ const startDesktop = async (): Promise<BrowserAgent> => {
       }
     });
     agent.context.setDefaultNavigationTimeout(90000);
+    // Auto-grant clipboard permissions so the noVNC "Share clipboard?" popup is suppressed
+    await agent.context.grantPermissions(
+      ['clipboard-read', 'clipboard-write'],
+      { origin: desktopOrigin },
+    );
     console.log("✅ Desktop BrowserAgent started successfully.");
     return agent;
   } catch (err) {
@@ -543,17 +683,18 @@ const startDesktop = async (): Promise<BrowserAgent> => {
   }
 }
 
-const startBrowser = async (headless: boolean): Promise<BrowserAgent> => {
+const startBrowser = async (headless: boolean, urlMappings?: Record<string, string>): Promise<BrowserAgent> => {
   try {
     const agent = await startBrowserAgent({
-      url: "https://www.duckduckgo.com/",
+      url: "https://www.google.com/",
       browser: getLaunchOptions(headless, defaultBrowserPaths.downloadsPath, defaultBrowserPaths.tracesDir),
       narrate: true,
+      urlMappings,
       // Route LLM calls through Orchestra/UniLLM proxy for billing and caching
       llm: {
         provider: 'openai-generic',
         options: {
-          model: 'claude-4.5-opus@anthropic',
+          model: 'claude-4.6-sonnet@anthropic',
           baseUrl: `${process.env.UNITY_COMMS_URL}/unillm`,
           headers: {
             'Authorization': `Bearer ${process.env.UNIFY_KEY}`,
@@ -571,24 +712,499 @@ const startBrowser = async (headless: boolean): Promise<BrowserAgent> => {
   }
 }
 
+const startBrowserOnVm = async (urlMappings?: Record<string, string>): Promise<BrowserAgent> => {
+  try {
+    const agent = await startBrowserAgent({
+      url: "https://www.google.com/",
+      browser: {
+        launchOptions: {
+          headless: false,
+          args: [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            '--auto-select-desktop-capture-source="Entire screen"',
+          ],
+          downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
+          tracesDir: defaultBrowserPaths.tracesDir || undefined,
+        },
+        contextOptions: { viewport: null, ignoreHTTPSErrors: true },
+      },
+      narrate: true,
+      urlMappings,
+      llm: {
+        provider: 'openai-generic',
+        options: {
+          model: 'claude-4.6-sonnet@anthropic',
+          baseUrl: `${process.env.UNITY_COMMS_URL}/unillm`,
+          headers: {
+            'Authorization': `Bearer ${process.env.UNIFY_KEY}`,
+          },
+          temperature: 0.2,
+        }
+      }
+    });
+    agent.context.setDefaultNavigationTimeout(90000);
+    console.log("✅ Web-VM BrowserAgent started successfully.");
+    return agent;
+  } catch (err) {
+    console.error("❌ Failed to start Web-VM BrowserAgent:", err);
+    throw err;
+  }
+}
+
+// --- Google Meet browser launcher ---
+const startGoogleMeetBrowser = async (meetUrl: string): Promise<BrowserAgent> => {
+  try {
+    const agent = await startBrowserAgent({
+      url: meetUrl,
+      browser: {
+        launchOptions: {
+          headless: false,
+          args: [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            '--auto-select-desktop-capture-source="Entire screen"',
+          ],
+          env: {
+            ...process.env,
+            PULSE_SINK: "agent_sink",
+            PULSE_SOURCE: "meet_mic",
+          },
+          downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
+          tracesDir: defaultBrowserPaths.tracesDir || undefined,
+        },
+        contextOptions: {
+          viewport: null,
+          ignoreHTTPSErrors: true,
+          permissions: ['camera', 'microphone'],
+        },
+      },
+      narrate: true,
+      llm: {
+        provider: 'openai-generic',
+        options: {
+          model: 'claude-4.6-sonnet@anthropic',
+          baseUrl: `${process.env.UNITY_COMMS_URL}/unillm`,
+          headers: {
+            'Authorization': `Bearer ${process.env.UNIFY_KEY}`,
+          },
+          temperature: 0.2,
+        }
+      }
+    });
+    agent.context.setDefaultNavigationTimeout(90000);
+    console.log("✅ Google Meet BrowserAgent started successfully.");
+    return agent;
+  } catch (err) {
+    console.error("❌ Failed to start Google Meet BrowserAgent:", err);
+    throw err;
+  }
+};
+
+// --- Google Meet session management ---
+type GoogleMeetStatus = 'joining' | 'lobby' | 'active' | 'ended' | 'removed' | 'error';
+
+interface GoogleMeetParticipant {
+  name: string;
+  isSpeaking: boolean;
+}
+
+interface GoogleMeetSessionInfo {
+  agent: BrowserAgent;
+  status: GoogleMeetStatus;
+  meetUrl: string;
+  displayName: string;
+  createdAt: Date;
+  participants: GoogleMeetParticipant[];
+  activeSpeaker: string | null;
+  pollIntervalId: ReturnType<typeof setInterval> | null;
+}
+
+const googleMeetSessions = new Map<string, GoogleMeetSessionInfo>();
+
+type GoogleMeetJoinResult =
+  | { status: 'active' | 'lobby' }
+  | { status: 'error'; reason: string };
+
+const MEET_PREPARE_TASK = (displayName: string) =>
+  `You are on a Google Meet pre-join screen. Complete these steps in order:\n` +
+  `1. Dismiss any popups, tooltips, or overlays (e.g. "Got it" button, cookie banners).\n` +
+  `2. If there is a "Your name" text input, clear it and type: ${displayName}\n` +
+  `3. Turn OFF the camera if it is on (click its toggle button). Leave the microphone ON.\n` +
+  `Do NOT change audio device selections — they are handled separately.\n` +
+  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
+  `If the page shows a fatal error like "invalid meeting link" or "this meeting has ended", do nothing — just stop.`;
+
+const MEET_CLICK_JOIN_TASK =
+  `You are on a Google Meet pre-join screen. The audio devices have already been configured.\n` +
+  `Click the "Ask to join" or "Join now" button to enter the meeting.\n` +
+  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
+  `If the page shows a fatal error like "invalid meeting link" or "this meeting has ended", do nothing — just stop.`;
+
+const MEET_PREPARE_MAX_ITERATIONS = 3;
+const MEET_JOIN_MAX_ITERATIONS = 3;
+
+async function runMagnitudeLoop(
+  agent: BrowserAgent,
+  task: string,
+  maxIterations: number,
+  label: string,
+): Promise<void> {
+  const memory = new AgentMemory({ promptCaching: true });
+
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    if (iteration > 0) {
+      console.log(`[${label}] Iteration ${iteration + 1}: re-observing...`);
+    }
+
+    await agent.recordConnectorObservations(memory);
+    const context = await agent.buildContext(memory);
+    const { reasoning, actions } = await agent.models.partialAct(context, task, [], agent.actions);
+
+    console.log(`[${label}] Iteration ${iteration + 1} reasoning: ${reasoning}`);
+    console.log(`[${label}] Planned ${actions.length} action(s): ${actions.map(a => a.variant).join(', ')}`);
+    memory.recordThought(reasoning);
+
+    if (actions.length === 0) {
+      console.log(`[${label}] LLM planned zero actions — stopping.`);
+      break;
+    }
+
+    const taskDone = actions.some(a => a.variant === 'task:done');
+
+    for (const action of actions) {
+      const actionDef = agent.identifyAction(action);
+      console.log(`[${label}] Executing: ${actionDef.render(action)}`);
+      await agent.exec(action, memory);
+    }
+
+    if (taskDone) {
+      console.log(`[${label}] LLM signalled task:done.`);
+      break;
+    }
+  }
+}
+
+/**
+ * Open Google Meet Settings dialog via Playwright (deterministic), then hand
+ * off to the LLM to navigate the Audio tab and select devices (visual).
+ */
+async function openMeetSettings(page: any): Promise<boolean> {
+  const tag = '[googlemeet/devices]';
+
+  try {
+    const moreBtn = page.locator(
+      'button[aria-label*="More options" i], button[aria-label*="more actions" i], button[aria-label*="More" i][aria-haspopup]'
+    ).first();
+    if (!await moreBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      console.log(`${tag} Triple-dots menu button not found`);
+      return false;
+    }
+    console.log(`${tag} Opening More options menu...`);
+    await moreBtn.click();
+    await page.waitForTimeout(500);
+
+    const settingsItem = page.locator(
+      'li:has-text("Settings"), [role="menuitem"]:has-text("Settings"), span:has-text("Settings")'
+    ).first();
+    if (!await settingsItem.isVisible({ timeout: 2000 }).catch(() => false)) {
+      console.log(`${tag} "Settings" menu item not found — closing menu`);
+      await page.keyboard.press('Escape');
+      return false;
+    }
+    console.log(`${tag} Clicking Settings...`);
+    await settingsItem.click();
+    await page.waitForTimeout(800);
+    console.log(`${tag} Settings dialog opened`);
+    return true;
+  } catch (err) {
+    console.log(`${tag} Error opening Settings: ${err}`);
+    await page.keyboard.press('Escape').catch(() => {});
+    return false;
+  }
+}
+
+const MEET_AUDIO_TAB_TASK =
+  `You are in the Google Meet Settings dialog.\n` +
+  `Click the "Audio" tab on the left side of the dialog.\n` +
+  `Do NOT close the dialog.`;
+
+const MEET_SELECT_MIC_TASK = (micLabel: string) =>
+  `You are in the Google Meet Settings dialog, on the Audio tab.\n` +
+  `Click the Microphone dropdown and select the option containing "${micLabel}".\n` +
+  `Do NOT close the dialog.`;
+
+const MEET_SELECT_SPEAKER_TASK = (speakerLabel: string) =>
+  `You are in the Google Meet Settings dialog, on the Audio tab.\n` +
+  `Click the Speakers dropdown and select the option containing "${speakerLabel}".\n` +
+  `Then close the settings dialog by clicking the X button.`;
+
+const MEET_AUDIO_MAX_ITERATIONS = 3;
+
+async function googleMeetJoinFlow(agent: BrowserAgent, displayName: string): Promise<GoogleMeetJoinResult> {
+  const page = agent.page;
+  await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+
+  const pageUrl = page.url?.() ?? 'unknown';
+  console.log(`[googlemeet/join] Page loaded: url=${pageUrl}`);
+
+  // Phase 1: LLM handles variable UI (popups, name, camera)
+  console.log('[googlemeet/join] Phase 1: prepare...');
+  await runMagnitudeLoop(agent, MEET_PREPARE_TASK(displayName), MEET_PREPARE_MAX_ITERATIONS, 'googlemeet/prepare');
+
+  // Phase 1b: Audio device selection — Playwright opens Settings, LLM handles each step
+  console.log('[googlemeet/join] Phase 1b: opening Settings for audio device selection...');
+  const settingsOpened = await openMeetSettings(page);
+  if (settingsOpened) {
+    console.log('[googlemeet/join] Phase 1b-i: navigating to Audio tab...');
+    await runMagnitudeLoop(agent, MEET_AUDIO_TAB_TASK, MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/audio-tab');
+
+    console.log('[googlemeet/join] Phase 1b-ii: selecting microphone...');
+    await runMagnitudeLoop(agent, MEET_SELECT_MIC_TASK('agent_sink'), MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/select-mic');
+
+    console.log('[googlemeet/join] Phase 1b-iii: selecting speaker + closing...');
+    await runMagnitudeLoop(agent, MEET_SELECT_SPEAKER_TASK('meet_sink'), MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/select-speaker');
+  } else {
+    console.log('[googlemeet/join] Phase 1b: Could not open Settings — using default devices');
+  }
+
+  // Phase 2: click join
+  console.log('[googlemeet/join] Phase 2: clicking join...');
+  await runMagnitudeLoop(agent, MEET_CLICK_JOIN_TASK, MEET_JOIN_MAX_ITERATIONS, 'googlemeet/click-join');
+
+  // Determine outcome by checking the page state after the agent finished
+  await sleep(2000);
+
+  const meetingActive = await page.locator(
+    '[data-meeting-title], [aria-label*="meeting details" i], [data-call-duration]'
+  ).first().isVisible({ timeout: 5000 }).catch(() => false);
+  if (meetingActive) return { status: 'active' };
+
+  const inLobby = await page.locator(
+    'text=/waiting|asking to join|let you in/i'
+  ).first().isVisible({ timeout: 3000 }).catch(() => false);
+  if (inLobby) return { status: 'lobby' };
+
+  const hasError = await page.locator(
+    'text=/invalid meeting|meeting has ended|no longer available|meeting not found/i'
+  ).first().isVisible({ timeout: 1000 }).catch(() => false);
+  if (hasError) {
+    const errorMsg = await page.locator('text=/invalid meeting|meeting has ended|no longer available|meeting not found/i').first().textContent().catch(() => 'unknown');
+    return { status: 'error', reason: `meet_page_error: "${errorMsg}" (url=${pageUrl})` };
+  }
+
+  const hasJoinBtn = await page.locator(
+    'button:has-text("Ask to join"), button:has-text("Join now"), button:has-text("Join")'
+  ).first().isVisible({ timeout: 1000 }).catch(() => false);
+  if (hasJoinBtn) {
+    return { status: 'error', reason: `join_button_still_visible: Agent completed but join button was not clicked (url=${pageUrl})` };
+  }
+
+  // No definitive signal — assume we're waiting for admission
+  return { status: 'lobby' };
+}
+
+async function googleMeetPollState(sessionId: string): Promise<void> {
+  const session = googleMeetSessions.get(sessionId);
+  if (!session || session.status === 'ended' || session.status === 'error') return;
+
+  try {
+    const page = session.agent.page;
+
+    // Detect if meeting has ended
+    const meetingEnded = await page.locator(
+      'text=/meeting has ended|you left the meeting|removed from the meeting|kicked/i'
+    ).first().isVisible({ timeout: 500 }).catch(() => false);
+
+    if (meetingEnded) {
+      session.status = 'ended';
+      return;
+    }
+
+    // If we were in the lobby, check if we're admitted now
+    if (session.status === 'lobby') {
+      const admitted = await page.locator(
+        '[data-meeting-title], [aria-label*="meeting details" i], [data-call-duration]'
+      ).first().isVisible({ timeout: 500 }).catch(() => false);
+      if (admitted) session.status = 'active';
+
+      // Check if denied
+      const denied = await page.locator(
+        'text=/denied|not allowed|can\'t join/i'
+      ).first().isVisible({ timeout: 500 }).catch(() => false);
+      if (denied) {
+        session.status = 'removed';
+        return;
+      }
+    }
+
+    // Scrape participants and active speaker from the DOM
+    const participants: GoogleMeetParticipant[] = [];
+    let activeSpeaker: string | null = null;
+
+    // Google Meet shows participant tiles; the active speaker has a highlighted border
+    const speakerElements = await page.locator(
+      '[data-self-name], [data-participant-id]'
+    ).all().catch(() => []);
+
+    for (const el of speakerElements) {
+      const name = await el.getAttribute('data-self-name').catch(() => null)
+        || await el.innerText().catch(() => null);
+      if (!name) continue;
+
+      const parentClasses = await el.evaluate(
+        (node: Element) => node.closest('[class]')?.className || ''
+      ).catch(() => '');
+      const isSpeaking = parentClasses.includes('speaking') ||
+        (await el.locator('[class*="speaking" i]').first().isVisible({ timeout: 100 }).catch(() => false));
+
+      const cleanName = name.split('\n')[0].trim();
+      participants.push({ name: cleanName, isSpeaking });
+      if (isSpeaking) activeSpeaker = cleanName;
+    }
+
+    session.participants = participants;
+    session.activeSpeaker = activeSpeaker;
+  } catch {
+    // Browser may have disconnected
+    session.status = 'error';
+  }
+}
+
 // --- API Endpoints ---
 app.post('/start', async (req: Request, res: Response) => {
-  const { headless, mode } = req.body;
-  if (!mode || (mode !== "desktop" && mode !== "web")) {
+  const { headless, mode, label, urlMappings } = req.body;
+  if (!mode || !['desktop', 'web', 'web-vm'].includes(mode)) {
     return res.status(400).json({
       error: 'bad_request',
       message:
-        'Mode is required and must be either "desktop" or "web".',
+        'Mode is required and must be "desktop", "web", or "web-vm".',
     });
   }
 
+  // Desktop mode is singleton -- one physical display, one session.
+  // Close any existing desktop session before creating a new one.
+  if (mode === "desktop") {
+    for (const [existingId, existing] of activeSessions.entries()) {
+      if (existing.mode === "desktop") {
+        console.log(`Replacing existing desktop session: ${existingId}`);
+        existing.agent.stop().catch((err: unknown) =>
+          console.error(`Error stopping old desktop session: ${err}`)
+        );
+        activeSessions.delete(existingId);
+        broadcastSessionEvent(existingId, 'replaced');
+      }
+    }
+  }
+
   const sessionId = randomUUID();
+  const t0 = Date.now();
+  console.log(`[start] BEGIN mode=${mode} sessionId=${sessionId}`);
   try {
     let agent: BrowserAgent;
+    const rawMappings = urlMappings && typeof urlMappings === 'object' ? urlMappings as Record<string, string> : undefined;
+    const resolvedMappings = rawMappings ? await ensureDemoSites(rawMappings) : undefined;
+    const mappings = resolvedMappings && Object.keys(resolvedMappings).length > 0 ? resolvedMappings : undefined;
+
     if (mode === "desktop") {
       agent = await startDesktop();
+    } else if (mode === "web-vm") {
+      agent = await startBrowserOnVm(mappings);
     } else {
-      agent = await startBrowser(headless ?? false);
+      agent = await startBrowser(headless ?? false, mappings);
+    }
+    console.log(`[start] agent_created=${Date.now() - t0}ms mode=${mode}`);
+
+    // ── Diagnostic logging for URL mapping debugging ────────────────────
+    if (mappings) {
+      console.log(`[url-map-diag] urlMappings received by agent: ${JSON.stringify(mappings)}`);
+
+      // Verify each demo site is actually reachable right now
+      for (const [original, replacement] of Object.entries(mappings)) {
+        console.log(`[url-map-diag] Mapping: ${original} -> ${replacement}`);
+        try {
+          const testResp = await fetch(replacement, { redirect: 'manual' });
+          console.log(`[url-map-diag] Fetch test ${replacement} -> status=${testResp.status}, headers=${JSON.stringify(Object.fromEntries([...testResp.headers.entries()].filter(([k]) => ['content-type','location','content-length'].includes(k.toLowerCase()))))}`);
+        } catch (e) {
+          console.error(`[url-map-diag] Fetch test ${replacement} -> FAILED: ${e}`);
+        }
+      }
+
+      // Log all registered routes on the context (Playwright exposes them via internal state)
+      try {
+        // Check if magnitude registered any routes by inspecting the context
+        const page = agent.page;
+        console.log(`[url-map-diag] Current page URL after agent start: ${page.url()}`);
+      } catch (e) {
+        console.warn(`[url-map-diag] Could not read page URL: ${e}`);
+      }
+
+      // Add a catch-all diagnostic route that logs EVERY request the browser makes.
+      // Uses route.fallback() so it doesn't interfere with magnitude's routes --
+      // if magnitude's route already handled it, this won't fire.
+      // If this DOES fire for a mapped URL, it means magnitude's route did NOT catch it.
+      try {
+        await agent.context.route('**/*', async (route) => {
+          const req = route.request();
+          const url = req.url();
+          const isNav = req.isNavigationRequest();
+          const method = req.method();
+          const resourceType = req.resourceType();
+
+          // Log all navigation requests + anything hitting a mapped domain
+          const mappedEntries = Object.entries(mappings!);
+          let matchInfo = 'no-match';
+          for (const [orig] of mappedEntries) {
+            const origHost = new URL(orig).hostname;
+            if (url.includes(origHost)) {
+              matchInfo = `matches-domain:${origHost}`;
+              // This request matched a mapped domain but reached our fallback,
+              // meaning magnitude's context.route() did NOT intercept it.
+              console.warn(`[url-map-diag] ⚠️ LEAKED REQUEST: ${method} ${url} (magnitude route did NOT intercept this)`);
+              // Check if URL exactly matches what magnitude should catch
+              const urlObj = new URL(url);
+              console.warn(`[url-map-diag]   url.href=${urlObj.href}, original=${orig}, startsWith(orig+/)=${urlObj.href.startsWith(orig + '/')}, equals=${urlObj.href === orig}`);
+              break;
+            }
+          }
+
+          if (isNav) {
+            console.log(`[url-map-diag] NAV ${method} ${url} (type=${resourceType}, ${matchInfo})`);
+          }
+
+          await route.fallback();
+        });
+        console.log(`[url-map-diag] Diagnostic catch-all route installed`);
+      } catch (e) {
+        console.warn(`[url-map-diag] Failed to install diagnostic route: ${e}`);
+      }
+    } else {
+      console.log(`[url-map-diag] No urlMappings provided for this session`);
+    }
+    // ── End diagnostic logging ───────────────────────────────────────────
+
+    if (label && mode === 'web-vm') {
+      try {
+        await agent.context.addInitScript(`
+          (function() {
+            function _injectBadge() {
+              if (document.getElementById('__mag_session_badge')) return;
+              var b = document.createElement('div');
+              b.id = '__mag_session_badge';
+              b.textContent = ${JSON.stringify(String(label))};
+              b.style.cssText = 'position:fixed;top:4px;right:4px;z-index:2147483647;'
+                + 'background:rgba(30,30,30,0.85);color:#fff;padding:2px 8px;'
+                + 'font:bold 12px/16px system-ui,sans-serif;border-radius:4px;'
+                + 'pointer-events:none;user-select:none;';
+              (document.body || document.documentElement).appendChild(b);
+            }
+            if (document.body) _injectBadge();
+            else document.addEventListener('DOMContentLoaded', _injectBadge);
+          })();
+        `);
+      } catch (badgeErr) {
+        console.warn(`[start] Badge injection failed: ${badgeErr}`);
+      }
     }
 
     activeSessions.set(sessionId, {
@@ -596,10 +1212,15 @@ app.post('/start', async (req: Request, res: Response) => {
       mode,
       createdAt: new Date(),
       lastAccessed: new Date(),
+      actHistory: [],
+      latestScreenshot: '',
+      latestCursorPosition: null,
     });
 
+    console.log(`[start] DONE mode=${mode} sessionId=${sessionId} total=${Date.now() - t0}ms active_sessions=${activeSessions.size}`);
     res.json({ status: 'started', sessionId });
   } catch (err) {
+    console.error(`[start] ERROR mode=${mode} after ${Date.now() - t0}ms:`, err);
     handleAgentError(err, res);
   }
 });
@@ -617,12 +1238,249 @@ app.post('/nav', isAgentReady, async (req: Request, res: Response) => {
 });
 
 app.post('/act', isAgentReady, async (req: Request, res: Response) => {
-  const { task, sessionId, override_cache } = req.body;
+  const { task, sessionId, lineage, verify } = req.body;
   if (!task) return res.status(400).json({ error: 'bad_request', message: 'Task description is required.' });
   try {
     const session = activeSessions.get(sessionId)!;
-    await session.agent.act(task, { override_cache: override_cache === true } as any);
-    res.json({ status: 'success', message: `Task "${task}" completed.` });
+    const agent = session.agent;
+    const actId = makeActId(task);
+
+    const lineageLabel = Array.isArray(lineage) && lineage.length > 0
+      ? `[${lineage.join('->')}->desktop.act] `
+      : '[desktop.act] ';
+
+    const memory = new AgentMemory({ promptCaching: true });
+
+    // Fresh web/web-vm sessions already have a browser open and loaded.
+    // Tell the LLM so it can no-op (return an empty action list) if the
+    // task is simply asking to open a browser.
+    if (session.actHistory.length === 0 && session.mode !== 'desktop') {
+      memory.recordObservation(new Observation(
+        'thought' as any,
+        'user',
+        'This is a freshly created browser session — the browser is already open and loaded. '
+        + 'If the task is simply asking to open a browser, open a new browser window, or launch a browser, '
+        + 'this has already been accomplished. Return an empty actions list.'
+      ));
+    }
+
+    if (session.actHistory.length > 0) {
+      let injectedCount = 0;
+      for (const entry of session.actHistory) {
+        memory.recordObservation(new Observation(
+          'thought' as any,
+          'user',
+          `Previously completed task: "${entry.task}"`
+        ));
+        injectedCount++;
+        for (const obs of entry.observations) {
+          memory.recordObservation(obs);
+          injectedCount++;
+        }
+      }
+      console.log(`${lineageLabel}📋 Injecting history from ${session.actHistory.length} previous acts (${injectedCount} observations)`);
+    } else {
+      console.log(`${lineageLabel}📋 No prior act history in session`);
+    }
+
+    const boundary = memory.observationCount;
+
+    const actT0 = Date.now();
+    console.log(`${lineageLabel}🧠 Planning actions for: "${task}"${verify ? ' (verify=true)' : ''}`);
+
+    const actActions = verify
+      ? agent.actions
+      : agent.actions.filter(a => !a.name.startsWith('task:'));
+    const MAX_VERIFY_ITERATIONS = 5;
+    const actionTraces: any[] = [];
+    const iterationReasonings: string[] = [];
+    const iterationPlannedActions: any[][] = [];
+    let totalActionsExecuted = 0;
+
+    for (let iteration = 0; iteration < (verify ? MAX_VERIFY_ITERATIONS : 1); iteration++) {
+      if (iteration > 0) {
+        console.log(`${lineageLabel}🔄 Verify pass ${iteration + 1}: re-observing and re-planning...`);
+      }
+
+      await agent.recordConnectorObservations(memory);
+
+      if (MAGNITUDE_DEBUG) {
+        try {
+          const harness = agent.require(BrowserConnector).getHarness();
+          const planImg = await harness.screenshot();
+          debugSaveImage(actId, iteration === 0 ? 'planning_screenshot' : `verify_${iteration}_screenshot`, await planImg.toBase64());
+
+          if (session.mode === 'desktop') {
+            debugSaveImage(actId, iteration === 0 ? 'native_screenshot' : `verify_${iteration}_native`, nativeScreenshot());
+          }
+        } catch (debugErr) {
+          console.warn(`[debug] Pre-plan screenshot capture failed: ${debugErr}`);
+        }
+      }
+
+      const context = await agent.buildContext(memory);
+      const { reasoning, actions } = await agent.models.partialAct(context, task, [], actActions);
+
+      const planMs = Date.now() - actT0;
+      console.log(`${lineageLabel}💭 Reasoning [${planMs}ms]: ${reasoning}`);
+      console.log(`${lineageLabel}📋 Planned ${actions.length} action(s): ${actions.map(a => a.variant).join(', ')}`);
+
+      iterationReasonings.push(reasoning);
+      iterationPlannedActions.push(actions);
+      memory.recordThought(reasoning);
+
+      for (let i = 0; i < actions.length; i++) {
+        const action = actions[i];
+        const actionDef = agent.identifyAction(action);
+        const rendered = actionDef.render(action);
+        const detail = JSON.stringify(action);
+        console.log(`${lineageLabel}🛠️ Action ${totalActionsExecuted + i + 1}: ${rendered} ${detail}`);
+
+        const actionT0 = Date.now();
+        let actionError: string | undefined;
+        try {
+          await agent.exec(action, memory);
+        } catch (err) {
+          actionError = err instanceof Error ? err.message : String(err);
+          throw err;
+        } finally {
+          const actionMs = Date.now() - actionT0;
+          console.log(`${lineageLabel}✅ Completed ${action.variant} [${actionMs}ms]`);
+
+          const actionTrace: any = {
+            index: totalActionsExecuted + i,
+            iteration,
+            variant: action.variant,
+            params: action,
+            rendered,
+            executionMs: actionMs,
+          };
+          if (actionError) actionTrace.error = actionError;
+
+          if (MAGNITUDE_DEBUG) {
+            try {
+              const harness = agent.require(BrowserConnector).getHarness();
+              const postImg = await harness.screenshot();
+              const coordLabel = ('x' in action && 'y' in action)
+                ? `_${action.x}_${action.y}`
+                : ('from' in action && typeof action.from === 'object')
+                  ? `_${action.from.x}_${action.from.y}`
+                  : '';
+              const padIdx = String(totalActionsExecuted + i + 1).padStart(3, '0');
+              debugSaveImage(
+                actId,
+                `post_action/${padIdx}_${action.variant.replace(/:/g, '_')}${coordLabel}`,
+                await postImg.toBase64(),
+              );
+            } catch (debugErr) {
+              console.warn(`[debug] Post-action screenshot failed: ${debugErr}`);
+            }
+          }
+
+          actionTraces.push(actionTrace);
+        }
+      }
+
+      totalActionsExecuted += actions.length;
+
+      const taskDone = actions.some(a => a.variant === 'task:done');
+      if (!verify || taskDone) break;
+    }
+
+    const totalMs = Date.now() - actT0;
+    console.log(`${lineageLabel}🏁 ${totalActionsExecuted} action(s) executed across ${iterationReasonings.length} iteration(s) [${totalMs}ms]`);
+
+    debugSaveTrace(actId, {
+      actId,
+      task,
+      verify: !!verify,
+      lineage: lineage ?? [],
+      sessionMode: session.mode,
+      sessionId,
+      reasoning: iterationReasonings.join('\n---\n'),
+      plannedActions: iterationPlannedActions,
+      actionTraces,
+      iterations: iterationReasonings.length,
+      totalMs,
+      historyDepth: session.actHistory.length,
+      observationCountBefore: boundary,
+    });
+
+    const newObservations = memory.getObservationsSlice(boundary);
+    const filtered = newObservations.filter(obs => {
+      const src = obs.source;
+      return src.startsWith('thought') || src.startsWith('action:taken:');
+    });
+
+    session.actHistory.push({ task, observations: filtered });
+    if (session.actHistory.length > ACT_HISTORY_DEPTH) {
+      session.actHistory = session.actHistory.slice(-ACT_HISTORY_DEPTH);
+    }
+
+    console.log(`[memory-carryover] Stored ${filtered.length} filtered observations for task "${task}" (history: ${session.actHistory.length}/${ACT_HISTORY_DEPTH})`);
+
+    const thoughts = filtered
+      .filter(obs => obs.source.startsWith('thought'))
+      .map(obs => String(obs.content))
+      .join('\n');
+
+    let screenshot = '';
+    try {
+      const connector = session.agent.require(BrowserConnector);
+      const harness = connector.getHarness();
+      const rawImage = await harness.screenshot();
+      const image = await connector.transformScreenshot(rawImage);
+      screenshot = await image.toBase64();
+      cacheScreenshot(sessionId, screenshot, harness.getCursorPosition());
+    } catch (screenshotErr) {
+      console.warn(`[act] Post-act screenshot failed: ${screenshotErr}`);
+    }
+
+    res.json({ status: 'success', summary: thoughts, screenshot });
+    refreshDesktopCache(sessionId);
+  } catch (err) {
+    handleAgentError(err, res);
+  }
+});
+
+app.post('/execute-actions', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId, actions } = req.body;
+  if (!actions || !Array.isArray(actions) || actions.length === 0) {
+    return res.status(400).json({
+      error: 'bad_request',
+      message: 'actions is required and must be a non-empty array of action objects.',
+    });
+  }
+
+  try {
+    const session = activeSessions.get(sessionId)!;
+    const agent = session.agent;
+    const t0 = Date.now();
+
+    const variants = actions.map((a: any) => a.variant).join(', ');
+    console.log(`[execute-actions] Executing ${actions.length} action(s) [${variants}] for session ${sessionId}`);
+
+    await agent.executeTrajectory(actions, { memory: agent.memory, recordObservations: false });
+
+    const execMs = Date.now() - t0;
+    console.log(`[execute-actions] ${actions.length} action(s) executed [${execMs}ms]`);
+
+    let screenshot = '';
+    let cursorPosition: { x: number; y: number } | null = null;
+    try {
+      const connector = agent.require(BrowserConnector);
+      const harness = connector.getHarness();
+      const rawImage = await harness.screenshot();
+      const image = await connector.transformScreenshot(rawImage);
+      screenshot = await image.toBase64();
+      cursorPosition = harness.getCursorPosition();
+      cacheScreenshot(sessionId, screenshot, cursorPosition);
+    } catch (screenshotErr) {
+      console.warn(`[execute-actions] Post-execution screenshot failed: ${screenshotErr}`);
+    }
+
+    res.json({ status: 'success', screenshot, cursorPosition });
+    refreshDesktopCache(sessionId);
   } catch (err) {
     handleAgentError(err, res);
   }
@@ -640,9 +1498,13 @@ app.post('/extract', isAgentReady, async (req: Request, res: Response) => {
     try {
       const zodSchema = schema ? jsonSchemaToZod(schema) : z.string();
       const session = activeSessions.get(sessionId)!;
+      const shouldBypassDomProcessing =
+        bypassDomProcessing === true || session.mode === 'desktop';
 
-      // If bypassDomProcessing is true, use screenshot-only extraction
-      if (bypassDomProcessing === true) {
+      // Desktop sessions are rendered through the live noVNC iframe, so DOM
+      // expansion is both meaningless and destructive. Always use screenshot-
+      // only extraction there, even if the caller forgets to request it.
+      if (shouldBypassDomProcessing) {
         const screenshot = await session.agent.require(BrowserConnector).getHarness().screenshot();
         const data = await (session.agent.models as any).extract(instructions, zodSchema as ZodTypeAny, screenshot, '');
         return res.json({ data });
@@ -678,24 +1540,172 @@ app.post('/query', isAgentReady, async (req: Request, res: Response) => {
   try {
     const zodSchema: ZodTypeAny = schema ? jsonSchemaToZod(schema) : z.any();
     const session = activeSessions.get(sessionId)!;
-    const queryFn = (session.agent as unknown as { query: (q: unknown, s: ZodTypeAny) => Promise<unknown> }).query;
-    const dataUnknown: unknown = await queryFn(query, zodSchema);
-    res.json({ data: dataUnknown });
+    const data: unknown = await (session.agent as any).query(query, zodSchema);
+    res.json({ data });
   } catch (err) {
     handleAgentError(err, res);
   }
 });
 
+// --- Native desktop screenshot via OS commands ---
+
+function nativeScreenshotCommand(dest: string): string {
+  switch (process.platform) {
+    case 'win32':
+      // PowerShell: capture full primary screen using System.Drawing
+      return [
+        'powershell.exe -NoProfile -Command "',
+        'Add-Type -AssemblyName System.Windows.Forms;',
+        'Add-Type -AssemblyName System.Drawing;',
+        '$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds;',
+        '$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height);',
+        '$g = [System.Drawing.Graphics]::FromImage($bmp);',
+        '$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size);',
+        '$g.Dispose();',
+        `$bmp.Save('${dest.replace(/'/g, "''")}');`,
+        '$bmp.Dispose();"',
+      ].join(' ');
+    case 'darwin':
+      return `screencapture -x "${dest}"`;
+    default:
+      // Linux / other Unix — xfce4-screenshooter ships with xfce4-goodies
+      // (installed in the desktop Docker image). Falls back to scrot, then
+      // ImageMagick's import for non-XFCE environments.
+      return `xfce4-screenshooter -f -s "${dest}" 2>/dev/null || scrot "${dest}" 2>/dev/null || import -window root "${dest}"`;
+  }
+}
+
+function nativeScreenshot(): string {
+  const dest = path.join(os.tmpdir(), `unity-screenshot-${randomUUID()}.png`);
+  try {
+    execSync(nativeScreenshotCommand(dest), { timeout: 10_000 });
+    const buf = fs.readFileSync(dest);
+    return buf.toString('base64');
+  } finally {
+    try { fs.unlinkSync(dest); } catch (_) { /* already cleaned or never created */ }
+  }
+}
+
+let _screenshotInFlight = 0;
+
 app.post('/screenshot', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  _screenshotInFlight++;
+  const t0 = Date.now();
+  const session = activeSessions.get(sessionId)!;
+  console.log(`[screenshot] START session=${sessionId} mode=${session.mode} in_flight=${_screenshotInFlight}`);
+  try {
+    // Use harness screenshot + transformScreenshot for ALL modes. This ensures the
+    // screenshot coordinate space matches the click coordinate space (both go through
+    // the Playwright page). For desktop mode, this captures the noVNC page which
+    // renders the VM desktop with noVNC's own scaling — the same coordinate space
+    // that page.mouse.click() uses.
+    const connector = session.agent.require(BrowserConnector);
+    const harness = connector.getHarness();
+    const tHarness = Date.now();
+    console.log(`[screenshot] harness_acquired=${tHarness - t0}ms`);
+    const rawImage = await harness.screenshot();
+    const tCapture = Date.now();
+    console.log(`[screenshot] playwright_capture=${tCapture - tHarness}ms`);
+    const image = await connector.transformScreenshot(rawImage);
+    const base64Image = await image.toBase64();
+    const cursorPosition = harness.getCursorPosition();
+    const tEncode = Date.now();
+    console.log(`[screenshot] base64_encode=${tEncode - tCapture}ms b64_len=${base64Image.length} total=${tEncode - t0}ms`);
+
+    cacheScreenshot(sessionId, base64Image, cursorPosition);
+    res.json({ screenshot: base64Image, cursorPosition });
+    _screenshotInFlight--;
+    console.log(`[screenshot] DONE total=${Date.now() - t0}ms in_flight=${_screenshotInFlight}`);
+  } catch (err) {
+    _screenshotInFlight--;
+    console.error(`[screenshot] ERROR after ${Date.now() - t0}ms in_flight=${_screenshotInFlight}:`, err);
+    handleAgentError(err, res, 'screenshot_failed');
+  }
+});
+
+app.post('/screenshot/latest', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  const session = activeSessions.get(sessionId)!;
+  if (session.latestScreenshot) {
+    res.json({ screenshot: session.latestScreenshot, cursorPosition: session.latestCursorPosition });
+  } else {
+    try {
+      const connector = session.agent.require(BrowserConnector);
+      const harness = connector.getHarness();
+      const rawImage = await harness.screenshot();
+      const image = await connector.transformScreenshot(rawImage);
+      const screenshot = await image.toBase64();
+      const cursorPosition = harness.getCursorPosition();
+      cacheScreenshot(sessionId!, screenshot, cursorPosition);
+      res.json({ screenshot, cursorPosition });
+    } catch (err) {
+      handleAgentError(err, res, 'screenshot_failed');
+    }
+  }
+});
+
+app.post('/eval', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId, expression } = req.body;
+  if (!expression) {
+    return res.status(400).json({ error: 'bad_request', message: 'expression is required.' });
+  }
+  try {
+    const session = activeSessions.get(sessionId)!;
+    const harness = session.agent.require(BrowserConnector).getHarness();
+    const result = await harness.page.evaluate(expression);
+    res.json({ result });
+  } catch (err) {
+    handleAgentError(err, res, 'eval_failed');
+  }
+});
+
+app.post('/viewport-info', isAgentReady, async (req: Request, res: Response) => {
   const { sessionId } = req.body;
   try {
     const session = activeSessions.get(sessionId)!;
     const harness = session.agent.require(BrowserConnector).getHarness();
-    const image = await harness.screenshot();
-    const base64Image = await image.toBase64();
-    res.json({ screenshot: base64Image });
+    const page = harness.page;
+
+    const playwrightViewport = page.viewportSize();
+
+    const jsInfo = await page.evaluate(() => ({
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      outerWidth: window.outerWidth,
+      outerHeight: window.outerHeight,
+      devicePixelRatio: window.devicePixelRatio,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      clientWidth: document.documentElement.clientWidth,
+      clientHeight: document.documentElement.clientHeight,
+      screenWidth: window.screen.width,
+      screenHeight: window.screen.height,
+      screenAvailWidth: window.screen.availWidth,
+      screenAvailHeight: window.screen.availHeight,
+    }));
+
+    const screenshotBuffer = await page.screenshot({ type: 'png' });
+    // PNG IHDR: width at bytes 16-19, height at bytes 20-23 (big-endian uint32)
+    const rawScreenshotDims = {
+      width: screenshotBuffer.readUInt32BE(16),
+      height: screenshotBuffer.readUInt32BE(20),
+    };
+
+    console.log(`[viewport-info] mode=${session.mode} playwright=${JSON.stringify(playwrightViewport)} js=${JSON.stringify(jsInfo)} rawScreenshot=${JSON.stringify(rawScreenshotDims)}`);
+
+    res.json({
+      mode: session.mode,
+      playwrightViewport,
+      jsViewport: jsInfo,
+      rawScreenshotDims,
+      rescaledScreenshotDims: {
+        width: Math.round(rawScreenshotDims.width / jsInfo.devicePixelRatio),
+        height: Math.round(rawScreenshotDims.height / jsInfo.devicePixelRatio),
+      },
+    });
   } catch (err) {
-    handleAgentError(err, res, 'screenshot_failed');
+    handleAgentError(err, res, 'viewport_info_failed');
   }
 });
 
@@ -861,6 +1871,7 @@ app.post('/stop', async (req: Request, res: Response) => {
   try {
     await session.agent.stop();
     activeSessions.delete(sessionId);
+    broadcastSessionEvent(sessionId, 'stop');
     res.json({ status: 'stopped' });
     console.log(`BrowserAgent stopped for session ${sessionId}.`);
   } catch (err) {
@@ -879,17 +1890,164 @@ app.post('/interrupt_action', isAgentReady, async (req: Request, res: Response) 
   }
 });
 
+app.post('/pause', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  try {
+    const session = activeSessions.get(sessionId)!;
+    session.agent.pause();
+    res.json({ status: 'paused', message: 'The agent has been paused.' });
+  } catch (err) {
+    handleAgentError(err, res, 'pause_failed');
+  }
+});
+
+app.post('/resume', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  try {
+    const session = activeSessions.get(sessionId)!;
+    session.agent.resume();
+    res.json({ status: 'resumed', message: 'The agent has been resumed.' });
+  } catch (err) {
+    handleAgentError(err, res, 'resume_failed');
+  }
+});
+
+// --- Google Meet endpoints ---
+
+app.post('/googlemeet/join', auth, async (req: Request, res: Response) => {
+  const { meetUrl, displayName } = req.body;
+  if (!meetUrl) {
+    return res.status(400).json({ error: 'bad_request', message: 'meetUrl is required.' });
+  }
+
+  const name = displayName || 'Unity Assistant';
+  const sessionId = randomUUID();
+  const t0 = Date.now();
+  console.log(`[googlemeet/join] BEGIN sessionId=${sessionId} url=${meetUrl}`);
+
+  try {
+    const agent = await startGoogleMeetBrowser(meetUrl);
+
+    const result = await googleMeetJoinFlow(agent, name);
+    console.log(`[googlemeet/join] Join flow completed: status=${result.status}${result.status === 'error' ? ` reason="${result.reason}"` : ''} [${Date.now() - t0}ms]`);
+
+    if (result.status === 'error') {
+      await agent.stop().catch(() => {});
+      return res.status(400).json({
+        error: 'join_failed',
+        reason: result.reason,
+        message: `Could not join Google Meet: ${result.reason}`,
+      });
+    }
+
+    const sessionInfo: GoogleMeetSessionInfo = {
+      agent,
+      status: result.status,
+      meetUrl,
+      displayName: name,
+      createdAt: new Date(),
+      participants: [],
+      activeSpeaker: null,
+      pollIntervalId: null,
+    };
+
+    // Start polling the DOM for meeting state and active speaker
+    sessionInfo.pollIntervalId = setInterval(() => {
+      googleMeetPollState(sessionId).then(() => {
+        const s = googleMeetSessions.get(sessionId);
+        if (s && (s.status === 'ended' || s.status === 'removed' || s.status === 'error')) {
+          if (s.pollIntervalId) clearInterval(s.pollIntervalId);
+          s.pollIntervalId = null;
+          console.log(`[googlemeet] Session ${sessionId} ended (status=${s.status}), polling stopped.`);
+        }
+      });
+    }, 2000);
+
+    googleMeetSessions.set(sessionId, sessionInfo);
+
+    console.log(`[googlemeet/join] DONE sessionId=${sessionId} status=${result.status} [${Date.now() - t0}ms]`);
+    res.json({ status: result.status, sessionId });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    console.error(`[googlemeet/join] EXCEPTION after ${Date.now() - t0}ms: ${message}`, stack ? `\n${stack}` : '');
+    res.status(500).json({ error: 'join_exception', message });
+  }
+});
+
+app.post('/googlemeet/leave', auth, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
+  }
+
+  const session = googleMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
+  }
+
+  try {
+    if (session.pollIntervalId) {
+      clearInterval(session.pollIntervalId);
+      session.pollIntervalId = null;
+    }
+
+    await session.agent.stop();
+    session.status = 'ended';
+    googleMeetSessions.delete(sessionId);
+
+    console.log(`[googlemeet/leave] Session ${sessionId} stopped.`);
+    res.json({ status: 'left' });
+  } catch (err) {
+    console.error(`[googlemeet/leave] Error stopping session ${sessionId}:`, err);
+    googleMeetSessions.delete(sessionId);
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'leave_failed', message });
+  }
+});
+
+app.get('/googlemeet/sessions', auth, async (_req: Request, res: Response) => {
+  const sessions = Array.from(googleMeetSessions.entries()).map(([sessionId, session]) => ({
+    sessionId,
+    meetUrl: session.meetUrl,
+    status: session.status,
+    displayName: session.displayName,
+    createdAt: session.createdAt,
+  }));
+  res.json({ sessions });
+});
+
+app.get('/googlemeet/state', auth, async (req: Request, res: Response) => {
+  const sessionId = req.query.sessionId as string;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId query parameter is required.' });
+  }
+
+  const session = googleMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
+  }
+
+  res.json({
+    status: session.status,
+    meetUrl: session.meetUrl,
+    displayName: session.displayName,
+    createdAt: session.createdAt,
+    participants: session.participants,
+    activeSpeaker: session.activeSpeaker,
+  });
+});
+
 // --- /exec endpoint: Execute shell commands (use /files first to upload files) ---
-// Pass user_session=true for commands that need interactive session (Excel, COM automation)
-app.post('/exec', async (req: Request, res: Response) => {
-  const { command, cwd, timeout, shell_mode, user_session } = req.body;
+app.post('/exec', auth, async (req: Request, res: Response) => {
+  const { command, cwd, timeout, shell_mode } = req.body;
   const execId = randomUUID().slice(0, 8);
 
   if (!command || typeof command !== 'string') {
     return res.status(400).json({ error: 'bad_request', message: 'command is required and must be a string.' });
   }
 
-  const workDir = cwd || UNITY_WORKSPACE_DIR;
+  const workDir = cwd || LOCAL_ROOT;
   const execTimeout = typeof timeout === 'number' && timeout > 0 ? timeout : DEFAULT_EXEC_TIMEOUT;
   const shellMode: ShellMode = shell_mode === 'cmd' ? 'cmd' : 'powershell';
 
@@ -897,16 +2055,8 @@ app.post('/exec', async (req: Request, res: Response) => {
     const resolvedWorkDir = path.resolve(workDir);
     await ensureDir(resolvedWorkDir);
 
-    let result: ExecResult;
-
-    // Use user_session=true for commands that need interactive session (Excel, COM, etc.)
-    if (user_session === true && process.platform === 'win32') {
-      console.log(`[exec] Running in USER SESSION: ${command} (cwd: ${resolvedWorkDir}, execId: ${execId})`);
-      result = await executeCommandInUserSession(command, resolvedWorkDir, execTimeout, execId);
-    } else {
-      console.log(`[exec] Running command: ${command} (cwd: ${resolvedWorkDir}, timeout: ${execTimeout}ms, shell: ${shellMode}, execId: ${execId})`);
-      result = await executeCommand(command, resolvedWorkDir, execTimeout, shellMode);
-    }
+    console.log(`[exec] Running command: ${command} (cwd: ${resolvedWorkDir}, timeout: ${execTimeout}ms, shell: ${shellMode}, execId: ${execId})`);
+    const result = await executeCommand(command, resolvedWorkDir, execTimeout, shellMode);
 
     res.json({
       status: result.exitCode === 0 ? 'success' : 'error',
@@ -916,7 +2066,6 @@ app.post('/exec', async (req: Request, res: Response) => {
       duration: result.duration,
       cwd: resolvedWorkDir,
       execId,
-      userSession: user_session === true,
     });
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -939,7 +2088,7 @@ async function handleFilesJson(req: Request, res: Response) {
     return res.status(400).json({ error: 'bad_request', message: 'action is required.' });
   }
 
-  const baseDir = UNITY_WORKSPACE_DIR;
+  const baseDir = LOCAL_ROOT;
 
   try {
     switch (action) {
@@ -1054,7 +2203,7 @@ async function handleFilesMultipart(req: Request, res: Response) {
     return res.status(400).json({ error: 'bad_request', message: 'No files uploaded.' });
   }
 
-  const baseDir = UNITY_WORKSPACE_DIR;
+  const baseDir = LOCAL_ROOT;
   const savedFiles: string[] = [];
   const errors: string[] = [];
 

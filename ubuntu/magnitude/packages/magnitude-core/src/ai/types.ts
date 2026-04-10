@@ -93,6 +93,7 @@ export interface OpenAIGenericClient {
         baseUrl: string,
         apiKey?: string,
         temperature?: number,
+        promptCaching?: boolean,
         headers?: Record<string, string>
     }
 }
