@@ -7,7 +7,7 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 %INSTALL_DIR%/gui/unify-assistant.py
-Environment=DISPLAY=:0
+Environment=DISPLAY=%DISPLAY%
 Restart=on-failure
 RestartSec=10
 

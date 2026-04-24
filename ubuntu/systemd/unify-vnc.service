@@ -6,8 +6,9 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-Environment=DISPLAY=:0
-ExecStart=/usr/bin/x11vnc -display :0 -nopw -forever -shared -rfbport 5900 -rfbportv6 -1 -noxdamage -nowf -nocursorshape -cursor arrow -nodpms
+Environment=DISPLAY=%DISPLAY%
+EnvironmentFile=%AGENT_SERVICE_DIR%/.env
+ExecStart=/bin/bash -c '/usr/bin/x11vnc -display %DISPLAY% -forever -shared -rfbport 5900 -passwd "$UNIFY_KEY" -rfbportv6 -1 -noxdamage -nowf -nocursorshape -cursor arrow -nodpms'
 ExecStop=/usr/bin/killall x11vnc
 Restart=on-failure
 RestartSec=5

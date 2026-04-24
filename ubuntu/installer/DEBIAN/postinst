@@ -81,17 +81,25 @@ ENVFILE
                 echo "[$(date)] WARNING: setup.sh encountered errors" >&2
             }
 
+            # Detect DISPLAY from display.env (written by start-display.sh) or fall back to :0
+            DISPLAY_ENV="$APP_DIR/logs/display.env"
+            if [ -f "$DISPLAY_ENV" ]; then
+                . "$DISPLAY_ENV"
+            fi
+            DISPLAY="${DISPLAY:-:0}"
+            export DISPLAY
+
             # Start services as the target user (so they can be stopped without root)
             TARGET_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
-            echo "[$(date)] Starting services as $TARGET_USER..."
-            su - "$TARGET_USER" -c "DISPLAY=:0 $SETUP_SCRIPT --start" || {
+            echo "[$(date)] Starting services as $TARGET_USER (DISPLAY=$DISPLAY)..."
+            su - "$TARGET_USER" -c "DISPLAY=$DISPLAY $SETUP_SCRIPT --start" || {
                 echo "[$(date)] WARNING: Service start failed" >&2
             }
 
             # Launch tray app if a display is available
             if [ -f "$APP_DIR/gui/unify-assistant.py" ]; then
                 echo "[$(date)] Launching tray app..."
-                su - "$TARGET_USER" -c "DISPLAY=:0 nohup python3 $APP_DIR/gui/unify-assistant.py &>/dev/null &" || true
+                su - "$TARGET_USER" -c "DISPLAY=$DISPLAY nohup python3 $APP_DIR/gui/unify-assistant.py &>/dev/null &" || true
             fi
 
             echo "[$(date)] Post-install complete."

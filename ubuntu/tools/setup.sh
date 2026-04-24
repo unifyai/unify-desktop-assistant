@@ -645,11 +645,13 @@ setup_systemd_services() {
                 local unit_name
                 unit_name=$(basename "$unit_file")
                 # Substitute template variables
+                local display="${DISPLAY:-:0}"
                 sed \
                     -e "s|%INSTALL_DIR%|$INSTALL_DIR|g" \
                     -e "s|%NOVNC_DIR%|$NOVNC_DIR|g" \
                     -e "s|%AGENT_SERVICE_DIR%|$AGENT_SERVICE_DIR|g" \
                     -e "s|%LOG_DIR%|$LOG_DIR|g" \
+                    -e "s|%DISPLAY%|$display|g" \
                     "$unit_file" > "$target_systemd_dir/$unit_name"
                 echo "  Installed: $unit_name"
             fi
