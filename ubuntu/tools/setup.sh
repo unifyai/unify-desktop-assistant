@@ -793,7 +793,9 @@ start_tunnel() {
         [[ -n "$tunnel_url" ]] && echo "  Public URL: $tunnel_url"
     else
         echo "  WARNING: Tunnel may have failed to start. Check log: $LOG_DIR/rathole.log"
-        [[ -f "$LOG_DIR/rathole.log" ]] && tail -5 "$LOG_DIR/rathole.log" 2>/dev/null | sed 's/^/    /'
+        if [[ -f "$LOG_DIR/rathole.log" ]]; then
+            tail -5 "$LOG_DIR/rathole.log" 2>/dev/null | sed 's/^/    /'
+        fi
     fi
 }
 
@@ -874,7 +876,7 @@ register_desktop() {
     [[ -z "$device_name" ]] && device_name=$(hostname)
 
     local body
-    body=$(printf '{"name": "%s", "url": "%s", "os": "linux"}' "$device_name" "$tunnel_url")
+    body=$(printf '{"name": "%s", "url": "%s", "os": "ubuntu"}' "$device_name" "$tunnel_url")
 
     local resp_file="/tmp/unify_desktop_register.json"
     local http_code
@@ -966,8 +968,12 @@ ENVFILE
     echo "    UNIFY_KEY: $(if [[ -n "$UNIFY_KEY" ]]; then echo '(set)'; else echo '(not set)'; fi)"
     echo "    ORCHESTRA_URL: $ORCHESTRA_URL"
     echo "    UNITY_COMMS_URL: $UNITY_COMMS_URL"
-    [[ -n "$existing_device_id" ]] && echo "    DEVICE_ID: $existing_device_id (preserved)"
-    [[ -n "$existing_tunnel_id" ]] && echo "    TUNNEL_ID: $existing_tunnel_id (preserved)"
+    if [[ -n "$existing_device_id" ]]; then
+        echo "    DEVICE_ID: $existing_device_id (preserved)"
+    fi
+    if [[ -n "$existing_tunnel_id" ]]; then
+        echo "    TUNNEL_ID: $existing_tunnel_id (preserved)"
+    fi
 }
 
 setup_systemd_services() {
