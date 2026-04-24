@@ -44,6 +44,7 @@ DO_UNINSTALL=false
 FORCE=false
 SKIP_APT=false
 NO_START=false
+DEVICE_NAME=""
 
 # =============================================================================
 # Argument Parsing
@@ -62,6 +63,7 @@ Options:
   --uninstall           Stop services, remove systemd units & firewall rules
   --skip-apt            Skip apt-get operations (used by .deb postinst)
   --no-start            Skip starting services at end (used by .deb postinst)
+  --device-name NAME    Friendly device name for registration (default: short hostname)
   --force               Force reinstall all components
   -h, --help            Show this help message
 
@@ -92,6 +94,8 @@ while [[ $# -gt 0 ]]; do
             SKIP_APT=true; shift ;;
         --no-start)
             NO_START=true; shift ;;
+        --device-name)
+            DEVICE_NAME="$2"; shift 2 ;;
         --force)
             FORCE=true; shift ;;
         -h|--help)
@@ -873,7 +877,7 @@ register_desktop() {
         return 1
     fi
 
-    [[ -z "$device_name" ]] && device_name=$(hostname)
+    [[ -z "$device_name" ]] && device_name=$(hostname -s)
 
     local body
     body=$(printf '{"name": "%s", "url": "%s", "os": "ubuntu"}' "$device_name" "$tunnel_url")
@@ -1349,11 +1353,11 @@ if [[ -n "$target_user" && "$target_user" != "root" ]]; then
 fi
 
 # Register tunnel and desktop (always, so config is ready for --start)
-register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" 3000 "" || true
+register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" 3000 "$DEVICE_NAME" || true
 
 tunnel_url=$(get_env_value "TUNNEL_URL")
 if [[ -n "$tunnel_url" ]]; then
-    register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "" "$tunnel_url" || true
+    register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
 fi
 
 # Start services (unless --no-start, e.g. when called from .deb postinst)
