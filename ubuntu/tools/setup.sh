@@ -30,6 +30,9 @@ NOVNC_DIR="$TOOLS_DIR/novnc"
 MAGNITUDE_DIR="$INSTALL_DIR/magnitude"
 AGENT_SERVICE_DIR="$INSTALL_DIR/agent-service"
 LOG_DIR="$INSTALL_DIR/logs"
+RATHOLE_DIR="$INSTALL_DIR/rathole"
+RATHOLE_BIN="$RATHOLE_DIR/rathole"
+RATHOLE_CONFIG="$RATHOLE_DIR/client.toml"
 
 # Default configuration
 UNIFY_KEY=""
@@ -154,6 +157,28 @@ save_dependencies_hash() {
     fi
 }
 
+get_env_value() {
+    local key=$1
+    local env_file="$AGENT_SERVICE_DIR/.env"
+    if [[ -f "$env_file" ]]; then
+        grep -oP "^${key}=\K.*" "$env_file" 2>/dev/null | sed "s/^[\"']//;s/[\"']$//" || true
+    fi
+}
+
+set_env_value() {
+    local key=$1
+    local value=$2
+    local env_file="$AGENT_SERVICE_DIR/.env"
+
+    mkdir -p "$(dirname "$env_file")"
+
+    if [[ -f "$env_file" ]] && grep -q "^${key}=" "$env_file" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$env_file"
+    else
+        echo "${key}=${value}" >> "$env_file"
+    fi
+}
+
 # =============================================================================
 # Fast Mode Detection
 # =============================================================================
@@ -218,6 +243,13 @@ test_fast_mode() {
         all_ok=false
     fi
 
+    if [[ -x "$RATHOLE_BIN" ]]; then
+        echo "  [OK] Rathole" >&2
+    else
+        echo "  [--] Rathole (will install)" >&2
+        all_ok=false
+    fi
+
     $all_ok
 }
 
@@ -228,6 +260,9 @@ test_fast_mode() {
 stop_all_services() {
     echo ""
     echo "=== Stopping Services ==="
+
+    # Stop tunnel first
+    stop_tunnel
 
     # Stop Agent Service (node running agent-service)
     local pids
@@ -285,7 +320,26 @@ uninstall_all() {
     # 1. Stop all services
     stop_all_services
 
-    # 2. Remove systemd user services
+    # 2. Unregister desktop and tunnel from server
+    local unify_key orchestra_url comms_url
+    unify_key=$(get_env_value "UNIFY_KEY")
+    orchestra_url=$(get_env_value "ORCHESTRA_URL")
+    comms_url=$(get_env_value "UNITY_COMMS_URL")
+
+    if [[ -n "$unify_key" ]]; then
+        echo ""
+        echo "Cleaning up remote registrations..."
+        [[ -n "$orchestra_url" ]] && unregister_desktop "$unify_key" "$orchestra_url"
+        [[ -n "$comms_url" ]] && unregister_tunnel "$unify_key" "$comms_url"
+    fi
+
+    # 3. Remove rathole
+    if [[ -d "$RATHOLE_DIR" ]]; then
+        rm -rf "$RATHOLE_DIR"
+        echo "  Removed rathole directory"
+    fi
+
+    # 4. Remove systemd user services
     echo ""
     echo "Removing systemd user services..."
     for svc in unify-vnc unify-websockify unify-agent unify-tray; do
@@ -298,7 +352,7 @@ uninstall_all() {
     done
     systemctl --user daemon-reload 2>/dev/null || true
 
-    # 3. Remove UFW firewall rules (if ufw is available)
+    # 5. Remove UFW firewall rules (if ufw is available)
     if command -v ufw &>/dev/null; then
         echo ""
         echo "Removing firewall rules..."
@@ -306,7 +360,7 @@ uninstall_all() {
         ufw delete allow 3000/tcp 2>/dev/null && echo "  Removed: port 3000 (Agent Service)" || true
     fi
 
-    # 4. Remove autostart desktop entry
+    # 6. Remove autostart desktop entry
     local autostart_file="$HOME/.config/autostart/unify-desktop-assistant.desktop"
     if [[ -f "$autostart_file" ]]; then
         rm -f "$autostart_file"
@@ -596,6 +650,285 @@ install_agent_service() {
 }
 
 # =============================================================================
+# Tunnel & Device Functions
+# =============================================================================
+
+install_rathole() {
+    echo ""
+    echo "=== Installing Rathole ==="
+
+    if [[ -x "$RATHOLE_BIN" ]]; then
+        echo "  Rathole already installed"
+        return
+    fi
+
+    mkdir -p "$RATHOLE_DIR"
+
+    local rathole_version="0.5.0"
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  arch="x86_64-unknown-linux-gnu" ;;
+        aarch64) arch="aarch64-unknown-linux-gnu" ;;
+        *)       echo "  ERROR: Unsupported architecture: $arch" >&2; return 1 ;;
+    esac
+
+    local download_url="https://github.com/rapiz1/rathole/releases/download/v${rathole_version}/rathole-${arch}.zip"
+    local zip_path="/tmp/rathole-${rathole_version}.zip"
+
+    echo "  Downloading rathole v${rathole_version} (${arch})..."
+    curl -fSL -o "$zip_path" "$download_url"
+
+    echo "  Extracting..."
+    unzip -o "$zip_path" -d "$RATHOLE_DIR"
+    chmod +x "$RATHOLE_BIN"
+
+    rm -f "$zip_path"
+
+    if [[ -x "$RATHOLE_BIN" ]]; then
+        echo "  Rathole installed"
+    else
+        echo "  ERROR: Rathole installation failed -- binary not found after extraction" >&2
+        return 1
+    fi
+}
+
+register_tunnel() {
+    local unify_key=$1
+    local comms_url=$2
+    local local_port=${3:-3000}
+    local tunnel_name=${4:-}
+
+    echo ""
+    echo "=== Registering Tunnel ==="
+
+    local existing_id
+    existing_id=$(get_env_value "TUNNEL_ID")
+    if [[ -n "$existing_id" ]]; then
+        echo "  Tunnel already registered: $existing_id"
+        local existing_url
+        existing_url=$(get_env_value "TUNNEL_URL")
+        [[ -n "$existing_url" ]] && echo "  URL: $existing_url"
+        return
+    fi
+
+    local body="{\"local_port\": ${local_port}}"
+    if [[ -n "$tunnel_name" ]]; then
+        body="{\"local_port\": ${local_port}, \"name\": \"${tunnel_name}\"}"
+    fi
+
+    local resp_file="/tmp/unify_tunnel_register.json"
+    local http_code
+    http_code=$(curl -sS -o "$resp_file" -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer ${unify_key}" \
+        -H "Content-Type: application/json" \
+        -d "$body" \
+        "${comms_url}/infra/tunnel/register" || true)
+
+    if [[ "$http_code" != "200" ]]; then
+        echo "  ERROR: Tunnel registration failed (HTTP ${http_code})" >&2
+        [[ -f "$resp_file" ]] && cat "$resp_file" >&2
+        rm -f "$resp_file"
+        return 1
+    fi
+
+    local tunnel_id tunnel_url client_config client_token
+    tunnel_id=$(grep -oP '"tunnel_id"\s*:\s*"\K[^"]+' "$resp_file" || true)
+    tunnel_url=$(grep -oP '"url"\s*:\s*"\K[^"]+' "$resp_file" || true)
+    client_token=$(grep -oP '"client_token"\s*:\s*"\K[^"]+' "$resp_file" || true)
+
+    # client_config is a multi-line TOML string; extract with python/jq if available
+    if command -v python3 &>/dev/null; then
+        client_config=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('client_config',''))" < "$resp_file" 2>/dev/null || true)
+    elif command -v jq &>/dev/null; then
+        client_config=$(jq -r '.client_config // ""' "$resp_file" 2>/dev/null || true)
+    fi
+
+    rm -f "$resp_file"
+
+    set_env_value "TUNNEL_ID" "$tunnel_id"
+    set_env_value "TUNNEL_URL" "$tunnel_url"
+    set_env_value "TUNNEL_TOKEN" "$client_token"
+
+    mkdir -p "$RATHOLE_DIR"
+    if [[ -n "$client_config" ]]; then
+        printf '%s\n' "$client_config" > "$RATHOLE_CONFIG"
+    fi
+
+    echo "  Tunnel registered: $tunnel_id"
+    echo "  Public URL: $tunnel_url"
+}
+
+start_tunnel() {
+    echo ""
+    echo "=== Starting Tunnel ==="
+
+    if [[ ! -x "$RATHOLE_BIN" ]]; then
+        echo "  Rathole not installed, skipping tunnel start"
+        return
+    fi
+
+    if [[ ! -f "$RATHOLE_CONFIG" ]]; then
+        echo "  No tunnel config found, skipping tunnel start"
+        return
+    fi
+
+    if pgrep -f "rathole.*client\.toml" &>/dev/null; then
+        echo "  Tunnel already running (PID $(pgrep -f 'rathole.*client\.toml' | head -1))"
+        return
+    fi
+
+    echo "  Starting rathole tunnel client..."
+    nohup "$RATHOLE_BIN" "$RATHOLE_CONFIG" > "$LOG_DIR/rathole.log" 2>&1 &
+
+    sleep 2
+
+    if pgrep -f "rathole.*client\.toml" &>/dev/null; then
+        local pid
+        pid=$(pgrep -f 'rathole.*client\.toml' | head -1)
+        local tunnel_url
+        tunnel_url=$(get_env_value "TUNNEL_URL")
+        echo "  Tunnel running (PID $pid)"
+        [[ -n "$tunnel_url" ]] && echo "  Public URL: $tunnel_url"
+    else
+        echo "  WARNING: Tunnel may have failed to start. Check log: $LOG_DIR/rathole.log"
+        [[ -f "$LOG_DIR/rathole.log" ]] && tail -5 "$LOG_DIR/rathole.log" 2>/dev/null | sed 's/^/    /'
+    fi
+}
+
+stop_tunnel() {
+    local pids
+    pids=$(pgrep -f "rathole.*client\.toml" 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        echo "$pids" | xargs kill -TERM 2>/dev/null || true
+        echo "  Stopped rathole tunnel"
+    fi
+}
+
+unregister_tunnel() {
+    local unify_key=$1
+    local comms_url=$2
+
+    local tunnel_id
+    tunnel_id=$(get_env_value "TUNNEL_ID")
+    [[ -z "$tunnel_id" ]] && return
+
+    echo "  Deleting tunnel $tunnel_id..."
+
+    local http_code
+    http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        -X DELETE \
+        -H "Authorization: Bearer ${unify_key}" \
+        "${comms_url}/infra/tunnel/${tunnel_id}" || true)
+
+    if [[ "$http_code" == "200" ]]; then
+        echo "  Tunnel deleted from server"
+    else
+        echo "  WARNING: Could not delete tunnel from server (HTTP ${http_code})"
+    fi
+
+    set_env_value "TUNNEL_ID" ""
+    set_env_value "TUNNEL_URL" ""
+    set_env_value "TUNNEL_TOKEN" ""
+
+    rm -f "$RATHOLE_CONFIG"
+}
+
+register_desktop() {
+    local unify_key=$1
+    local orchestra_url=$2
+    local device_name=$3
+    local tunnel_url=$4
+
+    echo ""
+    echo "=== Registering Desktop ==="
+
+    local existing_id
+    existing_id=$(get_env_value "DEVICE_ID")
+    if [[ -n "$existing_id" ]]; then
+        echo "  Desktop already registered: ID=$existing_id"
+        if [[ -n "$tunnel_url" ]]; then
+            echo "  Updating URL to: $tunnel_url"
+            local http_code
+            http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+                -X PATCH \
+                -H "Authorization: Bearer ${unify_key}" \
+                -H "Content-Type: application/json" \
+                -d "{\"url\": \"${tunnel_url}\"}" \
+                "${orchestra_url}/desktop/${existing_id}" || true)
+            if [[ "$http_code" == "200" ]]; then
+                echo "  URL updated"
+            else
+                echo "  WARNING: Could not update desktop URL (HTTP ${http_code})"
+            fi
+        fi
+        return
+    fi
+
+    if [[ -z "$tunnel_url" ]]; then
+        echo "  ERROR: No tunnel URL available for desktop registration" >&2
+        return 1
+    fi
+
+    [[ -z "$device_name" ]] && device_name=$(hostname)
+
+    local body
+    body=$(printf '{"name": "%s", "url": "%s", "os": "linux"}' "$device_name" "$tunnel_url")
+
+    local resp_file="/tmp/unify_desktop_register.json"
+    local http_code
+    http_code=$(curl -sS -o "$resp_file" -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer ${unify_key}" \
+        -H "Content-Type: application/json" \
+        -d "$body" \
+        "${orchestra_url}/desktop" || true)
+
+    if [[ "$http_code" != "200" ]]; then
+        echo "  ERROR: Desktop registration failed (HTTP ${http_code})" >&2
+        [[ -f "$resp_file" ]] && cat "$resp_file" >&2
+        rm -f "$resp_file"
+        return 1
+    fi
+
+    local device_id
+    device_id=$(grep -oP '"id"\s*:\s*"\K[^"]+' "$resp_file" | head -1 || true)
+    rm -f "$resp_file"
+
+    set_env_value "DEVICE_ID" "$device_id"
+
+    echo "  Desktop registered: ID=$device_id"
+    echo "  Name: $device_name"
+    echo "  URL: $tunnel_url"
+}
+
+unregister_desktop() {
+    local unify_key=$1
+    local orchestra_url=$2
+
+    local device_id
+    device_id=$(get_env_value "DEVICE_ID")
+    [[ -z "$device_id" ]] && return
+
+    echo "  Deleting desktop $device_id..."
+
+    local http_code
+    http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        -X DELETE \
+        -H "Authorization: Bearer ${unify_key}" \
+        "${orchestra_url}/desktop/${device_id}" || true)
+
+    if [[ "$http_code" == "200" ]]; then
+        echo "  Desktop deleted from server"
+    else
+        echo "  WARNING: Could not delete desktop from server (HTTP ${http_code})"
+    fi
+
+    set_env_value "DEVICE_ID" ""
+}
+
+# =============================================================================
 # Configuration Functions
 # =============================================================================
 
@@ -604,6 +937,13 @@ setup_agent_service_env() {
     echo "=== Configuring Agent Service ==="
 
     local env_file="$AGENT_SERVICE_DIR/.env"
+
+    # Preserve existing tunnel/device values if .env already exists
+    local existing_tunnel_id existing_tunnel_url existing_tunnel_token existing_device_id
+    existing_tunnel_id=$(get_env_value "TUNNEL_ID")
+    existing_tunnel_url=$(get_env_value "TUNNEL_URL")
+    existing_tunnel_token=$(get_env_value "TUNNEL_TOKEN")
+    existing_device_id=$(get_env_value "DEVICE_ID")
 
     cat > "$env_file" <<ENVFILE
 # Agent Service Environment Configuration
@@ -614,12 +954,20 @@ UNIFY_KEY=$UNIFY_KEY
 ORCHESTRA_URL=$ORCHESTRA_URL
 UNITY_COMMS_URL=$UNITY_COMMS_URL
 PLAYWRIGHT_BROWSERS_PATH=$INSTALL_DIR/browsers
+
+# Tunnel & Device (managed by setup/registration)
+TUNNEL_ID=$existing_tunnel_id
+TUNNEL_URL=$existing_tunnel_url
+TUNNEL_TOKEN=$existing_tunnel_token
+DEVICE_ID=$existing_device_id
 ENVFILE
 
     echo "  .env created"
     echo "    UNIFY_KEY: $(if [[ -n "$UNIFY_KEY" ]]; then echo '(set)'; else echo '(not set)'; fi)"
     echo "    ORCHESTRA_URL: $ORCHESTRA_URL"
     echo "    UNITY_COMMS_URL: $UNITY_COMMS_URL"
+    [[ -n "$existing_device_id" ]] && echo "    DEVICE_ID: $existing_device_id (preserved)"
+    [[ -n "$existing_tunnel_id" ]] && echo "    TUNNEL_ID: $existing_tunnel_id (preserved)"
 }
 
 setup_systemd_services() {
@@ -858,6 +1206,11 @@ start_all_services() {
         echo ""
         echo "  Some services failed to start. Check the log files above for details."
     fi
+
+    # Start tunnel after local services are confirmed up
+    if $all_ok; then
+        start_tunnel
+    fi
 }
 
 # =============================================================================
@@ -874,7 +1227,7 @@ show_summary() {
     echo "  Setup Complete!"
     echo "=========================================="
     echo ""
-    echo "Access URLs:"
+    echo "Local URLs:"
 
     local vnc_url="http://localhost:6080/custom.html"
     if [[ -n "$UNIFY_KEY" ]]; then
@@ -883,6 +1236,25 @@ show_summary() {
 
     echo "  Desktop:       $vnc_url"
     echo "  Agent Service: http://localhost:3000"
+
+    local tunnel_url tunnel_id device_id
+    tunnel_url=$(get_env_value "TUNNEL_URL")
+    tunnel_id=$(get_env_value "TUNNEL_ID")
+    device_id=$(get_env_value "DEVICE_ID")
+
+    if [[ -n "$tunnel_url" ]]; then
+        echo ""
+        echo "Public Access:"
+        echo "  Tunnel URL:  $tunnel_url"
+        echo "  Tunnel ID:   $tunnel_id"
+    fi
+
+    if [[ -n "$device_id" ]]; then
+        echo ""
+        echo "Device Registration:"
+        echo "  Device ID:   $device_id"
+    fi
+
     echo ""
     echo "Time elapsed: ${elapsed} seconds"
     echo ""
@@ -952,6 +1324,7 @@ else
     install_novnc
     install_magnitude
     install_agent_service
+    install_rathole
 fi
 
 # Always run configuration
@@ -967,6 +1340,14 @@ mkdir -p "$LOG_DIR"
 target_user="${SUDO_USER:-$(logname 2>/dev/null || echo "")}"
 if [[ -n "$target_user" && "$target_user" != "root" ]]; then
     chown -R "$target_user":"$(id -gn "$target_user")" "$INSTALL_DIR" 2>/dev/null || true
+fi
+
+# Register tunnel and desktop (always, so config is ready for --start)
+register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" 3000 "" || true
+
+tunnel_url=$(get_env_value "TUNNEL_URL")
+if [[ -n "$tunnel_url" ]]; then
+    register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "" "$tunnel_url" || true
 fi
 
 # Start services (unless --no-start, e.g. when called from .deb postinst)

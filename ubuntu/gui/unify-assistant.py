@@ -82,15 +82,29 @@ def test_port_listening(port: int) -> bool:
         return False
 
 
+def is_tunnel_running() -> bool:
+    """Check if rathole tunnel process is running."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "rathole.*client\\.toml"],
+            capture_output=True, timeout=2,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def get_service_status() -> dict:
     """Get status of all services by checking ports."""
     vnc = test_port_listening(VNC_PORT)
     novnc = test_port_listening(NOVNC_PORT)
     agent = test_port_listening(AGENT_PORT)
+    tunnel = is_tunnel_running()
     return {
         "vnc": vnc,
         "novnc": novnc,
         "agent": agent,
+        "tunnel": tunnel,
         "all_running": vnc and novnc and agent,
         "any_running": vnc or novnc or agent,
     }
@@ -285,6 +299,11 @@ class UnifyTrayApp:
         api_item.connect("activate", self._open_api)
         self.menu.append(api_item)
 
+        # Copy Public URL
+        copy_url_item = Gtk.MenuItem(label="Copy Public URL")
+        copy_url_item.connect("activate", self._copy_public_url)
+        self.menu.append(copy_url_item)
+
         self.menu.append(Gtk.SeparatorMenuItem())
 
         # Settings
@@ -330,6 +349,8 @@ class UnifyTrayApp:
                 status_key = "stopped"
                 status_text = "Stopped"
 
+            tunnel_text = "Connected" if status["tunnel"] else "Disconnected"
+
             # Only update icon when status changes (smarter updates)
             if self.last_status_key != status_key:
                 self.last_status_key = status_key
@@ -337,7 +358,9 @@ class UnifyTrayApp:
                 if icon_path:
                     self.indicator.set_icon_full(icon_path, status_text)
 
-            self.status_item.set_label(f"Status: {status_text}")
+            self.status_item.set_label(
+                f"Services: {status_text} | Tunnel: {tunnel_text}"
+            )
 
         except Exception:
             pass
@@ -389,6 +412,25 @@ class UnifyTrayApp:
     def _open_api(self, _widget):
         """Open the Agent API in the default browser."""
         webbrowser.open(f"http://localhost:{AGENT_PORT}")
+
+    def _copy_public_url(self, _widget):
+        """Copy the tunnel public URL to the clipboard."""
+        tunnel_url = get_env_value("TUNNEL_URL")
+        if tunnel_url:
+            clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            clipboard.set_text(tunnel_url, -1)
+            clipboard.store()
+        else:
+            dialog = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+                text="No Public URL",
+            )
+            dialog.format_secondary_text(
+                "No public URL available. Run setup first to register a tunnel."
+            )
+            dialog.run()
+            dialog.destroy()
 
     def _show_settings(self, _widget):
         """Show the settings dialog."""
@@ -487,6 +529,31 @@ class SettingsDialog(Gtk.Dialog):
         )
         self.txt_comms.set_sensitive(False)
         box.pack_start(self.txt_comms, False, False, 0)
+
+        # --- Device & Tunnel Info (read-only) ---
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        box.pack_start(sep, False, False, 8)
+
+        lbl_device_section = Gtk.Label(xalign=0)
+        lbl_device_section.set_markup("<b>Device &amp; Tunnel:</b>")
+        box.pack_start(lbl_device_section, False, False, 4)
+
+        for label_text, env_key, fallback in [
+            ("Device ID:", "DEVICE_ID", "(not registered)"),
+            ("Tunnel ID:", "TUNNEL_ID", "(not registered)"),
+            ("Public URL:", "TUNNEL_URL", "(not available)"),
+        ]:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            lbl = Gtk.Label(label=label_text, xalign=0)
+            lbl.set_size_request(80, -1)
+            row.pack_start(lbl, False, False, 0)
+            entry = Gtk.Entry()
+            entry.set_text(get_env_value(env_key) or fallback)
+            entry.set_editable(False)
+            entry.set_can_focus(False)
+            entry.set_hexpand(True)
+            row.pack_start(entry, True, True, 0)
+            box.pack_start(row, False, False, 2)
 
         # --- Startup options (always enabled, informational) ---
         chk_startup = Gtk.CheckButton(label="Start on login")
