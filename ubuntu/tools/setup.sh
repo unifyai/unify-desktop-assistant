@@ -899,7 +899,7 @@ register_desktop() {
     fi
 
     local device_id
-    device_id=$(grep -oP '"id"\s*:\s*"\K[^"]+' "$resp_file" | head -1 || true)
+    device_id=$(grep -oP '"id"\s*:\s*\K[^,}\s]+' "$resp_file" | head -1 | tr -d '"' || true)
     rm -f "$resp_file"
 
     set_env_value "DEVICE_ID" "$device_id"
