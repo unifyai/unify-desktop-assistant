@@ -8,7 +8,7 @@ APP_DIR="/opt/unify-desktop-assistant"
 SETUP_SCRIPT="$APP_DIR/tools/setup.sh"
 
 case "$1" in
-    remove|upgrade|deconfigure)
+    remove|deconfigure)
         # Signal tray app to shut down gracefully
         if [ -f "$APP_DIR/gui/unify-assistant.py" ]; then
             touch "$APP_DIR/uninstall.signal" 2>/dev/null || true
@@ -17,7 +17,21 @@ case "$1" in
             pkill -f "unify-assistant.py" 2>/dev/null || true
         fi
 
-        # Stop services via setup.sh
+        # Full uninstall: stop services + unregister tunnel/desktop from server
+        if [ -x "$SETUP_SCRIPT" ]; then
+            "$SETUP_SCRIPT" --uninstall 2>/dev/null || true
+        fi
+        ;;
+
+    upgrade)
+        # Signal tray app to shut down gracefully
+        if [ -f "$APP_DIR/gui/unify-assistant.py" ]; then
+            touch "$APP_DIR/uninstall.signal" 2>/dev/null || true
+            sleep 2
+            pkill -f "unify-assistant.py" 2>/dev/null || true
+        fi
+
+        # Stop services only — keep tunnel/desktop registrations across upgrades
         if [ -x "$SETUP_SCRIPT" ]; then
             "$SETUP_SCRIPT" --stop 2>/dev/null || true
         fi
