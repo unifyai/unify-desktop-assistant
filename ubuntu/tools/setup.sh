@@ -545,6 +545,16 @@ install_magnitude() {
             echo "  Running bun install (includes build via postinstall)..."
             echo "  Using: $bun_exe"
             "$bun_exe" install
+
+            echo "  Installing Patchright + Chromium (this may take a few minutes)..."
+            export PLAYWRIGHT_BROWSERS_PATH="$INSTALL_DIR/browsers"
+            mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
+            if $SKIP_APT; then
+                npx -y patchright install chromium
+            else
+                npx -y patchright install --with-deps chromium
+            fi
+            echo "  Patchright + Chromium installed"
         else
             echo "  ERROR: bun is required for magnitude (packageManager: bun)" >&2
             echo "  Checked: command -v bun, ~/.bun/bin/bun" >&2
@@ -578,15 +588,6 @@ install_agent_service() {
         echo "  Installing npm dependencies..."
         npm install
 
-        echo "  Installing Patchright + Chromium (this may take a few minutes)..."
-        if $SKIP_APT; then
-            # Download browser only — system deps come from .deb Depends or manual install
-            npx -y patchright@1.52.0 install chromium
-        else
-            # Download browser + install system libraries via apt
-            npx -y patchright@1.52.0 install --with-deps chromium
-        fi
-
         save_dependencies_hash "$AGENT_SERVICE_DIR"
         popd >/dev/null
 
@@ -612,6 +613,7 @@ PORT=3000
 UNIFY_KEY=$UNIFY_KEY
 ORCHESTRA_URL=$ORCHESTRA_URL
 UNITY_COMMS_URL=$UNITY_COMMS_URL
+PLAYWRIGHT_BROWSERS_PATH=$INSTALL_DIR/browsers
 ENVFILE
 
     echo "  .env created"
@@ -786,6 +788,7 @@ start_all_services() {
         echo "  Starting Agent Service..."
         (
             cd "$AGENT_SERVICE_DIR"
+            export PLAYWRIGHT_BROWSERS_PATH="$INSTALL_DIR/browsers"
             nohup npx -y ts-node src/index.ts > "$LOG_DIR/agent.log" 2>&1 &
         )
     else
@@ -960,9 +963,10 @@ configure_firewall
 # Create log directory
 mkdir -p "$LOG_DIR"
 
-# Fix ownership if running as sudo
-if [[ -n "${SUDO_USER:-}" ]]; then
-    chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$INSTALL_DIR" 2>/dev/null || true
+# Fix ownership — detect real user even when SUDO_USER isn't set (e.g. dpkg postinst)
+target_user="${SUDO_USER:-$(logname 2>/dev/null || echo "")}"
+if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+    chown -R "$target_user":"$(id -gn "$target_user")" "$INSTALL_DIR" 2>/dev/null || true
 fi
 
 # Start services (unless --no-start, e.g. when called from .deb postinst)

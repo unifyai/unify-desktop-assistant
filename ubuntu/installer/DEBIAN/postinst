@@ -41,6 +41,7 @@ PORT=3000
 UNIFY_KEY=$UNIFY_KEY
 ORCHESTRA_URL=$ORCHESTRA_URL
 UNITY_COMMS_URL=$UNITY_COMMS_URL
+PLAYWRIGHT_BROWSERS_PATH=$APP_DIR/browsers
 ENVFILE
         echo "Agent Service .env configured."
 
@@ -81,6 +82,12 @@ ENVFILE
                 echo "[$(date)] WARNING: setup.sh encountered errors" >&2
             }
 
+            # Ensure install dir is owned by target user (belt-and-suspenders for chown in setup.sh)
+            TARGET_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+            if [ "$TARGET_USER" != "root" ]; then
+                chown -R "$TARGET_USER":"$(id -gn "$TARGET_USER")" "$APP_DIR" 2>/dev/null || true
+            fi
+
             # Detect DISPLAY from display.env (written by start-display.sh) or fall back to :0
             DISPLAY_ENV="$APP_DIR/logs/display.env"
             if [ -f "$DISPLAY_ENV" ]; then
@@ -90,7 +97,6 @@ ENVFILE
             export DISPLAY
 
             # Start services as the target user (so they can be stopped without root)
-            TARGET_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
             echo "[$(date)] Starting services as $TARGET_USER (DISPLAY=$DISPLAY)..."
             su - "$TARGET_USER" -c "DISPLAY=$DISPLAY $SETUP_SCRIPT --start" || {
                 echo "[$(date)] WARNING: Service start failed" >&2
