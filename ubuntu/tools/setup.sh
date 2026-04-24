@@ -752,12 +752,17 @@ start_all_services() {
                 vnc_password=$(grep -oP '^UNIFY_KEY=\K.*' "$AGENT_SERVICE_DIR/.env" 2>/dev/null || true)
             fi
 
-            echo "  Starting x11vnc..."
-            x11vnc -display "$display" -nopw -forever -shared -rfbport 5900 \
-                   ${vnc_password:+-passwd "$vnc_password"} \
-                   -rfbportv6 -1 -noxdamage -nowf -nocursorshape -cursor arrow -nodpms \
-                   -o "$LOG_DIR/x11vnc.log" \
-                   -bg 2>/dev/null || true
+            if [[ -z "$vnc_password" ]]; then
+                echo "  ERROR: Cannot start x11vnc — no VNC password (UNIFY_KEY not set)" >&2
+                echo "  Configure via: sudo setup.sh --unify-key YOUR_KEY" >&2
+            else
+                echo "  Starting x11vnc..."
+                x11vnc -display "$display" -forever -shared -rfbport 5900 \
+                       -passwd "$vnc_password" \
+                       -rfbportv6 -1 -noxdamage -nowf -nocursorshape -cursor arrow -nodpms \
+                       -o "$LOG_DIR/x11vnc.log" \
+                       -bg 2>/dev/null || true
+            fi
         else
             echo "  ERROR: x11vnc not found" >&2
         fi
