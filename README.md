@@ -29,6 +29,6 @@ Each platform folder is **self-contained** with its own copy of `agent-service/`
 
 | Platform | Guide | Install Method |
 |----------|-------|----------------|
-| **Windows** | [windows/README.md](windows/README.md) | Inno Setup installer or PowerShell setup script |
+| **Windows** | [windows/README.md](windows/README.md) | Inno Setup installer |
 | **macOS** | [macos/README.md](macos/README.md) | Shell scripts |
-| **Ubuntu/Linux** | [ubuntu/README.md](ubuntu/README.md) | Debian package (`.deb`) |
+| **Ubuntu/Linux** | [ubuntu/README.md](ubuntu/README.md) | Debian (`.deb`) installer |
