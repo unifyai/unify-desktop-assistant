@@ -78,8 +78,7 @@ jobs:
               exit 1
             }
           }
-          $branch = "${{ github.ref_name }}"
-          $tag = "v${version}-${branch}"
+          $tag = "v$version"
           Write-Host "Version: $version, Tag: $tag"
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
@@ -88,13 +87,17 @@ jobs:
         shell: pwsh
         run: |
           $exe = Get-ChildItem windows/installer/output/*.exe | Select-Object -First 1
-          Move-Item $exe.FullName windows/installer/output/unify-desktop-assistant.exe
+          if ("${{ inputs.environment }}" -eq "staging") {
+            Move-Item $exe.FullName windows/installer/output/unify-desktop-assistant-staging.exe
+          } else {
+            Move-Item $exe.FullName windows/installer/output/unify-desktop-assistant.exe
+          }
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          name: Unify Desktop Assistant ${{ steps.version.outputs.version }} (${{ inputs.environment }})
-          files: windows/installer/output/unify-desktop-assistant.exe
+          name: Unify Desktop Assistant ${{ steps.version.outputs.version }}
+          files: windows/installer/output/unify-desktop-assistant*.exe
           prerelease: ${{ inputs.environment == 'staging' }}
           generate_release_notes: false
