@@ -467,6 +467,21 @@ install_websockify() {
     echo "  websockify installed via pip"
 }
 
+install_rumps() {
+    echo ""
+    echo "=== Installing rumps (tray app) ==="
+
+    if python3 -c "import rumps" &>/dev/null 2>&1; then
+        echo "  rumps already installed"
+        return
+    fi
+
+    pip3 install --break-system-packages rumps 2>/dev/null \
+        || pip3 install rumps
+
+    echo "  rumps installed via pip"
+}
+
 install_novnc() {
     echo ""
     echo "=== Installing noVNC ==="
@@ -1220,6 +1235,7 @@ else
     install_nodejs
     install_bun
     install_websockify
+    install_rumps
 
     # Install main components
     install_novnc
