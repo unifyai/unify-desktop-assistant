@@ -12,10 +12,13 @@ unify-desktop-assistant/
 │   ├── gui/                   # System tray app
 │   ├── installer/             # Inno Setup build files
 │   └── tools/                 # Setup & utility scripts
-├── macos/                     # macOS (shell scripts)
+├── macos/                     # macOS (.pkg installer + tray GUI)
 │   ├── agent-service/
 │   ├── magnitude/
-│   └── *.sh
+│   ├── gui/                   # Menu bar tray app (rumps)
+│   ├── installer/             # .pkg build files
+│   ├── launchd/               # LaunchAgent plist templates
+│   └── tools/                 # Setup & utility scripts
 ├── ubuntu/                    # Ubuntu/Linux (.deb package)
 │   ├── agent-service/
 │   ├── magnitude/
@@ -30,5 +33,5 @@ Each platform folder is **self-contained** with its own copy of `agent-service/`
 | Platform | Guide | Install Method |
 |----------|-------|----------------|
 | **Windows** | [windows/README.md](windows/README.md) | Inno Setup installer |
-| **macOS** | [macos/README.md](macos/README.md) | Shell scripts |
+| **macOS** | [macos/README.md](macos/README.md) | macOS (`.pkg`) installer |
 | **Ubuntu/Linux** | [ubuntu/README.md](ubuntu/README.md) | Debian (`.deb`) installer |
