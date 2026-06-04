@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.unify.agent</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/npx</string>
+		<string>-y</string>
+		<string>ts-node</string>
+		<string>src/index.ts</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>%AGENT_SERVICE_DIR%</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PLAYWRIGHT_BROWSERS_PATH</key>
+		<string>%INSTALL_DIR%/browsers</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<false/>
+
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+
+	<key>StandardOutPath</key>
+	<string>%LOG_DIR%/agent.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>%LOG_DIR%/agent.log</string>
+</dict>
+</plist>
