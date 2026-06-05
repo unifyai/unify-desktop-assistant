@@ -47,6 +47,7 @@ DO_UNINSTALL=false
 FORCE=false
 SKIP_BREW=false
 NO_START=false
+PREREQS_ONLY=false
 DEVICE_NAME=""
 
 # =============================================================================
@@ -66,6 +67,7 @@ Options:
   --uninstall           Stop services, remove launchd agents & cleanup
   --skip-brew           Skip Homebrew operations (used by .pkg postinstall)
   --no-start            Skip starting services at end (used by .pkg postinstall)
+  --prereqs-only        Install prerequisites only (no key required, no config/registration)
   --device-name NAME    Friendly device name for registration (default: short hostname)
   --force               Force reinstall all components
   -h, --help            Show this help message
@@ -97,6 +99,8 @@ while [[ $# -gt 0 ]]; do
             SKIP_BREW=true; shift ;;
         --no-start)
             NO_START=true; shift ;;
+        --prereqs-only)
+            PREREQS_ONLY=true; shift ;;
         --device-name)
             DEVICE_NAME="$2"; shift 2 ;;
         --force)
@@ -239,6 +243,13 @@ test_fast_mode() {
         echo "  [OK] Rathole" >&2
     else
         echo "  [--] Rathole (will install)" >&2
+        all_ok=false
+    fi
+
+    if python3 -c "import rumps" &>/dev/null; then
+        echo "  [OK] rumps" >&2
+    else
+        echo "  [--] rumps (will install)" >&2
         all_ok=false
     fi
 
@@ -1022,17 +1033,20 @@ start_all_services() {
         if [[ -z "$vnc_password" ]]; then
             echo "  ERROR: Cannot start Screen Sharing — no VNC password (UNIFY_KEY not set)" >&2
             echo "  Configure via: sudo setup.sh --unify-key YOUR_KEY" >&2
-        elif [[ -f "$KICKSTART" ]]; then
+        elif [[ ! -f "$KICKSTART" ]]; then
+            echo "  ERROR: kickstart not found — cannot manage Screen Sharing" >&2
+        elif [[ "$EUID" -ne 0 ]]; then
+            echo "  WARNING: Screen Sharing requires root to enable. Run with sudo or enable manually." >&2
+            echo "  Skipping VNC — other services will still start." >&2
+        else
             # Apple VNC passwords are limited to 8 characters
             local vnc_pw_short="${vnc_password:0:8}"
             echo "  Enabling Screen Sharing..."
-            sudo "$KICKSTART" \
+            "$KICKSTART" \
                 -activate -configure -access -on \
                 -clientopts -setvnclegacy -vnclegacy yes \
                 -clientopts -setvncpw -vncpw "$vnc_pw_short" \
                 -restart -agent -privs -all > "$LOG_DIR/screensharing.log" 2>&1 || true
-        else
-            echo "  ERROR: kickstart not found — cannot manage Screen Sharing" >&2
         fi
     else
         echo "  Screen Sharing already running on port 5900"
@@ -1195,6 +1209,31 @@ fi
 # Handle uninstall command
 if $DO_UNINSTALL; then
     uninstall_all
+    exit 0
+fi
+
+# Handle prereqs-only (install dependencies without requiring a key)
+if $PREREQS_ONLY; then
+    echo ""
+    echo "Prerequisites-only mode"
+
+    if [[ "$EUID" -ne 0 ]]; then
+        echo "ERROR: Installation requires root. Run with sudo." >&2
+        exit 1
+    fi
+
+    install_system_deps
+    install_nodejs
+    install_bun
+    install_websockify
+    install_rumps
+    install_novnc
+    install_magnitude
+    install_agent_service
+    install_rathole
+
+    echo ""
+    echo "Prerequisites installed. Run with --unify-key to complete configuration."
     exit 0
 fi
 

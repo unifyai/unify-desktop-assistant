@@ -87,24 +87,33 @@ mkdir -p "$LOG_DIR"
         echo "[$(date)] Node.js $(node --version 2>/dev/null) already >= v22"
     fi
 
-    # Full setup: install deps, configure launchd/autostart, don't start yet
-    echo "[$(date)] Running setup.sh..."
-    SETUP_ARGS="--force --no-start --orchestra-url $ORCHESTRA_URL --unity-comms-url $UNITY_COMMS_URL"
-    if [ -n "$UNIFY_KEY" ]; then
-        SETUP_ARGS="$SETUP_ARGS --unify-key $UNIFY_KEY"
+    # Enable Screen Sharing while we still have root privileges
+    KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+    if [ -f "$KICKSTART" ] && [ -n "$UNIFY_KEY" ]; then
+        VNC_PW_SHORT="$(printf '%s' "$UNIFY_KEY" | cut -c1-8)"
+        echo "[$(date)] Enabling Screen Sharing (root)..."
+        "$KICKSTART" \
+            -activate -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -clientopts -setvncpw -vncpw "$VNC_PW_SHORT" \
+            -restart -agent -privs -all 2>&1 || true
     fi
 
-    # Run setup.sh — needs sudo for Screen Sharing kickstart; key may be empty on first install
+    # Full setup: install deps, configure launchd/autostart, don't start yet
+    echo "[$(date)] Running setup.sh..."
     if [ -n "$UNIFY_KEY" ]; then
-        "$SETUP_SCRIPT" $SETUP_ARGS || {
+        "$SETUP_SCRIPT" --force --no-start \
+            --unify-key "$UNIFY_KEY" \
+            --orchestra-url "$ORCHESTRA_URL" \
+            --unity-comms-url "$UNITY_COMMS_URL" || {
             echo "[$(date)] WARNING: setup.sh encountered errors" >&2
         }
     else
-        echo "[$(date)] No UNIFY_KEY set (first install). Skipping full setup."
+        echo "[$(date)] No UNIFY_KEY set (first install). Installing prerequisites only."
         echo "[$(date)] The tray app will prompt for the API key on first launch."
-
-        # Still install prerequisites so they're ready when the user provides a key
-        "$SETUP_SCRIPT" $SETUP_ARGS --skip-brew 2>&1 || true
+        "$SETUP_SCRIPT" --prereqs-only --force 2>&1 || {
+            echo "[$(date)] WARNING: prereqs-only setup encountered errors" >&2
+        }
     fi
 
     # Ensure install dir is owned by target user
