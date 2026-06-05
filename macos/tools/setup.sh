@@ -678,14 +678,35 @@ install_rathole() {
 
     mkdir -p "$RATHOLE_DIR"
 
+    # Prefer Homebrew: it provides a native binary for both arm64 and x86_64.
+    # (The GitHub release has no aarch64-apple-darwin build — only x86_64.)
+    if ! $SKIP_BREW && command -v brew &>/dev/null; then
+        echo "  Installing rathole via Homebrew..."
+        if brew list rathole &>/dev/null || brew install rathole; then
+            local brew_rathole
+            brew_rathole="$(brew --prefix 2>/dev/null)/bin/rathole"
+            if [[ -x "$brew_rathole" ]]; then
+                ln -sf "$brew_rathole" "$RATHOLE_BIN"
+                echo "  Rathole installed (Homebrew): $brew_rathole"
+                return
+            fi
+        fi
+        echo "  Homebrew rathole install failed, trying direct download..." >&2
+    fi
+
+    # Fallback: direct download. Only x86_64-apple-darwin is published for macOS,
+    # so on Apple Silicon this relies on Rosetta 2.
     local rathole_version="0.5.0"
     local arch
     arch=$(uname -m)
     case "$arch" in
-        x86_64)     arch="x86_64-apple-darwin" ;;
-        arm64)      arch="aarch64-apple-darwin" ;;
-        aarch64)    arch="aarch64-apple-darwin" ;;
-        *)          echo "  ERROR: Unsupported architecture: $arch" >&2; return 1 ;;
+        x86_64)
+            arch="x86_64-apple-darwin" ;;
+        arm64|aarch64)
+            echo "  WARNING: no prebuilt arm64 rathole release; using x86_64 build (requires Rosetta 2)" >&2
+            arch="x86_64-apple-darwin" ;;
+        *)
+            echo "  ERROR: Unsupported architecture: $arch" >&2; return 1 ;;
     esac
 
     local download_url="https://github.com/rapiz1/rathole/releases/download/v${rathole_version}/rathole-${arch}.zip"
