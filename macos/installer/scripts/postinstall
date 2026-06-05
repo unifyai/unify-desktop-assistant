@@ -75,17 +75,9 @@ mkdir -p "$LOG_DIR"
 (
     echo "[$(date)] Starting deferred setup..."
 
-    # Install Node.js v22 if needed (via Homebrew as the real user)
-    NODE_MAJOR=$(node --version 2>/dev/null | sed 's/v\([0-9]*\).*/\1/' || echo "0")
-    if [ "$NODE_MAJOR" -lt 22 ] 2>/dev/null; then
-        echo "[$(date)] Installing Node.js v22 via Homebrew..."
-        su - "$TARGET_USER" -c "brew install node@22 && brew link --overwrite node@22" 2>&1 || {
-            echo "[$(date)] WARNING: Node.js install failed. User may need to install manually." >&2
-        }
-        echo "[$(date)] Node.js: $(node --version 2>/dev/null || echo 'not found')"
-    else
-        echo "[$(date)] Node.js $(node --version 2>/dev/null) already >= v22"
-    fi
+    # Node.js (and all other deps) are installed by setup.sh as the target user.
+    # setup.sh loads Homebrew's shellenv itself, so it works even though this
+    # non-interactive context doesn't source the user's ~/.zshrc.
 
     # Enable Screen Sharing while we still have root privileges
     KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"

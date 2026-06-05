@@ -119,6 +119,19 @@ echo "  Unify Desktop Assistant Setup (macOS)"
 echo "=========================================="
 echo ""
 
+# Ensure Homebrew (and tools it installs: node/bun/npx/pip3) are on PATH.
+# When invoked via `su - <user> -c ...` (e.g. from the .pkg postinstall), the
+# shell is non-interactive and does NOT source ~/.zshrc, so a brew shellenv
+# placed there is missed. Load it explicitly from the known locations.
+for _brew_bin in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [[ -x "$_brew_bin" ]]; then
+        eval "$("$_brew_bin" shellenv)" 2>/dev/null || true
+        break
+    fi
+done
+# Make user-local bun visible too (curl-installer fallback target).
+[[ -d "$HOME/.bun/bin" ]] && export PATH="$HOME/.bun/bin:$PATH"
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -1236,6 +1249,10 @@ if $PREREQS_ONLY; then
     install_magnitude
     install_agent_service
     install_rathole
+
+    # Install + launch the tray so the user can enter their API key via its
+    # first-run dialog (the tray runs without a key — shows "stopped").
+    setup_autostart
 
     echo ""
     echo "Prerequisites installed. Run with --unify-key to complete configuration."
