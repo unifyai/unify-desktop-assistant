@@ -284,15 +284,10 @@ stop_all_services() {
 
     # Note: macOS Screen Sharing (system service on 5900) is left running here.
     # It requires root to toggle and is only disabled on full uninstall.
-
-    # Unload launchd agents if loaded
-    for agent in com.unify.websockify com.unify.agent com.unify.tray; do
-        if launchctl list "$agent" &>/dev/null 2>&1; then
-            launchctl bootout "gui/$(id -u)/$agent" 2>/dev/null || \
-                launchctl unload "$HOME/Library/LaunchAgents/${agent}.plist" 2>/dev/null || true
-            echo "  Unloaded: $agent"
-        fi
-    done
+    #
+    # The tray launchd agent (com.unify.tray) is intentionally NOT unloaded here —
+    # the tray itself calls --stop, so unloading it would kill the menu-bar app.
+    # The tray agent is only removed on full uninstall.
 
     # Final sweep: kill processes on target ports
     for port in 6080 3000; do
@@ -356,11 +351,19 @@ uninstall_all() {
     # 4. Remove launchd agents
     echo ""
     echo "Removing launchd agents..."
-    for agent in com.unify.websockify com.unify.agent com.unify.tray; do
-        local plist="$HOME/Library/LaunchAgents/${agent}.plist"
+    # Resolve the real user (uninstall is run via sudo, so $HOME/id -u are root's)
+    local tgt_user tgt_home tgt_uid
+    tgt_user="${SUDO_USER:-$USER}"
+    tgt_home=$(eval echo "~$tgt_user")
+    tgt_uid=$(id -u "$tgt_user" 2>/dev/null || echo "")
+
+    for agent in com.unify.tray; do
+        local plist="$tgt_home/Library/LaunchAgents/${agent}.plist"
         if [[ -f "$plist" ]]; then
-            launchctl bootout "gui/$(id -u)/$agent" 2>/dev/null || \
-                launchctl unload "$plist" 2>/dev/null || true
+            if [[ -n "$tgt_uid" ]]; then
+                launchctl bootout "gui/$tgt_uid/$agent" 2>/dev/null || \
+                    launchctl unload "$plist" 2>/dev/null || true
+            fi
             rm -f "$plist"
             echo "  Removed: $agent"
         fi
@@ -973,52 +976,43 @@ ENVFILE
     fi
 }
 
-setup_launchd_agents() {
-    echo ""
-    echo "=== Setting up launchd agents ==="
-
-    local launchd_dir="$INSTALL_DIR/launchd"
-    local target_dir="$HOME/Library/LaunchAgents"
-    mkdir -p "$target_dir"
-
-    if [[ -d "$launchd_dir" ]]; then
-        for plist_file in "$launchd_dir"/*.plist; do
-            if [[ -f "$plist_file" ]]; then
-                local plist_name
-                plist_name=$(basename "$plist_file")
-                sed \
-                    -e "s|%INSTALL_DIR%|$INSTALL_DIR|g" \
-                    -e "s|%NOVNC_DIR%|$NOVNC_DIR|g" \
-                    -e "s|%AGENT_SERVICE_DIR%|$AGENT_SERVICE_DIR|g" \
-                    -e "s|%LOG_DIR%|$LOG_DIR|g" \
-                    "$plist_file" > "$target_dir/$plist_name"
-                echo "  Installed: $plist_name"
-            fi
-        done
-    else
-        echo "  No launchd templates found (will be added in a future phase)"
-    fi
-
-    echo "  launchd agents configured"
-}
-
 setup_autostart() {
     echo ""
-    echo "=== Setting up autostart ==="
+    echo "=== Setting up autostart (tray app) ==="
 
+    local template="$INSTALL_DIR/launchd/com.unify.tray.plist"
     local target_dir="$HOME/Library/LaunchAgents"
     local tray_plist="$target_dir/com.unify.tray.plist"
 
     mkdir -p "$target_dir"
 
-    if [[ -f "$INSTALL_DIR/launchd/com.unify.tray.plist" ]]; then
-        sed \
-            -e "s|%INSTALL_DIR%|$INSTALL_DIR|g" \
-            -e "s|%LOG_DIR%|$LOG_DIR|g" \
-            "$INSTALL_DIR/launchd/com.unify.tray.plist" > "$tray_plist"
-        echo "  Autostart plist created: $tray_plist"
+    if [[ ! -f "$template" ]]; then
+        echo "  WARNING: tray plist template not found at $template" >&2
+        return
+    fi
+
+    # Resolve the user's python3 (has rumps installed); fall back to system python.
+    local python_bin
+    python_bin=$(command -v python3 || echo /usr/bin/python3)
+
+    sed \
+        -e "s|%PYTHON%|$python_bin|g" \
+        -e "s|%INSTALL_DIR%|$INSTALL_DIR|g" \
+        -e "s|%LOG_DIR%|$LOG_DIR|g" \
+        "$template" > "$tray_plist"
+    echo "  Autostart plist created: $tray_plist"
+
+    # (Re)load the tray agent so it starts now and at every login.
+    if [[ "$EUID" -ne 0 ]]; then
+        local domain="gui/$(id -u)"
+        launchctl bootout "$domain/com.unify.tray" 2>/dev/null || true
+        if launchctl bootstrap "$domain" "$tray_plist" 2>/dev/null; then
+            echo "  Tray agent loaded (will start at login)"
+        else
+            echo "  Tray agent will load at next login"
+        fi
     else
-        echo "  No tray plist template found (will be added in a future phase)"
+        echo "  Skipping launchctl load (running as root) — tray loads at next user login"
     fi
 }
 
@@ -1297,7 +1291,6 @@ fi
 
 # Always run configuration
 setup_agent_service_env
-setup_launchd_agents
 setup_autostart
 
 # Create log directory

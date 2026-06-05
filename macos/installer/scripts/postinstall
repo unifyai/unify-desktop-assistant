@@ -131,10 +131,12 @@ mkdir -p "$LOG_DIR"
         }
     fi
 
-    # Launch tray app
-    if [ -f "$APP_DIR/gui/unify-assistant.py" ]; then
-        echo "[$(date)] Launching tray app..."
-        su - "$TARGET_USER" -c "nohup python3 $APP_DIR/gui/unify-assistant.py &>/dev/null &" || true
+    # Tray app: setup.sh (run as the user above) installs and bootstraps the
+    # launchd agent. Nudge it to start now; otherwise it loads at next login.
+    TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || echo "")"
+    if [ -n "$TARGET_UID" ]; then
+        echo "[$(date)] Starting tray app via launchd..."
+        su - "$TARGET_USER" -c "launchctl kickstart -k gui/$TARGET_UID/com.unify.tray" 2>/dev/null || true
     fi
 
     echo "[$(date)] Post-install complete."

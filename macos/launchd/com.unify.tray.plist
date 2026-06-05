@@ -7,7 +7,7 @@
 
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/python3</string>
+		<string>%PYTHON%</string>
 		<string>%INSTALL_DIR%/gui/unify-assistant.py</string>
 	</array>
 
