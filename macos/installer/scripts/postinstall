@@ -99,24 +99,28 @@ mkdir -p "$LOG_DIR"
             -restart -agent -privs -all 2>&1 || true
     fi
 
-    # Full setup: install deps, configure launchd/autostart, don't start yet
-    echo "[$(date)] Running setup.sh..."
+    # Hand ownership of the install dir to the target user BEFORE running setup,
+    # so the user-context install (Homebrew/npm/bun/pip) can write into it.
+    chown -R "$TARGET_USER" "$APP_DIR" 2>/dev/null || true
+
+    # Full setup runs as the target user — Homebrew/npm/bun refuse to run as root.
+    echo "[$(date)] Running setup.sh as $TARGET_USER..."
     if [ -n "$UNIFY_KEY" ]; then
-        "$SETUP_SCRIPT" --force --no-start \
-            --unify-key "$UNIFY_KEY" \
-            --orchestra-url "$ORCHESTRA_URL" \
-            --unity-comms-url "$UNITY_COMMS_URL" || {
+        su - "$TARGET_USER" -c "'$SETUP_SCRIPT' --force --no-start \
+            --unify-key '$UNIFY_KEY' \
+            --orchestra-url '$ORCHESTRA_URL' \
+            --unity-comms-url '$UNITY_COMMS_URL'" || {
             echo "[$(date)] WARNING: setup.sh encountered errors" >&2
         }
     else
         echo "[$(date)] No UNIFY_KEY set (first install). Installing prerequisites only."
         echo "[$(date)] The tray app will prompt for the API key on first launch."
-        "$SETUP_SCRIPT" --prereqs-only --force 2>&1 || {
+        su - "$TARGET_USER" -c "'$SETUP_SCRIPT' --prereqs-only --force" 2>&1 || {
             echo "[$(date)] WARNING: prereqs-only setup encountered errors" >&2
         }
     fi
 
-    # Ensure install dir is owned by target user
+    # Re-assert ownership (root-owned files may have appeared during setup)
     chown -R "$TARGET_USER" "$APP_DIR" 2>/dev/null || true
 
     # Start services as the target user (only if key is configured)

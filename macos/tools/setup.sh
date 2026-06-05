@@ -1217,8 +1217,10 @@ if $PREREQS_ONLY; then
     echo ""
     echo "Prerequisites-only mode"
 
-    if [[ "$EUID" -ne 0 ]]; then
-        echo "ERROR: Installation requires root. Run with sudo." >&2
+    # macOS: install must run as the regular user — Homebrew/npm/bun refuse to run as root.
+    if [[ "$EUID" -eq 0 ]]; then
+        echo "ERROR: Do not run the install as root — Homebrew cannot run as root." >&2
+        echo "Run as your normal user (the .pkg installer handles this automatically)." >&2
         exit 1
     fi
 
@@ -1263,9 +1265,10 @@ else
     echo ""
     echo "Full install mode"
 
-    # Check root for installation (some macOS operations require sudo)
-    if [[ "$EUID" -ne 0 ]]; then
-        echo "ERROR: Installation requires root. Run with sudo." >&2
+    # macOS: install must run as the regular user — Homebrew/npm/bun refuse to run as root.
+    if [[ "$EUID" -eq 0 ]]; then
+        echo "ERROR: Do not run the install as root — Homebrew cannot run as root." >&2
+        echo "Run as your normal user (the .pkg installer handles this automatically)." >&2
         exit 1
     fi
 
@@ -1290,12 +1293,6 @@ setup_autostart
 
 # Create log directory
 mkdir -p "$LOG_DIR"
-
-# Fix ownership — ensure real user owns the install dir when running via sudo
-target_user="${SUDO_USER:-$USER}"
-if [[ -n "$target_user" && "$target_user" != "root" ]]; then
-    chown -R "$target_user" "$INSTALL_DIR" 2>/dev/null || true
-fi
 
 # Register tunnel and desktop (always, so config is ready for --start)
 register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" 3000 "$DEVICE_NAME" || true
