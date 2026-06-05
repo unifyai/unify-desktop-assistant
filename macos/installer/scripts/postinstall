@@ -20,6 +20,7 @@ echo "[postinstall] Configuring Unify Desktop Assistant..."
 # $USER is root during pkg install; console user is the real one
 TARGET_USER="$(stat -f '%Su' /dev/console 2>/dev/null || echo "${SUDO_USER:-$USER}")"
 TARGET_HOME="$(eval echo "~$TARGET_USER")"
+TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || echo "")"
 
 # Load baked URLs from environment.conf
 ENV_CONF="$APP_DIR/environment.conf"
@@ -51,6 +52,29 @@ fi
 
 # Use existing key if present (upgrade), otherwise leave blank (first-run dialog will prompt)
 UNIFY_KEY="${EXISTING_UNIFY_KEY:-}"
+
+# Fresh install with no key: prompt the logged-in user via a native dialog.
+# Runs in the user's GUI session (launchctl asuser). Falls back to keyless if
+# headless (e.g. `sudo installer` over SSH), cancelled, or left blank — in which
+# case the menu-bar app prompts for the key on first launch.
+if [ -z "$UNIFY_KEY" ] && [ -n "$TARGET_UID" ] && [ "$TARGET_USER" != "root" ]; then
+    echo "[postinstall] Prompting for Unify API Key..."
+    PROMPT_SCRIPT='try
+set r to display dialog "Enter your Unify API Key to finish setup.
+
+Leave blank or click Skip to configure later from the menu-bar app." default answer "" with title "Unify Desktop Assistant" with icon note buttons {"Skip", "Continue"} default button "Continue"
+if button returned of r is "Continue" then
+return text returned of r
+end if
+end try'
+    UNIFY_KEY="$(launchctl asuser "$TARGET_UID" sudo -u "$TARGET_USER" /usr/bin/osascript -e "$PROMPT_SCRIPT" 2>/dev/null || true)"
+    UNIFY_KEY="$(printf '%s' "$UNIFY_KEY" | tr -d '\r\n')"
+    if [ -n "$UNIFY_KEY" ]; then
+        echo "[postinstall] API key provided — will complete full setup (services + Screen Sharing)."
+    else
+        echo "[postinstall] No key entered — installing prerequisites only."
+    fi
+fi
 
 cat > "$ENV_FILE" <<ENVFILE
 # Agent Service Environment Configuration
@@ -125,7 +149,6 @@ mkdir -p "$LOG_DIR"
 
     # Tray app: setup.sh (run as the user above) installs and bootstraps the
     # launchd agent. Nudge it to start now; otherwise it loads at next login.
-    TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || echo "")"
     if [ -n "$TARGET_UID" ]; then
         echo "[$(date)] Starting tray app via launchd..."
         su - "$TARGET_USER" -c "launchctl kickstart -k gui/$TARGET_UID/com.unify.tray" 2>/dev/null || true
