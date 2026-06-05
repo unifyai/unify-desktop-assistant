@@ -282,15 +282,8 @@ stop_all_services() {
         echo "  Stopped websockify"
     fi
 
-    # Disable macOS Screen Sharing (VNC on 5900)
-    if [[ -f "$KICKSTART" ]]; then
-        echo "  Disabling Screen Sharing..."
-        sudo "$KICKSTART" -deactivate -stop 2>/dev/null || true
-        sudo "$KICKSTART" -configure -access -off 2>/dev/null || true
-        sudo "$KICKSTART" -configure -clientopts -setvnclegacy -vnclegacy no 2>/dev/null || true
-        sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
-        echo "  Screen Sharing disabled"
-    fi
+    # Note: macOS Screen Sharing (system service on 5900) is left running here.
+    # It requires root to toggle and is only disabled on full uninstall.
 
     # Unload launchd agents if loaded
     for agent in com.unify.websockify com.unify.agent com.unify.tray; do
@@ -324,6 +317,22 @@ uninstall_all() {
 
     # 1. Stop all services
     stop_all_services
+
+    # 1b. Disable macOS Screen Sharing (system service — requires root)
+    if [[ -f "$KICKSTART" ]]; then
+        if [[ "$EUID" -eq 0 ]]; then
+            echo ""
+            echo "Disabling Screen Sharing..."
+            "$KICKSTART" -deactivate -stop 2>/dev/null || true
+            "$KICKSTART" -configure -access -off 2>/dev/null || true
+            "$KICKSTART" -configure -clientopts -setvnclegacy -vnclegacy no 2>/dev/null || true
+            launchctl unload -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+            echo "  Screen Sharing disabled"
+        else
+            echo ""
+            echo "  WARNING: Screen Sharing requires root to disable. Run: sudo setup.sh --uninstall" >&2
+        fi
+    fi
 
     # 2. Unregister desktop and tunnel from server
     local unify_key orchestra_url comms_url
