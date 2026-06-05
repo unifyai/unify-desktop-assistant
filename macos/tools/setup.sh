@@ -65,7 +65,7 @@ Options:
   --start               Start services only (no install/config, no root needed)
   --stop                Stop all services
   --uninstall           Stop services, remove launchd agents & cleanup
-  --skip-brew           Skip Homebrew operations (used by .pkg postinstall)
+  --skip-brew           Skip Homebrew operations (assume deps are pre-installed)
   --no-start            Skip starting services at end (used by .pkg postinstall)
   --prereqs-only        Install prerequisites only (no key required, no config/registration)
   --device-name NAME    Friendly device name for registration (default: short hostname)
