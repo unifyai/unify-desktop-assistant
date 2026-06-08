@@ -47,6 +47,16 @@ export class CursorVisual {
         }
     }
 
+    async ensureDrawn(): Promise<void> {
+        if (this.lastPosition) {
+            await this._drawVisual(this.lastPosition.x, this.lastPosition.y, false);
+        }
+    }
+
+    getLastPosition(): { x: number; y: number } | null {
+        return this.lastPosition;
+    }
+
     // Internal method to handle the actual drawing logic
     private async _drawVisual(x: number, y: number, showClickEffect: boolean): Promise<void> {
         try {

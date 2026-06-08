@@ -94,6 +94,15 @@ export class AgentMemory {
         return messages;
     }
 
+    public get observationCount(): number {
+        return this.observations.length;
+    }
+
+    public getObservationsSlice(startIndex: number): Observation[] {
+        return this.observations.slice(startIndex);
+    }
+
+
     public isEmpty(): boolean {
         return this.observations.length === 0;
     }
