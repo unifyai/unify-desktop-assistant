@@ -50,6 +50,7 @@ NO_START=false
 PREREQS_ONLY=false
 DEVICE_NAME=""
 SET_VNC_PW=""
+RECONFIGURE=false
 
 # =============================================================================
 # Argument Parsing
@@ -69,6 +70,7 @@ Options:
   --skip-brew           Skip Homebrew operations (assume deps are pre-installed)
   --no-start            Skip starting services at end (used by .pkg postinstall)
   --prereqs-only        Install prerequisites only (no key required, no config/registration)
+  --reconfigure         Re-apply key + re-register + restart services (no deps, no autostart)
   --set-vnc-password K  (root) Enable Screen Sharing and set the VNC password from K
   --device-name NAME    Friendly device name for registration (default: short hostname)
   --force               Force reinstall all components
@@ -103,6 +105,8 @@ while [[ $# -gt 0 ]]; do
             NO_START=true; shift ;;
         --prereqs-only)
             PREREQS_ONLY=true; shift ;;
+        --reconfigure)
+            RECONFIGURE=true; shift ;;
         --set-vnc-password)
             SET_VNC_PW="$2"; shift 2 ;;
         --device-name)
@@ -517,16 +521,23 @@ uninstall_all() {
     fi
 
     # 7. Remove the install directory.
-    # This script is executing from inside $INSTALL_DIR/tools, so deleting the
-    # directory now could truncate the running script. Defer the rm to a detached
-    # process that runs once this script has exited. Guarded to the expected path
-    # so a misconfigured INSTALL_DIR can never trigger a destructive delete.
+    # This script is executing from inside $INSTALL_DIR/tools, so a plain `rm`
+    # could truncate the still-running script. We instead `exec` a tiny in-memory
+    # shell (program text comes from -c, not a file in $INSTALL_DIR) as the LAST
+    # step: exec replaces this process image, releasing the on-disk script, then
+    # removes the directory synchronously. Doing it synchronously (rather than a
+    # detached background job) is essential because the tray runs uninstall via
+    # `osascript … with administrator privileges`, whose privileged context reaps
+    # any backgrounded child before it can run — which is why the old deferred
+    # delete worked from the CLI but left folders behind from the tray.
+    # Guarded to the expected path so a misconfigured INSTALL_DIR can never
+    # trigger a destructive delete.
     echo ""
     if [[ "$EUID" -eq 0 && "$INSTALL_DIR" == "/opt/unify-desktop-assistant" && -d "$INSTALL_DIR" ]]; then
         echo "Removing $INSTALL_DIR..."
-        nohup bash -c "sleep 2; rm -rf '$INSTALL_DIR'" >/dev/null 2>&1 &
-        disown 2>/dev/null || true
-        echo "  Scheduled (completes a moment after this script exits)."
+        echo ""
+        echo "Uninstall complete. Unify Desktop Assistant has been fully removed."
+        exec /bin/bash -c "rm -rf '$INSTALL_DIR'"
     elif [[ -d "$INSTALL_DIR" ]]; then
         echo "To finish removal, run: sudo rm -rf $INSTALL_DIR" >&2
     fi
@@ -1389,6 +1400,44 @@ show_summary() {
 if [[ -n "$SET_VNC_PW" ]]; then
     do_set_vnc_password "$SET_VNC_PW"
     exit $?
+fi
+
+# Handle reconfigure (lightweight key update: re-apply key + re-register +
+# restart services). Used by the tray when the API key changes. It deliberately
+# skips dependency installs AND setup_autostart — touching the tray launchd agent
+# from inside the tray's own job would bootout (kill) the running menu-bar app.
+if $RECONFIGURE; then
+    echo ""
+    echo "Reconfigure mode"
+
+    if [[ -z "$UNIFY_KEY" ]]; then
+        echo "ERROR: --reconfigure requires --unify-key" >&2
+        exit 1
+    fi
+
+    # Run as the regular user (registration writes the user-owned .env; matches --start).
+    if [[ "$EUID" -eq 0 ]]; then
+        echo "ERROR: Do not run --reconfigure as root." >&2
+        exit 1
+    fi
+
+    # Rewrite .env with the new key (preserves TUNNEL_*/DEVICE_ID).
+    setup_agent_service_env
+
+    # Stop running services so they restart with the new key in memory.
+    stop_all_services
+
+    mkdir -p "$LOG_DIR"
+
+    # Re-register tunnel + desktop with the new key.
+    register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" 3000 "$DEVICE_NAME" || true
+    tunnel_url=$(get_env_value "TUNNEL_URL")
+    if [[ -n "$tunnel_url" ]]; then
+        register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
+    fi
+
+    start_all_services
+    exit 0
 fi
 
 # Handle start command (just start services, no install/config - no root needed)
