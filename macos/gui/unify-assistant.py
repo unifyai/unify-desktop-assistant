@@ -406,22 +406,15 @@ class UnifyTrayApp(rumps.App):
     def _enable_screen_sharing(self, key: str):
         """Enable Apple Screen Sharing (VNC) via an admin prompt.
 
-        kickstart requires root, which the tray (a user-context agent) lacks,
-        so we elevate with a single native authentication dialog via osascript.
+        Enabling Screen Sharing and setting the VNC password require root, which
+        the tray (a user-context agent) lacks, so we elevate with a single native
+        authentication dialog via osascript. The heavy lifting lives in
+        `setup.sh --set-vnc-password`, which writes the VNC password reliably
+        (kickstart -setvncpw is unreliable on macOS 13+).
         """
-        kickstart = (
-            "/System/Library/CoreServices/RemoteManagement/"
-            "ARDAgent.app/Contents/Resources/kickstart"
-        )
-        if not os.path.exists(kickstart):
+        if not SETUP_SCRIPT.exists():
             return
-        vnc_pw = key[:8]  # Apple VNC passwords are limited to 8 characters
-        shell_cmd = (
-            f"'{kickstart}' -activate -configure -access -on "
-            f"-clientopts -setvnclegacy -vnclegacy yes "
-            f"-clientopts -setvncpw -vncpw '{vnc_pw}' "
-            f"-restart -agent -privs -all"
-        )
+        shell_cmd = f"'{SETUP_SCRIPT}' --set-vnc-password '{key}'"
         applescript = (
             f'do shell script "{shell_cmd}" with administrator privileges'
         )

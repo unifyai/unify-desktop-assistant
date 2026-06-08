@@ -114,13 +114,11 @@ mkdir -p "$LOG_DIR"
     # persists across logins).
     KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
     if [ -f "$KICKSTART" ] && [ -n "$UNIFY_KEY" ] && [ -n "$TARGET_UID" ]; then
-        VNC_PW_SHORT="$(printf '%s' "$UNIFY_KEY" | cut -c1-8)"
         echo "[$(date)] Enabling Screen Sharing (in $TARGET_USER's session)..."
-        launchctl asuser "$TARGET_UID" "$KICKSTART" \
-            -activate -configure -access -on \
-            -clientopts -setvnclegacy -vnclegacy yes \
-            -clientopts -setvncpw -vncpw "$VNC_PW_SHORT" \
-            -restart -agent -privs -all 2>&1 || true
+        # Run as root within the user's GUI session so port 5900 binds. setup.sh
+        # --set-vnc-password enables Screen Sharing and writes the VNC password via
+        # the settings file (reliable, unlike kickstart -setvncpw on macOS 13+).
+        launchctl asuser "$TARGET_UID" "$SETUP_SCRIPT" --set-vnc-password "$UNIFY_KEY" 2>&1 || true
     fi
 
     # Hand ownership of the install dir to the target user BEFORE running setup,

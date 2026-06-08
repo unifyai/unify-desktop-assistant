@@ -49,6 +49,7 @@ SKIP_BREW=false
 NO_START=false
 PREREQS_ONLY=false
 DEVICE_NAME=""
+SET_VNC_PW=""
 
 # =============================================================================
 # Argument Parsing
@@ -68,6 +69,7 @@ Options:
   --skip-brew           Skip Homebrew operations (assume deps are pre-installed)
   --no-start            Skip starting services at end (used by .pkg postinstall)
   --prereqs-only        Install prerequisites only (no key required, no config/registration)
+  --set-vnc-password K  (root) Enable Screen Sharing and set the VNC password from K
   --device-name NAME    Friendly device name for registration (default: short hostname)
   --force               Force reinstall all components
   -h, --help            Show this help message
@@ -101,6 +103,8 @@ while [[ $# -gt 0 ]]; do
             NO_START=true; shift ;;
         --prereqs-only)
             PREREQS_ONLY=true; shift ;;
+        --set-vnc-password)
+            SET_VNC_PW="$2"; shift 2 ;;
         --device-name)
             DEVICE_NAME="$2"; shift 2 ;;
         --force)
@@ -217,6 +221,78 @@ get_env_value() {
     if [[ -f "$env_file" ]]; then
         grep -E "^${key}=" "$env_file" 2>/dev/null | sed "s/^${key}=//;s/^[\"']//;s/[\"']$//" || true
     fi
+}
+
+# -----------------------------------------------------------------------------
+# VNC password (legacy Screen Sharing) management
+#
+# `kickstart -setvncpw` is unreliable on macOS 13+ (it frequently mangles the
+# stored password, so clients fall back to macOS-account auth — the "enter your
+# Mac username + password" prompt). The robust approach is to write the password
+# file ourselves: /Library/Preferences/com.apple.VNCSettings.txt holds 32 hex
+# chars — each of the (<=8) password bytes XOR'd against Apple's fixed 16-byte
+# key. Implemented in pure bash (no perl/python dependency).
+# -----------------------------------------------------------------------------
+VNC_SETTINGS_FILE="/Library/Preferences/com.apple.VNCSettings.txt"
+VNC_FIXED_KEY="REDACTED"
+
+vnc_password_hash() {
+    local pw="${1:0:8}"
+    local out="" i kb pc
+    for (( i = 0; i < 16; i++ )); do
+        kb=$((16#${VNC_FIXED_KEY:$((i * 2)):2}))
+        if (( i < ${#pw} )); then
+            pc=$(printf '%d' "'${pw:$i:1}")
+        else
+            pc=0
+        fi
+        out+=$(printf '%02X' $(( kb ^ (pc & 255) )))
+    done
+    printf '%s' "$out"
+}
+
+write_vnc_password() {
+    # Requires root. Writes the VNC password hash file with safe perms.
+    local pw="$1"
+    if [[ "$EUID" -ne 0 ]]; then
+        echo "  ERROR: setting the VNC password requires root" >&2
+        return 1
+    fi
+    local hash
+    hash="$(vnc_password_hash "$pw")"
+    printf '%s\n' "$hash" > "$VNC_SETTINGS_FILE" || return 1
+    chown root:wheel "$VNC_SETTINGS_FILE" 2>/dev/null || true
+    chmod 600 "$VNC_SETTINGS_FILE" 2>/dev/null || true
+    return 0
+}
+
+# Root-only: enable Apple Screen Sharing and set the legacy VNC password reliably.
+# Must run inside the user's GUI session (callers arrange this via `launchctl
+# asuser` or an osascript admin prompt) so port 5900 actually binds.
+do_set_vnc_password() {
+    local key="$1"
+    if [[ "$EUID" -ne 0 ]]; then
+        echo "ERROR: --set-vnc-password requires root (use sudo)." >&2
+        return 1
+    fi
+    if [[ -z "$key" ]]; then
+        echo "ERROR: --set-vnc-password requires a key value." >&2
+        return 1
+    fi
+    if [[ ! -f "$KICKSTART" ]]; then
+        echo "ERROR: kickstart not found — cannot manage Screen Sharing." >&2
+        return 1
+    fi
+    echo "Enabling Screen Sharing and setting VNC password..."
+    # Enable Remote Management + legacy VNC auth type (NOT the password — that is
+    # set via the file below, since -setvncpw is unreliable on recent macOS).
+    "$KICKSTART" -activate -configure -access -on \
+        -clientopts -setvnclegacy -vnclegacy yes \
+        -privs -all 2>&1 || true
+    write_vnc_password "${key:0:8}" || return 1
+    # Restart the agent so it reloads the newly written password.
+    "$KICKSTART" -restart -agent 2>&1 || true
+    echo "  Screen Sharing enabled (VNC password set)."
 }
 
 set_env_value() {
@@ -1141,14 +1217,16 @@ start_all_services() {
             echo "  WARNING: Screen Sharing requires root to enable. Run with sudo or enable manually." >&2
             echo "  Skipping VNC — other services will still start." >&2
         else
-            # Apple VNC passwords are limited to 8 characters
-            local vnc_pw_short="${vnc_password:0:8}"
             echo "  Enabling Screen Sharing..."
+            # Enable Remote Management + legacy VNC auth, then write the password
+            # via the settings file (kickstart -setvncpw is unreliable on macOS 13+).
             "$KICKSTART" \
                 -activate -configure -access -on \
                 -clientopts -setvnclegacy -vnclegacy yes \
-                -clientopts -setvncpw -vncpw "$vnc_pw_short" \
-                -restart -agent -privs -all > "$LOG_DIR/screensharing.log" 2>&1 || true
+                -privs -all > "$LOG_DIR/screensharing.log" 2>&1 || true
+            write_vnc_password "${vnc_password:0:8}" \
+                || echo "  WARNING: failed to write VNC password file" >&2
+            "$KICKSTART" -restart -agent >> "$LOG_DIR/screensharing.log" 2>&1 || true
         fi
     else
         echo "  Screen Sharing already running on port 5900"
@@ -1304,6 +1382,14 @@ show_summary() {
 # =============================================================================
 # Main Execution
 # =============================================================================
+
+# Handle set-vnc-password (root-only; used by the installer/tray to set the VNC
+# password reliably). Dispatched first, before the root-refusal checks, since
+# this operation REQUIRES root.
+if [[ -n "$SET_VNC_PW" ]]; then
+    do_set_vnc_password "$SET_VNC_PW"
+    exit $?
+fi
 
 # Handle start command (just start services, no install/config - no root needed)
 if $DO_START; then
