@@ -393,9 +393,34 @@ uninstall_all() {
         fi
     fi
 
+    # 6. Forget the installer receipt and remove the CLI wrapper
     echo ""
-    echo "Uninstall cleanup complete."
-    echo "To fully remove, delete $INSTALL_DIR and /usr/local/bin/unify-desktop-assistant"
+    echo "Removing installer receipt and CLI wrapper..."
+    if [[ "$EUID" -eq 0 ]]; then
+        pkgutil --forget ai.unify.desktop-assistant 2>/dev/null || true
+        rm -f /usr/local/bin/unify-desktop-assistant 2>/dev/null || true
+        echo "  Done"
+    else
+        echo "  WARNING: run with sudo to remove the receipt and CLI wrapper." >&2
+    fi
+
+    # 7. Remove the install directory.
+    # This script is executing from inside $INSTALL_DIR/tools, so deleting the
+    # directory now could truncate the running script. Defer the rm to a detached
+    # process that runs once this script has exited. Guarded to the expected path
+    # so a misconfigured INSTALL_DIR can never trigger a destructive delete.
+    echo ""
+    if [[ "$EUID" -eq 0 && "$INSTALL_DIR" == "/opt/unify-desktop-assistant" && -d "$INSTALL_DIR" ]]; then
+        echo "Removing $INSTALL_DIR..."
+        nohup bash -c "sleep 2; rm -rf '$INSTALL_DIR'" >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+        echo "  Scheduled (completes a moment after this script exits)."
+    elif [[ -d "$INSTALL_DIR" ]]; then
+        echo "To finish removal, run: sudo rm -rf $INSTALL_DIR" >&2
+    fi
+
+    echo ""
+    echo "Uninstall complete. Unify Desktop Assistant has been fully removed."
 }
 
 # =============================================================================
