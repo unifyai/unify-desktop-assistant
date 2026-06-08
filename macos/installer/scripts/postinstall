@@ -103,12 +103,20 @@ mkdir -p "$LOG_DIR"
     # setup.sh loads Homebrew's shellenv itself, so it works even though this
     # non-interactive context doesn't source the user's ~/.zshrc.
 
-    # Enable Screen Sharing while we still have root privileges
+    # Enable Screen Sharing while we still have root privileges.
+    #
+    # IMPORTANT: kickstart must run inside the logged-in user's GUI (Aqua) session,
+    # not the bare installd/root context. From installd there is no GUI session, so
+    # kickstart writes the Remote-Management config to disk but the ARD agent that
+    # binds port 5900 never activates — the listener stays down even though the
+    # config reads "enabled". `launchctl asuser "$TARGET_UID"` runs kickstart as
+    # root but within the user's bootstrap namespace, so 5900 actually binds (and
+    # persists across logins).
     KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
-    if [ -f "$KICKSTART" ] && [ -n "$UNIFY_KEY" ]; then
+    if [ -f "$KICKSTART" ] && [ -n "$UNIFY_KEY" ] && [ -n "$TARGET_UID" ]; then
         VNC_PW_SHORT="$(printf '%s' "$UNIFY_KEY" | cut -c1-8)"
-        echo "[$(date)] Enabling Screen Sharing (root)..."
-        "$KICKSTART" \
+        echo "[$(date)] Enabling Screen Sharing (in $TARGET_USER's session)..."
+        launchctl asuser "$TARGET_UID" "$KICKSTART" \
             -activate -configure -access -on \
             -clientopts -setvnclegacy -vnclegacy yes \
             -clientopts -setvncpw -vncpw "$VNC_PW_SHORT" \
