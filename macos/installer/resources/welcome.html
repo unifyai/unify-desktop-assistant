@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {
+    font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #1d1d1f;
+    margin: 0;
+    padding: 16px 4px;
+  }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  p  { margin: 0 0 12px; }
+  ul { margin: 0 0 12px; padding-left: 20px; }
+  li { margin: 0 0 6px; }
+  .note {
+    background: #f2f7ff;
+    border-left: 3px solid #0a84ff;
+    padding: 10px 12px;
+    border-radius: 4px;
+    color: #333;
+  }
+</style>
+</head>
+<body>
+  <h2>Welcome to Unify Desktop Assistant</h2>
+  <p>This installer will set up Unify Desktop Assistant on your Mac so it can be
+     controlled remotely through your Unify account.</p>
+  <p>During installation it will:</p>
+  <ul>
+    <li>Install the assistant and its dependencies to <code>/opt/unify-desktop-assistant</code>.</li>
+    <li>Ask you for your <b>Unify API Key</b> to finish setup (you can skip this and enter it later).</li>
+    <li>Request your permission to enable <b>Screen Sharing</b>, so the desktop can be viewed remotely.</li>
+    <li>Add a <b>menu-bar app</b> for starting/stopping services and managing settings.</li>
+  </ul>
+  <div class="note">
+    Don't have your API key handy? Just click <b>Skip</b> when prompted — you can
+    add it any time from the menu-bar icon under <b>Settings…</b>.
+  </div>
+</body>
+</html>

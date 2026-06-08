@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {
+    font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #1d1d1f;
+    margin: 0;
+    padding: 16px 4px;
+  }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  p  { margin: 0 0 12px; }
+  ul { margin: 0 0 12px; padding-left: 20px; }
+  li { margin: 0 0 6px; }
+  .ok {
+    background: #effaf0;
+    border-left: 3px solid #34c759;
+    padding: 10px 12px;
+    border-radius: 4px;
+    color: #333;
+  }
+  code { font-size: 12px; }
+</style>
+</head>
+<body>
+  <h2>Installation Complete</h2>
+  <div class="ok">
+    Unify Desktop Assistant is finishing setup in the background. Look for the
+    <b>menu-bar icon</b> near the clock — it turns <b>green</b> once services are running.
+  </div>
+  <p>What happens next:</p>
+  <ul>
+    <li>Dependencies and services finish installing automatically (this can take a few minutes on first install).</li>
+    <li>If you entered your API key, services start and Screen Sharing is enabled for you.</li>
+    <li>If you skipped the key, open the menu-bar icon and choose <b>Settings…</b> to enter it — setup completes after that (you'll be asked to approve Screen Sharing once).</li>
+  </ul>
+  <p>To watch progress you can run:
+     <br><code>tail -f /opt/unify-desktop-assistant/logs/postinstall-deferred.log</code></p>
+</body>
+</html>

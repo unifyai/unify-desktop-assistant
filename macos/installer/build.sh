@@ -223,9 +223,33 @@ pkgbuild \
     --install-location "/" \
     "$COMPONENT_PKG"
 
-# Step 2: Wrap with productbuild for distribution (adds welcome, etc.)
+# Step 2: Generate distribution XML (adds Welcome / Conclusion panes)
+DIST_XML="$BUILD_DIR/distribution.xml"
+cat > "$DIST_XML" <<DISTXML
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Unify Desktop Assistant</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="$PKG_ID"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="$PKG_ID" visible="false">
+        <pkg-ref id="$PKG_ID"/>
+    </choice>
+    <pkg-ref id="$PKG_ID" version="$VERSION" onConclusion="none">component.pkg</pkg-ref>
+</installer-gui-script>
+DISTXML
+
+# Step 3: Wrap with productbuild using the distribution + resources
 productbuild \
-    --package "$COMPONENT_PKG" \
+    --distribution "$DIST_XML" \
+    --resources "$SCRIPT_DIR/resources" \
+    --package-path "$BUILD_DIR" \
     "$FINAL_PKG"
 
 # =============================================================================
