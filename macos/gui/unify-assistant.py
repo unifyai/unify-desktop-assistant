@@ -250,6 +250,68 @@ class UnifyTrayApp(rumps.App):
             daemon=True,
         ).start()
 
+    def _enable_screen_sharing(self, key: str):
+        """Enable Apple Screen Sharing (VNC) via an admin prompt.
+
+        kickstart requires root, which the tray (a user-context agent) lacks,
+        so we elevate with a single native authentication dialog via osascript.
+        """
+        kickstart = (
+            "/System/Library/CoreServices/RemoteManagement/"
+            "ARDAgent.app/Contents/Resources/kickstart"
+        )
+        if not os.path.exists(kickstart):
+            return
+        vnc_pw = key[:8]  # Apple VNC passwords are limited to 8 characters
+        shell_cmd = (
+            f"'{kickstart}' -activate -configure -access -on "
+            f"-clientopts -setvnclegacy -vnclegacy yes "
+            f"-clientopts -setvncpw -vncpw '{vnc_pw}' "
+            f"-restart -agent -privs -all"
+        )
+        applescript = (
+            f'do shell script "{shell_cmd}" with administrator privileges'
+        )
+        try:
+            subprocess.run(
+                ["osascript", "-e", applescript],
+                capture_output=True, timeout=120,
+            )
+        except Exception:
+            pass
+
+    def _apply_key_and_setup(self, key: str):
+        """Persist the key and complete full setup (config, registration, services).
+
+        Runs the full keyed setup.sh as the current user (deps, tunnel + desktop
+        registration, agent + websockify), then enables Screen Sharing with an
+        admin prompt. Kicked off in a background thread so the UI stays responsive.
+        """
+        key = key.strip()
+        if not key:
+            return
+
+        set_env_value("UNIFY_KEY", key)
+        set_env_value("PORT", "3000")
+
+        rumps.notification(
+            APP_NAME, "Setting up",
+            "Configuring services… this may take a minute.",
+        )
+
+        def worker():
+            subprocess.run(
+                ["bash", str(SETUP_SCRIPT), "--unify-key", key, "--force"],
+                capture_output=True,
+            )
+            # kickstart needs root — elevate separately with a single admin prompt
+            self._enable_screen_sharing(key)
+            rumps.notification(
+                APP_NAME, "Ready", "Unify Desktop Assistant is set up.",
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _open_desktop(self, _sender):
         """Open the noVNC desktop viewer in the default browser."""
         key = get_env_value("UNIFY_KEY")
@@ -288,9 +350,7 @@ class UnifyTrayApp(rumps.App):
         ).run()
 
         if response.clicked and response.text.strip():
-            set_env_value("UNIFY_KEY", response.text.strip())
-            set_env_value("PORT", "3000")
-            self._start_services(None)
+            self._apply_key_and_setup(response.text.strip())
 
     def _show_settings(self, _sender):
         """Show the settings dialog."""
@@ -324,9 +384,8 @@ class UnifyTrayApp(rumps.App):
 
         if response.clicked:
             new_key = response.text.strip()
-            if new_key:
-                set_env_value("UNIFY_KEY", new_key)
-                set_env_value("PORT", "3000")
+            if new_key and new_key != current_key:
+                self._apply_key_and_setup(new_key)
 
     def _view_logs(self, _sender):
         """Open the agent log file in the default editor."""
