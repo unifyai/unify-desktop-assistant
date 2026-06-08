@@ -226,19 +226,27 @@ class UnifyTrayApp(rumps.App):
             pass
 
     def _start_services(self, _sender):
-        """Start all services via setup.sh --start."""
+        """Start all services via setup.sh --start.
+
+        setup.sh --start runs unprivileged and cannot enable Screen Sharing, so
+        if VNC (5900) is down we first re-enable it via an admin prompt — otherwise
+        the status can never reach green. Screen Sharing normally persists, so this
+        prompt only appears in edge cases (e.g. it was manually disabled).
+        """
         key = get_env_value("UNIFY_KEY")
         if not key:
             self._show_first_run_settings()
             return
 
-        threading.Thread(
-            target=lambda: subprocess.run(
+        def worker():
+            if not test_port_listening(VNC_PORT):
+                self._enable_screen_sharing(key)
+            subprocess.run(
                 ["bash", str(SETUP_SCRIPT), "--start"],
                 capture_output=True,
-            ),
-            daemon=True,
-        ).start()
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _stop_services(self, _sender):
         """Stop all services via setup.sh --stop."""
