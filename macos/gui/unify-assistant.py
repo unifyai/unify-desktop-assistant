@@ -177,6 +177,7 @@ class UnifyTrayApp(rumps.App):
             rumps.MenuItem("Settings...", callback=self._show_settings),
             rumps.MenuItem("View Logs...", callback=self._view_logs),
             None,
+            rumps.MenuItem("Uninstall...", callback=self._uninstall),
             rumps.MenuItem("Quit", callback=self._quit),
         ]
 
@@ -405,6 +406,43 @@ class UnifyTrayApp(rumps.App):
                 title="Log Viewer",
                 message=f"Log file not found:\n{log_file}",
             )
+
+    def _uninstall(self, _sender):
+        """Uninstall the app via an elevated setup.sh --uninstall, then quit.
+
+        Uninstall needs root (disable Screen Sharing, pkgutil --forget, remove
+        /usr/local/bin, delete /opt), so it's run through a single native admin
+        prompt via osascript. The tray quits once cleanup finishes.
+        """
+        confirm = rumps.alert(
+            title="Uninstall Unify Desktop Assistant?",
+            message=(
+                "This will stop all services, disable Screen Sharing, unregister "
+                "this device, and remove Unify Desktop Assistant from your Mac.\n\n"
+                "This cannot be undone."
+            ),
+            ok="Uninstall",
+            cancel="Cancel",
+        )
+        if confirm != 1:
+            return
+
+        def worker():
+            applescript = (
+                f'do shell script "\'{SETUP_SCRIPT}\' --uninstall" '
+                f"with administrator privileges"
+            )
+            subprocess.run(
+                ["osascript", "-e", applescript],
+                capture_output=True, timeout=300,
+            )
+            rumps.notification(
+                APP_NAME, "Uninstalled",
+                "Unify Desktop Assistant has been removed.",
+            )
+            rumps.quit_application()
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _quit(self, _sender):
         """Quit the tray application."""
