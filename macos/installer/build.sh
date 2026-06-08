@@ -157,6 +157,11 @@ if [[ -f "$PROJECT_DIR/gui/unify-assistant.py" ]]; then
     chmod +x "$APP_ROOT/gui/unify-assistant.py"
 fi
 
+# --- assets/ (tray logo, etc.) ---
+echo "  Copying assets/..."
+mkdir -p "$APP_ROOT/assets"
+cp "$PROJECT_DIR/assets/"* "$APP_ROOT/assets/" 2>/dev/null || true
+
 # --- launchd/ ---
 echo "  Copying launchd templates..."
 mkdir -p "$APP_ROOT/launchd"

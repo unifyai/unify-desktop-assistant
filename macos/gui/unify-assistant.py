@@ -22,6 +22,9 @@ import subprocess
 import socket
 import webbrowser
 import threading
+import tempfile
+import shutil
+import atexit
 from pathlib import Path
 
 import rumps
@@ -37,10 +40,12 @@ APP_ID = "ai.unify.desktop-assistant"
 INSTALL_DIR = Path(__file__).resolve().parent.parent
 TOOLS_DIR = INSTALL_DIR / "tools"
 AGENT_SERVICE_DIR = INSTALL_DIR / "agent-service"
+ASSETS_DIR = INSTALL_DIR / "assets"
 SETUP_SCRIPT = TOOLS_DIR / "setup.sh"
 ENV_FILE = AGENT_SERVICE_DIR / ".env"
 SIGNAL_FILE = INSTALL_DIR / "uninstall.signal"
 LOG_DIR = INSTALL_DIR / "logs"
+LOGO_PATH = ASSETS_DIR / "unify_logo_only.png"
 
 VNC_PORT = 5900
 NOVNC_PORT = 6080
@@ -48,10 +53,18 @@ AGENT_PORT = 3000
 
 STATUS_INTERVAL = 5  # seconds
 
+# Emoji fallback used only when the composited logo icon can't be built.
 STATUS_ICONS = {
     "running": "🟢",
     "partial": "🟡",
     "stopped": "🔴",
+}
+
+# Status dot colors (RGB), matching the Ubuntu tray palette.
+STATUS_COLORS = {
+    "running": (76, 175, 80),    # green
+    "partial": (255, 193, 7),    # amber
+    "stopped": (244, 67, 54),    # red
 }
 
 
@@ -160,6 +173,87 @@ def _as_applescript_str(s: str) -> str:
     return " & return & ".join(lines) if len(lines) > 1 else lines[0]
 
 
+def make_status_icon(logo_path, status, out_path, size: int = 22, scale: int = 2) -> bool:
+    """Composite the Unify logo with a colored status dot at the lower-right.
+
+    Renders at `scale`x for retina crispness, then tags the PNG's point size as
+    `size` so it fits the menu bar. Uses PyObjC's AppKit (a rumps dependency, so
+    no extra install). Returns True on success, False on any failure (caller
+    then falls back to the emoji title).
+    """
+    try:
+        from AppKit import (
+            NSImage, NSBitmapImageRep, NSColor, NSBezierPath,
+            NSGraphicsContext, NSCalibratedRGBColorSpace,
+            NSCompositingOperationSourceOver,
+        )
+        from Foundation import NSMakeRect, NSZeroRect
+        try:
+            from AppKit import NSBitmapImageFileTypePNG as PNG_TYPE
+        except Exception:
+            PNG_TYPE = 4  # NSPNGFileType
+    except Exception:
+        return False
+
+    try:
+        logo = NSImage.alloc().initWithContentsOfFile_(str(logo_path))
+        if logo is None:
+            return False
+
+        px = int(size * scale)
+
+        # Offscreen bitmap (no WindowServer needed, unlike NSImage.lockFocus).
+        rep = NSBitmapImageRep.alloc().\
+            initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+                None, px, px, 8, 4, True, False, NSCalibratedRGBColorSpace, 0, 0
+            )
+        if rep is None:
+            return False
+        ctx = NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
+        if ctx is None:
+            return False
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.setCurrentContext_(ctx)
+        try:
+            # Logo fills the canvas.
+            logo.drawInRect_fromRect_operation_fraction_(
+                NSMakeRect(0, 0, px, px), NSZeroRect,
+                NSCompositingOperationSourceOver, 1.0,
+            )
+
+            # Status dot at the lower-right (AppKit origin is bottom-left).
+            r, g, b = STATUS_COLORS.get(status, (158, 158, 158))
+            diam = px * 0.46
+            margin = px * 0.02
+            ring = px * 0.07
+            x = px - diam - margin
+            y = margin
+
+            # White ring for contrast against the (green) logo / menu bar.
+            NSColor.whiteColor().set()
+            NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(x - ring, y - ring, diam + 2 * ring, diam + 2 * ring)
+            ).fill()
+
+            # Colored dot.
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                r / 255.0, g / 255.0, b / 255.0, 1.0
+            ).set()
+            NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(x, y, diam, diam)
+            ).fill()
+        finally:
+            NSGraphicsContext.restoreGraphicsState()
+
+        rep.setSize_((size, size))  # point size = menu-bar height, 2x backing
+        png = rep.representationUsingType_properties_(PNG_TYPE, {})
+        png.writeToFile_atomically_(str(out_path), True)
+        return True
+    except Exception:
+        return False
+
+
 # =============================================================================
 # Tray Application
 # =============================================================================
@@ -168,9 +262,14 @@ class UnifyTrayApp(rumps.App):
     def __init__(self):
         super().__init__(
             APP_NAME,
-            title=STATUS_ICONS["stopped"],
             quit_button=None,
         )
+        self.template = False  # colored icon (logo + status dot), not tinted
+
+        # Pre-build the composited logo+dot icons (falls back to emoji if needed).
+        self._icon_paths = {}
+        self._icon_tmpdir = None
+        self._build_status_icons()
 
         self.last_status_key = ""
 
@@ -205,6 +304,38 @@ class UnifyTrayApp(rumps.App):
         if key:
             self._start_services(None)
 
+    def _build_status_icons(self):
+        """Composite logo+dot PNGs for each status into a temp dir (cached)."""
+        if not LOGO_PATH.exists():
+            return
+        try:
+            tmpdir = Path(tempfile.mkdtemp(prefix="unify-tray-"))
+            for status in ("running", "partial", "stopped"):
+                out = tmpdir / f"unify-{status}.png"
+                if make_status_icon(LOGO_PATH, status, out):
+                    self._icon_paths[status] = str(out)
+            if self._icon_paths:
+                self._icon_tmpdir = tmpdir
+                atexit.register(self._cleanup_icons)
+            else:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            self._icon_paths = {}
+
+    def _cleanup_icons(self):
+        """Remove the temp icon directory on exit."""
+        if self._icon_tmpdir:
+            shutil.rmtree(self._icon_tmpdir, ignore_errors=True)
+            self._icon_tmpdir = None
+
+    def _set_status_icon(self, status_key: str):
+        """Set the menu-bar icon for a status; fall back to emoji if unavailable."""
+        path = self._icon_paths.get(status_key)
+        if path:
+            self.icon = path
+        else:
+            self.title = STATUS_ICONS.get(status_key, "⚪")
+
     def _update_status(self, _sender):
         """Periodic status update callback."""
         try:
@@ -232,7 +363,7 @@ class UnifyTrayApp(rumps.App):
 
             if self.last_status_key != status_key:
                 self.last_status_key = status_key
-                self.title = STATUS_ICONS.get(status_key, "⚪")
+                self._set_status_icon(status_key)
 
             self.status_item.title = f"Services: {status_text} | Tunnel: {tunnel_text}"
 
