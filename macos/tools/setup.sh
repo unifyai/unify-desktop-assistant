@@ -132,6 +132,42 @@ done
 # Make user-local bun visible too (curl-installer fallback target).
 [[ -d "$HOME/.bun/bin" ]] && export PATH="$HOME/.bun/bin:$PATH"
 
+# -----------------------------------------------------------------------------
+# Resolve a single, deterministic Python interpreter.
+#
+# websockify/rumps are pip-installed into one interpreter; if a *different*
+# python3 later starts them, `python3 -m websockify` fails and port 6080 never
+# binds. This happens because the installer's start runs in a login shell (full
+# PATH: pyenv/python.org/etc.) while the tray starts services from a non-login
+# shell that only re-adds Homebrew — so bare `python3` resolves differently.
+# Pin the interpreter once and reuse it for install, start, the prereq check,
+# and the tray plist so they always match.
+# -----------------------------------------------------------------------------
+PYTHON_BIN_FILE="$TOOLS_DIR/.python-bin"
+
+resolve_python_bin() {
+    # 1. Honor a previously persisted interpreter (recorded at install time).
+    if [[ -f "$PYTHON_BIN_FILE" ]]; then
+        local saved
+        saved="$(head -n1 "$PYTHON_BIN_FILE" 2>/dev/null || true)"
+        if [[ -n "$saved" && -x "$saved" ]]; then
+            echo "$saved"; return 0
+        fi
+    fi
+    # 2. Prefer an interpreter that already has websockify importable.
+    local p
+    for p in "$(command -v python3 2>/dev/null || true)" \
+             /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+        if [[ -n "$p" && -x "$p" ]] && "$p" -c 'import websockify' 2>/dev/null; then
+            echo "$p"; return 0
+        fi
+    done
+    # 3. Fall back to the first python3 on PATH (install will add websockify).
+    command -v python3 2>/dev/null || echo /usr/bin/python3
+}
+
+PYTHON_BIN="$(resolve_python_bin)"
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -231,7 +267,7 @@ test_fast_mode() {
         all_ok=false
     fi
 
-    if command -v websockify &>/dev/null || python3 -m websockify --help &>/dev/null 2>&1; then
+    if "$PYTHON_BIN" -m websockify --help &>/dev/null 2>&1 || command -v websockify &>/dev/null; then
         echo "  [OK] websockify" >&2
     else
         echo "  [--] websockify (will install)" >&2
@@ -259,7 +295,7 @@ test_fast_mode() {
         all_ok=false
     fi
 
-    if python3 -c "import rumps" &>/dev/null; then
+    if "$PYTHON_BIN" -c "import rumps" &>/dev/null; then
         echo "  [OK] rumps" >&2
     else
         echo "  [--] rumps (will install)" >&2
@@ -522,25 +558,29 @@ install_websockify() {
     echo ""
     echo "=== Installing websockify ==="
 
-    pip3 install --break-system-packages websockify 2>/dev/null \
-        || pip3 install websockify
+    "$PYTHON_BIN" -m pip install --break-system-packages websockify 2>/dev/null \
+        || "$PYTHON_BIN" -m pip install websockify
 
-    echo "  websockify installed via pip"
+    # Persist the interpreter so --start (run later from the tray's non-login
+    # shell) uses the exact same Python that now has the websockify module.
+    echo "$PYTHON_BIN" > "$PYTHON_BIN_FILE" 2>/dev/null || true
+
+    echo "  websockify installed via pip ($PYTHON_BIN)"
 }
 
 install_rumps() {
     echo ""
     echo "=== Installing rumps (tray app) ==="
 
-    if python3 -c "import rumps" &>/dev/null 2>&1; then
+    if "$PYTHON_BIN" -c "import rumps" &>/dev/null 2>&1; then
         echo "  rumps already installed"
         return
     fi
 
-    pip3 install --break-system-packages rumps 2>/dev/null \
-        || pip3 install rumps
+    "$PYTHON_BIN" -m pip install --break-system-packages rumps 2>/dev/null \
+        || "$PYTHON_BIN" -m pip install rumps
 
-    echo "  rumps installed via pip"
+    echo "  rumps installed via pip ($PYTHON_BIN)"
 }
 
 install_novnc() {
@@ -1050,9 +1090,9 @@ setup_autostart() {
         return
     fi
 
-    # Resolve the user's python3 (has rumps installed); fall back to system python.
-    local python_bin
-    python_bin=$(command -v python3 || echo /usr/bin/python3)
+    # Use the pinned interpreter (has rumps + websockify) so the tray app and the
+    # websockify it later launches via --start share the exact same Python.
+    local python_bin="$PYTHON_BIN"
 
     sed \
         -e "s|%PYTHON%|$python_bin|g" \
@@ -1114,10 +1154,19 @@ start_all_services() {
         echo "  Screen Sharing already running on port 5900"
     fi
 
-    # Start websockify (only if not already running on 6080)
+    # Start websockify (only if not already running on 6080).
+    # Use the pinned interpreter ($PYTHON_BIN) — a bare `python3` here can resolve
+    # to a different interpreter than the one websockify was installed into. If the
+    # pinned one is somehow missing the module, self-heal by installing it.
     if ! test_port_listening 6080; then
-        echo "  Starting websockify..."
-        nohup python3 -m websockify --web="$NOVNC_DIR" 6080 localhost:5900 \
+        if ! "$PYTHON_BIN" -c 'import websockify' 2>/dev/null; then
+            echo "  websockify module missing for $PYTHON_BIN — installing..."
+            "$PYTHON_BIN" -m pip install --break-system-packages websockify 2>/dev/null \
+                || "$PYTHON_BIN" -m pip install websockify 2>/dev/null || true
+            echo "$PYTHON_BIN" > "$PYTHON_BIN_FILE" 2>/dev/null || true
+        fi
+        echo "  Starting websockify ($PYTHON_BIN)..."
+        nohup "$PYTHON_BIN" -m websockify --web="$NOVNC_DIR" 6080 localhost:5900 \
             > "$LOG_DIR/websockify.log" 2>&1 &
     else
         echo "  websockify already running on port 6080"
