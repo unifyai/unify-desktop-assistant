@@ -62,7 +62,7 @@ if [ -z "$UNIFY_KEY" ] && [ -n "$TARGET_UID" ] && [ "$TARGET_USER" != "root" ]; 
     PROMPT_SCRIPT='try
 set r to display dialog "Enter your Unify API Key to finish setup.
 
-Leave blank or click Skip to configure later from the menu-bar app." default answer "" with title "Unify Desktop Assistant" with icon note buttons {"Skip", "Continue"} default button "Continue"
+Leave blank or click Skip to configure later from the menu-bar app." default answer "" with hidden answer with title "Unify Desktop Assistant" with icon note buttons {"Skip", "Continue"} default button "Continue"
 if button returned of r is "Continue" then
 return text returned of r
 end if

@@ -147,6 +147,19 @@ def copy_to_clipboard(text: str):
         pass
 
 
+def _as_applescript_str(s: str) -> str:
+    """Render a Python string as an AppleScript string literal.
+
+    Escapes quotes/backslashes and converts newlines into `& return &` joins so
+    multi-line messages render correctly inside osascript.
+    """
+    lines = []
+    for line in s.split("\n"):
+        line = line.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'"{line}"')
+    return " & return & ".join(lines) if len(lines) > 1 else lines[0]
+
+
 # =============================================================================
 # Tray Application
 # =============================================================================
@@ -347,22 +360,43 @@ class UnifyTrayApp(rumps.App):
                 message="No public URL available. Run setup first to register a tunnel.",
             )
 
-    def _show_first_run_settings(self):
-        """Prompt for API key on first run when no key is configured."""
-        response = rumps.Window(
-            title="Welcome to Unify Desktop Assistant",
-            message="Enter your Unify API Key to get started:",
-            default_text="",
-            ok="Save & Start",
-            cancel="Cancel",
-            dimensions=(320, 24),
-        ).run()
+    def _prompt_secure(self, title: str, message: str):
+        """Prompt for a secret via a masked (hidden-answer) native dialog.
 
-        if response.clicked and response.text.strip():
-            self._apply_key_and_setup(response.text.strip())
+        rumps.Window has no secure-field option, so we use osascript with
+        `hidden answer` (characters render as dots). Returns the entered text,
+        or None if the user cancelled.
+        """
+        script = (
+            f'set r to display dialog {_as_applescript_str(message)} '
+            f'default answer "" with hidden answer '
+            f'with title {_as_applescript_str(title)} '
+            f'buttons {{"Cancel", "OK"}} default button "OK"\n'
+            f'text returned of r'
+        )
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=300,
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None  # cancelled / dismissed
+        return result.stdout.rstrip("\n")
+
+    def _show_first_run_settings(self):
+        """Prompt for API key on first run when no key is configured (masked)."""
+        key = self._prompt_secure(
+            "Welcome to Unify Desktop Assistant",
+            "Enter your Unify API Key to get started.\n"
+            "(Input is hidden for security.)",
+        )
+        if key and key.strip():
+            self._apply_key_and_setup(key.strip())
 
     def _show_settings(self, _sender):
-        """Show the settings dialog."""
+        """Show the settings dialog (API key entry is fully masked)."""
         current_key = get_env_value("UNIFY_KEY")
         device_id = get_env_value("DEVICE_ID") or "(not registered)"
         tunnel_id = get_env_value("TUNNEL_ID") or "(not registered)"
@@ -373,7 +407,12 @@ class UnifyTrayApp(rumps.App):
             or "https://unity-comms-app-000000000000.us-central1.run.app"
         )
 
-        info_text = (
+        key_state = "configured" if current_key else "not set"
+        message = (
+            f"API key: {key_state}\n"
+            f"Enter a new key to change it, or leave blank to keep the current one.\n"
+            f"(Input is hidden for security.)\n"
+            f"\n"
             f"Orchestra URL: {orchestra_url}\n"
             f"Comms URL: {comms_url}\n"
             f"\n"
@@ -382,19 +421,12 @@ class UnifyTrayApp(rumps.App):
             f"Public URL: {tunnel_url}"
         )
 
-        response = rumps.Window(
-            title="Settings",
-            message=f"Enter your Unify API Key:\n\n{info_text}",
-            default_text=current_key,
-            ok="Save",
-            cancel="Cancel",
-            dimensions=(360, 24),
-        ).run()
-
-        if response.clicked:
-            new_key = response.text.strip()
-            if new_key and new_key != current_key:
-                self._apply_key_and_setup(new_key)
+        new_key = self._prompt_secure("Settings", message)
+        if new_key is None:
+            return  # cancelled
+        new_key = new_key.strip()
+        if new_key and new_key != current_key:
+            self._apply_key_and_setup(new_key)
 
     def _view_logs(self, _sender):
         """Open the agent log file in the default editor."""
