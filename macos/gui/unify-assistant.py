@@ -427,11 +427,14 @@ class UnifyTrayApp(rumps.App):
             pass
 
     def _apply_key_and_setup(self, key: str):
-        """Persist the key and complete full setup (config, registration, services).
+        """Persist the key and (re)configure services, then enable Screen Sharing.
 
-        Runs the full keyed setup.sh as the current user (deps, tunnel + desktop
-        registration, agent + websockify), then enables Screen Sharing with an
-        admin prompt. Kicked off in a background thread so the UI stays responsive.
+        Uses setup.sh --reconfigure (not --force): it re-applies the key, re-stops
+        and restarts services, and re-registers the tunnel/desktop, but skips both
+        dependency installs and setup_autostart. The latter is critical — a --force
+        run would call setup_autostart, which does `launchctl bootout com.unify.tray`
+        and kills this very menu-bar app (and the setup child) before it can reload.
+        Kicked off in a background thread so the UI stays responsive.
         """
         key = key.strip()
         if not key:
@@ -446,18 +449,15 @@ class UnifyTrayApp(rumps.App):
         )
 
         def worker():
-            # Stop any running services first so they restart with the new key.
-            # start_all_services skips services already listening on their ports,
-            # so a running agent would otherwise keep the old key in memory.
+            # --reconfigure does its own stop + restart with the new key, so the
+            # agent picks up the new key instead of keeping the old one in memory.
             subprocess.run(
-                ["bash", str(SETUP_SCRIPT), "--stop"],
+                ["bash", str(SETUP_SCRIPT), "--reconfigure", "--unify-key", key],
                 capture_output=True,
             )
-            subprocess.run(
-                ["bash", str(SETUP_SCRIPT), "--unify-key", key, "--force"],
-                capture_output=True,
-            )
-            # kickstart needs root — elevate separately with a single admin prompt
+            # VNC password is derived from the key and must be reset on change —
+            # start_all_services skips VNC when 5900 is already up, so do it here.
+            # kickstart needs root — elevate with a single admin prompt.
             self._enable_screen_sharing(key)
             rumps.notification(
                 APP_NAME, "Ready", "Unify Desktop Assistant is set up.",
