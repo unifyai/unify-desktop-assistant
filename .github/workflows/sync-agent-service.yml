@@ -37,7 +37,6 @@ jobs:
         with:
           repository: unifyai/unity
           ref: ${{ matrix.branch }}
-          token: ${{ secrets.CLONE_TOKEN }}
           path: _unity_agent
           sparse-checkout: agent-service
           fetch-depth: 1
@@ -47,7 +46,6 @@ jobs:
         with:
           repository: unifyai/magnitude
           ref: unity-modifications
-          token: ${{ secrets.CLONE_TOKEN }}
           path: _magnitude
           fetch-depth: 1
 
