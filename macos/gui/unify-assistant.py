@@ -453,6 +453,13 @@ class UnifyTrayApp(rumps.App):
         )
 
         def worker():
+            # Stop any running services first so they restart with the new key.
+            # start_all_services skips services already listening on their ports,
+            # so a running agent would otherwise keep the old key in memory.
+            subprocess.run(
+                ["bash", str(SETUP_SCRIPT), "--stop"],
+                capture_output=True,
+            )
             subprocess.run(
                 ["bash", str(SETUP_SCRIPT), "--unify-key", key, "--force"],
                 capture_output=True,
