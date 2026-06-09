@@ -1462,7 +1462,15 @@ if $RECONFIGURE; then
         exit 1
     fi
 
-    # Rewrite .env with the new key (preserves TUNNEL_*/DEVICE_ID).
+    # Settings only changes the API key — preserve the URLs baked at install.
+    # Otherwise setup_agent_service_env would overwrite them with setup.sh's
+    # hardcoded production defaults, breaking a staging/custom install.
+    existing_orch="$(get_env_value "ORCHESTRA_URL")"
+    existing_comms="$(get_env_value "UNITY_COMMS_URL")"
+    [[ -n "$existing_orch" ]]  && ORCHESTRA_URL="$existing_orch"
+    [[ -n "$existing_comms" ]] && UNITY_COMMS_URL="$existing_comms"
+
+    # Rewrite .env with the new key (preserves TUNNEL_*/DEVICE_ID and URLs).
     setup_agent_service_env
 
     # Stop running services so they restart with the new key in memory.
