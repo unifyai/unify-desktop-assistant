@@ -230,45 +230,12 @@ get_env_value() {
 # -----------------------------------------------------------------------------
 # VNC password (legacy Screen Sharing) management
 #
-# `kickstart -setvncpw` is unreliable on macOS 13+ (it frequently mangles the
-# stored password, so clients fall back to macOS-account auth — the "enter your
-# Mac username + password" prompt). The robust approach is to write the password
-# file ourselves: /Library/Preferences/com.apple.VNCSettings.txt holds 32 hex
-# chars — each of the (<=8) password bytes XOR'd against Apple's fixed 16-byte
-# key. Implemented in pure bash (no perl/python dependency).
+# The VNC password is set via `kickstart -setvncpw`, which writes
+# /Library/Preferences/com.apple.VNCSettings.txt in the exact format macOS
+# expects. Hand-writing that file (XOR hash) was tried but produced a malformed
+# file that macOS rejected, so the server fell back to ARD user auth (username +
+# password) and noVNC saw a blank screen — let kickstart own the file instead.
 # -----------------------------------------------------------------------------
-VNC_SETTINGS_FILE="/Library/Preferences/com.apple.VNCSettings.txt"
-VNC_FIXED_KEY="REDACTED"
-
-vnc_password_hash() {
-    local pw="${1:0:8}"
-    local out="" i kb pc
-    for (( i = 0; i < 16; i++ )); do
-        kb=$((16#${VNC_FIXED_KEY:$((i * 2)):2}))
-        if (( i < ${#pw} )); then
-            pc=$(printf '%d' "'${pw:$i:1}")
-        else
-            pc=0
-        fi
-        out+=$(printf '%02X' $(( kb ^ (pc & 255) )))
-    done
-    printf '%s' "$out"
-}
-
-write_vnc_password() {
-    # Requires root. Writes the VNC password hash file with safe perms.
-    local pw="$1"
-    if [[ "$EUID" -ne 0 ]]; then
-        echo "  ERROR: setting the VNC password requires root" >&2
-        return 1
-    fi
-    local hash
-    hash="$(vnc_password_hash "$pw")"
-    printf '%s\n' "$hash" > "$VNC_SETTINGS_FILE" || return 1
-    chown root:wheel "$VNC_SETTINGS_FILE" 2>/dev/null || true
-    chmod 600 "$VNC_SETTINGS_FILE" 2>/dev/null || true
-    return 0
-}
 
 # Root-only: enable Apple Screen Sharing and set the legacy VNC password reliably.
 # Must run inside the user's GUI session (callers arrange this via `launchctl
@@ -288,14 +255,15 @@ do_set_vnc_password() {
         return 1
     fi
     echo "Enabling Screen Sharing and setting VNC password..."
-    # Enable Remote Management + legacy VNC auth type (NOT the password — that is
-    # set via the file below, since -setvncpw is unreliable on recent macOS).
+    # Enable Remote Management + legacy VNC auth and set the password in one
+    # kickstart call, letting kickstart write the password file itself. Writing
+    # /Library/Preferences/com.apple.VNCSettings.txt by hand produced a malformed
+    # file that macOS rejected, forcing ARD user auth (username + password) and a
+    # blank screen over noVNC.
     "$KICKSTART" -activate -configure -access -on \
         -clientopts -setvnclegacy -vnclegacy yes \
-        -privs -all 2>&1 || true
-    write_vnc_password "${key:0:8}" || return 1
-    # Restart the agent so it reloads the newly written password.
-    "$KICKSTART" -restart -agent 2>&1 || true
+        -clientopts -setvncpw -vncpw "${key:0:8}" \
+        -restart -agent -privs -all 2>&1 || true
     echo "  Screen Sharing enabled (VNC password set)."
 }
 
@@ -1288,15 +1256,17 @@ start_all_services() {
             echo "  Skipping VNC — other services will still start." >&2
         else
             echo "  Enabling Screen Sharing..."
-            # Enable Remote Management + legacy VNC auth, then write the password
-            # via the settings file (kickstart -setvncpw is unreliable on macOS 13+).
+            # Enable Remote Management + legacy VNC auth and set the password in a
+            # single kickstart call. Let kickstart write the password file itself
+            # (/Library/Preferences/com.apple.VNCSettings.txt) — hand-writing it
+            # produced a malformed 33-byte file (trailing newline / wrong case) that
+            # macOS rejected, so it fell back to ARD user auth (username + password)
+            # and noVNC saw a blank screen.
             "$KICKSTART" \
                 -activate -configure -access -on \
                 -clientopts -setvnclegacy -vnclegacy yes \
-                -privs -all > "$LOG_DIR/screensharing.log" 2>&1 || true
-            write_vnc_password "${vnc_password:0:8}" \
-                || echo "  WARNING: failed to write VNC password file" >&2
-            "$KICKSTART" -restart -agent >> "$LOG_DIR/screensharing.log" 2>&1 || true
+                -clientopts -setvncpw -vncpw "${vnc_password:0:8}" \
+                -restart -agent -privs -all > "$LOG_DIR/screensharing.log" 2>&1 || true
         fi
     else
         echo "  Screen Sharing already running on port 5900"
