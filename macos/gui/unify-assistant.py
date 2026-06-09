@@ -385,7 +385,7 @@ class UnifyTrayApp(rumps.App):
 
         def worker():
             if not test_port_listening(VNC_PORT):
-                self._enable_screen_sharing(key)
+                self._enable_screen_sharing()
             subprocess.run(
                 ["bash", str(SETUP_SCRIPT), "--start"],
                 capture_output=True,
@@ -403,18 +403,18 @@ class UnifyTrayApp(rumps.App):
             daemon=True,
         ).start()
 
-    def _enable_screen_sharing(self, key: str):
-        """Enable Apple Screen Sharing (VNC) via an admin prompt.
+    def _enable_screen_sharing(self):
+        """Enable Apple Screen Sharing (ARD) via an admin prompt.
 
-        Enabling Screen Sharing and setting the VNC password require root, which
-        the tray (a user-context agent) lacks, so we elevate with a single native
-        authentication dialog via osascript. The heavy lifting lives in
-        `setup.sh --set-vnc-password`, which writes the VNC password reliably
-        (kickstart -setvncpw is unreliable on macOS 13+).
+        Enabling Screen Sharing requires root, which the tray (a user-context
+        agent) lacks, so we elevate with a single native authentication dialog
+        via osascript. The work lives in `setup.sh --enable-screen-sharing`,
+        which turns on Apple Remote Desktop (the viewer signs in with the macOS
+        account username + password).
         """
         if not SETUP_SCRIPT.exists():
             return
-        shell_cmd = f"'{SETUP_SCRIPT}' --set-vnc-password '{key}'"
+        shell_cmd = f"'{SETUP_SCRIPT}' --enable-screen-sharing"
         applescript = (
             f'do shell script "{shell_cmd}" with administrator privileges'
         )
@@ -455,10 +455,8 @@ class UnifyTrayApp(rumps.App):
                 ["bash", str(SETUP_SCRIPT), "--reconfigure", "--unify-key", key],
                 capture_output=True,
             )
-            # VNC password is derived from the key and must be reset on change —
-            # start_all_services skips VNC when 5900 is already up, so do it here.
-            # kickstart needs root — elevate with a single admin prompt.
-            self._enable_screen_sharing(key)
+            # Screen Sharing uses the macOS account (ARD), not a key-derived VNC
+            # password, so it does not need re-enabling when the key changes.
             rumps.notification(
                 APP_NAME, "Ready", "Unify Desktop Assistant is set up.",
             )

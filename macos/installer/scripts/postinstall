@@ -126,9 +126,9 @@ mkdir -p "$LOG_DIR"
     if [ -f "$KICKSTART" ] && [ -n "$UNIFY_KEY" ] && [ -n "$TARGET_UID" ]; then
         echo "[$(date)] Enabling Screen Sharing (in $TARGET_USER's session)..."
         # Run as root within the user's GUI session so port 5900 binds. setup.sh
-        # --set-vnc-password enables Screen Sharing and writes the VNC password via
-        # the settings file (reliable, unlike kickstart -setvncpw on macOS 13+).
-        launchctl asuser "$TARGET_UID" "$SETUP_SCRIPT" --set-vnc-password "$UNIFY_KEY" 2>&1 || true
+        # --enable-screen-sharing turns on Apple Screen Sharing (ARD account auth;
+        # the viewer signs in with the macOS username + password).
+        launchctl asuser "$TARGET_UID" "$SETUP_SCRIPT" --enable-screen-sharing 2>&1 || true
     fi
 
     # Hand ownership of the install dir to the target user BEFORE running setup,

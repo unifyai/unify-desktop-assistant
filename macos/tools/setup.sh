@@ -18,7 +18,7 @@
 #   - Agent Service (port 3000)
 #
 # Access URLs:
-#   - Desktop: http://localhost:6080/custom.html?password=<vnc-password>
+#   - Desktop: http://localhost:6080/custom.html (sign in with macOS account)
 #   - Agent API: http://localhost:3000
 
 set -euo pipefail
@@ -49,7 +49,7 @@ SKIP_BREW=false
 NO_START=false
 PREREQS_ONLY=false
 DEVICE_NAME=""
-SET_VNC_PW=""
+ENABLE_SS=false
 RECONFIGURE=false
 
 # =============================================================================
@@ -71,7 +71,7 @@ Options:
   --no-start            Skip starting services at end (used by .pkg postinstall)
   --prereqs-only        Install prerequisites only (no key required, no config/registration)
   --reconfigure         Re-apply key + re-register + restart services (no deps, no autostart)
-  --set-vnc-password K  (root) Enable Screen Sharing and set the VNC password from K
+  --enable-screen-sharing (root) Enable Apple Screen Sharing (ARD account auth)
   --device-name NAME    Friendly device name for registration (default: short hostname)
   --force               Force reinstall all components
   -h, --help            Show this help message
@@ -107,8 +107,8 @@ while [[ $# -gt 0 ]]; do
             PREREQS_ONLY=true; shift ;;
         --reconfigure)
             RECONFIGURE=true; shift ;;
-        --set-vnc-password)
-            SET_VNC_PW="$2"; shift 2 ;;
+        --enable-screen-sharing)
+            ENABLE_SS=true; shift ;;
         --device-name)
             DEVICE_NAME="$2"; shift 2 ;;
         --force)
@@ -228,33 +228,29 @@ get_env_value() {
 }
 
 # -----------------------------------------------------------------------------
-# VNC password (legacy Screen Sharing) management
+# Screen Sharing (Apple Remote Management) management
 #
-# The VNC password is set via `kickstart -setvncpw`, which writes
-# /Library/Preferences/com.apple.VNCSettings.txt in the exact format macOS
-# expects. Hand-writing that file (XOR hash) was tried but produced a malformed
-# file that macOS rejected, so the server fell back to ARD user auth (username +
-# password) and noVNC saw a blank screen — let kickstart own the file instead.
+# Remote access uses Apple Remote Desktop (ARD) authentication: the viewer signs
+# in with a macOS account (username + password). We deliberately do NOT enable
+# legacy VNC password auth (`-setvnclegacy`/`-setvncpw`): on modern macOS it is
+# advertised but never completes the handshake (the client hangs right after the
+# password), and it would leave a key-derived password in
+# /Library/Preferences/com.apple.VNCSettings.txt.
 # -----------------------------------------------------------------------------
 
-# Root-only: enable Apple Screen Sharing and set the legacy VNC password reliably.
-# Must run inside the user's GUI session (callers arrange this via `launchctl
-# asuser` or an osascript admin prompt) so port 5900 actually binds.
-do_set_vnc_password() {
-    local key="$1"
+# Root-only: enable Apple Screen Sharing (ARD). Must run inside the user's GUI
+# session (callers arrange this via `launchctl asuser` or an osascript admin
+# prompt) so port 5900 actually binds.
+do_enable_screen_sharing() {
     if [[ "$EUID" -ne 0 ]]; then
-        echo "ERROR: --set-vnc-password requires root (use sudo)." >&2
-        return 1
-    fi
-    if [[ -z "$key" ]]; then
-        echo "ERROR: --set-vnc-password requires a key value." >&2
+        echo "ERROR: --enable-screen-sharing requires root (use sudo)." >&2
         return 1
     fi
     if [[ ! -f "$KICKSTART" ]]; then
         echo "ERROR: kickstart not found — cannot manage Screen Sharing." >&2
         return 1
     fi
-    echo "Enabling Screen Sharing and setting VNC password..."
+    echo "Enabling Screen Sharing..."
     # Clear any persisted launchd disable override left by a previous uninstall.
     # `--uninstall` runs `launchctl disable system/com.apple.{screensharing,
     # remotemanagementd}`, which survives reboots; without re-enabling here,
@@ -262,16 +258,10 @@ do_set_vnc_password() {
     for _d in com.apple.screensharing com.apple.remotemanagementd; do
         launchctl enable "system/$_d" 2>/dev/null || true
     done
-    # Enable Remote Management + legacy VNC auth and set the password in one
-    # kickstart call, letting kickstart write the password file itself. Writing
-    # /Library/Preferences/com.apple.VNCSettings.txt by hand produced a malformed
-    # file that macOS rejected, forcing ARD user auth (username + password) and a
-    # blank screen over noVNC.
+    # ARD-only enable (account auth). No legacy VNC mode, no VNC password file.
     "$KICKSTART" -activate -configure -access -on \
-        -clientopts -setvnclegacy -vnclegacy yes \
-        -clientopts -setvncpw -vncpw "${key:0:8}" \
         -restart -agent -privs -all 2>&1 || true
-    echo "  Screen Sharing enabled (VNC password set)."
+    echo "  Screen Sharing enabled."
 }
 
 set_env_value() {
@@ -1271,13 +1261,14 @@ start_all_services() {
 
     # Start Screen Sharing (Apple VNC on 5900)
     if ! test_port_listening 5900; then
-        local vnc_password="$UNIFY_KEY"
-        if [[ -z "$vnc_password" && -f "$AGENT_SERVICE_DIR/.env" ]]; then
-            vnc_password=$(get_env_value "UNIFY_KEY")
+        # Only enable Screen Sharing once the assistant is configured.
+        local configured="$UNIFY_KEY"
+        if [[ -z "$configured" && -f "$AGENT_SERVICE_DIR/.env" ]]; then
+            configured=$(get_env_value "UNIFY_KEY")
         fi
 
-        if [[ -z "$vnc_password" ]]; then
-            echo "  ERROR: Cannot start Screen Sharing — no VNC password (UNIFY_KEY not set)" >&2
+        if [[ -z "$configured" ]]; then
+            echo "  Skipping Screen Sharing — not configured (UNIFY_KEY not set)"
             echo "  Configure via: sudo setup.sh --unify-key YOUR_KEY" >&2
         elif [[ ! -f "$KICKSTART" ]]; then
             echo "  ERROR: kickstart not found — cannot manage Screen Sharing" >&2
@@ -1292,16 +1283,9 @@ start_all_services() {
             for _d in com.apple.screensharing com.apple.remotemanagementd; do
                 launchctl enable "system/$_d" 2>/dev/null || true
             done
-            # Enable Remote Management + legacy VNC auth and set the password in a
-            # single kickstart call. Let kickstart write the password file itself
-            # (/Library/Preferences/com.apple.VNCSettings.txt) — hand-writing it
-            # produced a malformed 33-byte file (trailing newline / wrong case) that
-            # macOS rejected, so it fell back to ARD user auth (username + password)
-            # and noVNC saw a blank screen.
+            # ARD-only enable (account auth). No legacy VNC mode, no VNC password file.
             "$KICKSTART" \
                 -activate -configure -access -on \
-                -clientopts -setvnclegacy -vnclegacy yes \
-                -clientopts -setvncpw -vncpw "${vnc_password:0:8}" \
                 -restart -agent -privs -all > "$LOG_DIR/screensharing.log" 2>&1 || true
         fi
     else
@@ -1459,11 +1443,11 @@ show_summary() {
 # Main Execution
 # =============================================================================
 
-# Handle set-vnc-password (root-only; used by the installer/tray to set the VNC
-# password reliably). Dispatched first, before the root-refusal checks, since
+# Handle enable-screen-sharing (root-only; used by the installer/tray to enable
+# Apple Screen Sharing). Dispatched first, before the root-refusal checks, since
 # this operation REQUIRES root.
-if [[ -n "$SET_VNC_PW" ]]; then
-    do_set_vnc_password "$SET_VNC_PW"
+if $ENABLE_SS; then
+    do_enable_screen_sharing
     exit $?
 fi
 
