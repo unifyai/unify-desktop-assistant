@@ -230,17 +230,30 @@ get_env_value() {
 # -----------------------------------------------------------------------------
 # Screen Sharing (Apple Remote Management) management
 #
-# Remote access uses Apple Remote Desktop (ARD) authentication: the viewer signs
-# in with a macOS account (username + password). We deliberately do NOT enable
-# legacy VNC password auth (`-setvnclegacy`/`-setvncpw`): on modern macOS it is
-# advertised but never completes the handshake (the client hangs right after the
-# password), and it would leave a key-derived password in
-# /Library/Preferences/com.apple.VNCSettings.txt.
+# Remote access is password-only (no macOS username required). We enable legacy
+# VNC password auth (`-setvnclegacy`/`-setvncpw`) and set the VNC password to the
+# first 8 chars of UNIFY_KEY (legacy VNC passwords are capped at 8 chars). This
+# is the toggle Apple exposes in System Settings as "VNC viewers may control
+# screen with password" (VNCLegacyConnectionsEnabled=1); with it set, the server
+# advertises RFB security type 2 (VNC auth) and completes the handshake. The
+# bundled noVNC is patched (see install_novnc) to prefer type 2 over Apple ARD
+# (type 30) so the browser client never prompts for a macOS username.
+#
+# The macOS session lock is a separate layer handled outside this script (Unify
+# stores the account password as a secret); we do not touch screen-lock here.
 # -----------------------------------------------------------------------------
 
-# Root-only: enable Apple Screen Sharing (ARD). Must run inside the user's GUI
-# session (callers arrange this via `launchctl asuser` or an osascript admin
-# prompt) so port 5900 actually binds.
+# Root-only: enable macOS *basic* Screen Sharing (com.apple.screensharing) with
+# password-only legacy VNC.
+#
+# IMPORTANT: we deliberately use basic Screen Sharing, NOT Remote Management
+# (ARD). Both share the screensharingd binary and read the same VNC password
+# (com.apple.VNCSettings.txt) + VNCLegacyConnectionsEnabled flag, but only the
+# basic Screen Sharing service hands a legacy VNC (RFB type 2) connection off to
+# AppleVNCServer/VNCPrivilegeProxy to produce the framebuffer. ARD's path
+# authenticates the VNC password but then stalls before ServerInit (the client
+# hangs on "Connecting…" forever). So we enable com.apple.screensharing and keep
+# com.apple.remotemanagementd disabled.
 do_enable_screen_sharing() {
     if [[ "$EUID" -ne 0 ]]; then
         echo "ERROR: --enable-screen-sharing requires root (use sudo)." >&2
@@ -251,17 +264,43 @@ do_enable_screen_sharing() {
         return 1
     fi
     echo "Enabling Screen Sharing..."
-    # Clear any persisted launchd disable override left by a previous uninstall.
-    # `--uninstall` runs `launchctl disable system/com.apple.{screensharing,
-    # remotemanagementd}`, which survives reboots; without re-enabling here,
-    # kickstart -activate would silently fail to bind port 5900 on a reinstall.
-    for _d in com.apple.screensharing com.apple.remotemanagementd; do
-        launchctl enable "system/$_d" 2>/dev/null || true
-    done
-    # ARD-only enable (account auth). No legacy VNC mode, no VNC password file.
-    "$KICKSTART" -activate -configure -access -on \
-        -restart -agent -privs -all 2>&1 || true
+
+    local key
+    key=$(get_env_value "UNIFY_KEY")
+
+    enable_basic_screen_sharing "$key"
     echo "  Screen Sharing enabled."
+}
+
+# Shared helper: configure password-only legacy VNC and bring up the basic
+# Screen Sharing service. $1 = UNIFY_KEY (VNC password derives from first 8
+# chars). Must run as root.
+enable_basic_screen_sharing() {
+    local key="$1"
+    local ss_plist="/System/Library/LaunchDaemons/com.apple.screensharing.plist"
+
+    # Configure password-only legacy VNC. `kickstart -configure` only writes
+    # settings (VNCSettings.txt + prefs); it does NOT activate ARD.
+    if [[ -n "$key" ]]; then
+        "$KICKSTART" -configure -clientopts -setvnclegacy -vnclegacy yes 2>&1 || true
+        "$KICKSTART" -configure -clientopts -setvncpw -vncpw "${key:0:8}" 2>&1 || true
+    else
+        echo "  WARNING: UNIFY_KEY not set — VNC password not configured." >&2
+    fi
+    defaults write /Library/Preferences/com.apple.RemoteManagement \
+        VNCLegacyConnectionsEnabled -bool true 2>/dev/null || true
+    # Don't require local approval for incoming connections (unattended).
+    defaults write /Library/Preferences/com.apple.RemoteManagement \
+        ScreenSharingReqPermEnabled -bool false 2>/dev/null || true
+
+    # Keep Remote Management (ARD) OFF — its legacy-VNC path hangs at ServerInit.
+    launchctl disable system/com.apple.remotemanagementd 2>/dev/null || true
+
+    # Enable + start basic Screen Sharing (clears any persisted disable override
+    # left by a previous uninstall, then bootstraps the socket-activated job).
+    launchctl enable system/com.apple.screensharing 2>/dev/null || true
+    launchctl bootstrap system "$ss_plist" 2>/dev/null \
+        || launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
 }
 
 set_env_value() {
@@ -784,6 +823,25 @@ CUSTOMHTML
 
     cp "$NOVNC_DIR/custom.html" "$NOVNC_DIR/index.html"
     echo "  custom.html created"
+
+    # Prefer password-only VNC auth (RFB security type 2) over Apple ARD (type
+    # 30). macOS advertises both, with ARD first; stock noVNC picks the server's
+    # first supported type, which would force a macOS username prompt. We reorder
+    # the client's selection to use type 2 when offered so remote access is
+    # password-only. Idempotent: skipped if the marker is already present.
+    local rfb="$NOVNC_DIR/core/rfb.js"
+    if [[ -f "$rfb" ]]; then
+        if grep -q "Unify patch: prefer password-only" "$rfb"; then
+            echo "  noVNC already patched for password-only VNC auth"
+        else
+            perl -0777 -pi -e 's/(this\._rfbAuthScheme = -1;\n)(\s*)for \(let type of types\) \{/${1}${2}\/\/ Unify patch: prefer password-only VNC auth (type 2) over Apple ARD (type 30)\n${2}const _unifyOrdered = Array.from(types).includes(2) ? [2] : Array.from(types);\n${2}for (let type of _unifyOrdered) {/' "$rfb"
+            if grep -q "Unify patch: prefer password-only" "$rfb"; then
+                echo "  noVNC patched: prefer password-only VNC auth (type 2)"
+            else
+                echo "  WARNING: noVNC rfb.js patch did not apply (upstream layout changed?)" >&2
+            fi
+        fi
+    fi
 }
 
 install_magnitude() {
@@ -1277,16 +1335,11 @@ start_all_services() {
             echo "  Skipping VNC — other services will still start." >&2
         else
             echo "  Enabling Screen Sharing..."
-            # Clear any persisted launchd disable override left by a previous
-            # uninstall (which runs `launchctl disable system/...`), otherwise
-            # kickstart -activate cannot bind port 5900 on a reinstall.
-            for _d in com.apple.screensharing com.apple.remotemanagementd; do
-                launchctl enable "system/$_d" 2>/dev/null || true
-            done
-            # ARD-only enable (account auth). No legacy VNC mode, no VNC password file.
-            "$KICKSTART" \
-                -activate -configure -access -on \
-                -restart -agent -privs -all > "$LOG_DIR/screensharing.log" 2>&1 || true
+            # Enable password-only basic Screen Sharing (com.apple.screensharing),
+            # NOT Remote Management (ARD) — ARD's legacy-VNC path authenticates
+            # but stalls before ServerInit. See enable_basic_screen_sharing.
+            enable_basic_screen_sharing "$configured" \
+                > "$LOG_DIR/screensharing.log" 2>&1 || true
         fi
     else
         echo "  Screen Sharing already running on port 5900"

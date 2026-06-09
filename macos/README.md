@@ -15,8 +15,9 @@ A macOS application that sets up your machine as a remote-controllable AI assist
 > and enter your API Key there — setup finishes automatically (you'll be asked to
 > approve Screen Sharing once).
 
-> **Remote access credentials:** Screen Sharing uses Apple Remote Desktop
-> authentication — connect with your **macOS account username and password**.
+> **Remote access credentials:** Remote access is **password-only** (no macOS
+> username required). The VNC password is derived from your Unify API Key, so
+> connections are authenticated automatically through your Unify dashboard.
 
 ## Using the Tray App
 
