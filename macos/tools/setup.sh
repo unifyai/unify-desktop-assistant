@@ -255,6 +255,13 @@ do_set_vnc_password() {
         return 1
     fi
     echo "Enabling Screen Sharing and setting VNC password..."
+    # Clear any persisted launchd disable override left by a previous uninstall.
+    # `--uninstall` runs `launchctl disable system/com.apple.{screensharing,
+    # remotemanagementd}`, which survives reboots; without re-enabling here,
+    # kickstart -activate would silently fail to bind port 5900 on a reinstall.
+    for _d in com.apple.screensharing com.apple.remotemanagementd; do
+        launchctl enable "system/$_d" 2>/dev/null || true
+    done
     # Enable Remote Management + legacy VNC auth and set the password in one
     # kickstart call, letting kickstart write the password file itself. Writing
     # /Library/Preferences/com.apple.VNCSettings.txt by hand produced a malformed
@@ -467,13 +474,25 @@ uninstall_all() {
                 done
             fi
 
-            # Tear down the system daemons (best-effort; some may be SIP-managed).
+            # Persist-disable the on-demand system daemons FIRST, then bootout.
+            # macOS launches com.apple.screensharing via socket activation (port
+            # 5900) and com.apple.remotemanagementd via its Mach service, so a
+            # plain `bootout`/`kickstart -deactivate` only kills the *running*
+            # instance — the next TCP connection / Mach request respawns it, and
+            # a respawned remotemanagementd re-asserts the master flag back to
+            # "enabled" (the menu-bar icon returns "on its own"). `launchctl
+            # disable` writes a persisted override (in disabled.plist) that
+            # survives and prevents on-demand relaunch. The modern
+            # disable/bootout API replaces the legacy, SIP-unreliable
+            # `launchctl unload -w`.
+            for _d in com.apple.screensharing com.apple.remotemanagementd; do
+                launchctl disable "system/$_d" 2>/dev/null || true
+            done
             for _d in com.apple.remotemanagementd \
                       com.apple.RemoteDesktop.PrivilegeProxy \
                       com.apple.screensharing; do
                 launchctl bootout "system/$_d" 2>/dev/null || true
             done
-            launchctl unload -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
 
             # Flip the master flag LAST, after the agents/daemons are down, so
             # nothing is left alive to re-assert "enabled" after us. (Lives under
@@ -483,7 +502,7 @@ uninstall_all() {
 
             # Kill any stragglers so the menu-bar icon disappears immediately
             # instead of lingering until the next logout.
-            killall SSMenuAgent ARDAgent 2>/dev/null || true
+            killall SSMenuAgent ARDAgent screensharingd remotemanagementd 2>/dev/null || true
 
             # Remove the custom VNC password file kickstart wrote on enable.
             rm -f /Library/Preferences/com.apple.VNCSettings.txt 2>/dev/null || true
@@ -1259,6 +1278,12 @@ start_all_services() {
             echo "  Skipping VNC — other services will still start." >&2
         else
             echo "  Enabling Screen Sharing..."
+            # Clear any persisted launchd disable override left by a previous
+            # uninstall (which runs `launchctl disable system/...`), otherwise
+            # kickstart -activate cannot bind port 5900 on a reinstall.
+            for _d in com.apple.screensharing com.apple.remotemanagementd; do
+                launchctl enable "system/$_d" 2>/dev/null || true
+            done
             # Enable Remote Management + legacy VNC auth and set the password in a
             # single kickstart call. Let kickstart write the password file itself
             # (/Library/Preferences/com.apple.VNCSettings.txt) — hand-writing it
