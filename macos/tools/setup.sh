@@ -396,9 +396,13 @@ stop_all_services() {
     # Stop tunnel first
     stop_tunnel
 
-    # Stop Agent Service (node running agent-service)
+    # Stop Agent Service. It runs as `npm exec ts-node src/index.ts`, whose child
+    # (the port-3000 listener) is `node …/agent-service/node_modules/.bin/ts-node
+    # src/index.ts`. Match on the trailing `ts-node src/index.ts` so BOTH the npm
+    # parent and the node listener are caught — the old `ts-node.*agent-service`
+    # pattern never matched (in the path "agent-service" precedes "ts-node").
     local pids
-    pids=$(pgrep -f 'ts-node.*agent-service' 2>/dev/null || true)
+    pids=$(pgrep -f 'ts-node src/index.ts' 2>/dev/null || true)
     if [[ -n "$pids" ]]; then
         echo "$pids" | xargs kill -TERM 2>/dev/null || true
         echo "  Stopped Agent Service"
@@ -418,12 +422,22 @@ stop_all_services() {
     # the tray itself calls --stop, so unloading it would kill the menu-bar app.
     # The tray agent is only removed on full uninstall.
 
-    # Final sweep: kill processes on target ports
+    # Final sweep: kill processes on target ports. SIGTERM first, then escalate
+    # to SIGKILL for anything still listening — the Node agent handles SIGTERM
+    # (graceful shutdown / keep-alive sockets) and otherwise lingers on 3000.
     for port in 6080 3000; do
         pids=$(lsof -ti TCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
         if [[ -n "$pids" ]]; then
             echo "$pids" | xargs kill -TERM 2>/dev/null || true
             echo "  Killed process on port $port"
+        fi
+    done
+    sleep 2
+    for port in 6080 3000; do
+        pids=$(lsof -ti TCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
+        if [[ -n "$pids" ]]; then
+            echo "$pids" | xargs kill -KILL 2>/dev/null || true
+            echo "  Force-killed lingering process on port $port"
         fi
     done
 
