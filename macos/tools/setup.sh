@@ -301,6 +301,29 @@ enable_basic_screen_sharing() {
     launchctl enable system/com.apple.screensharing 2>/dev/null || true
     launchctl bootstrap system "$ss_plist" 2>/dev/null \
         || launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
+
+    # The system daemon (above) only binds port 5900 + does VNC auth. The actual
+    # screen capture is done by a PER-LOGIN-SESSION agent
+    # (gui/$uid/com.apple.screensharing.agent) that must attach to the user's
+    # WindowServer. If we don't (re)launch it inside the active GUI session, the
+    # first connection authenticates but streams a BLACK framebuffer until the
+    # user toggles Screen Sharing in System Settings. Kick it here to reproduce
+    # what that toggle does.
+    local _cuser _cuid
+    _cuser="$(scutil <<< 'show State:/Users/ConsoleUser' 2>/dev/null | awk '/Name :/ { print $3 }')"
+    if [[ -z "$_cuser" || "$_cuser" == "loginwindow" || "$_cuser" == "root" ]]; then
+        _cuser="${SUDO_USER:-}"
+    fi
+    _cuid="$(id -u "$_cuser" 2>/dev/null || true)"
+    if [[ -n "$_cuid" && "$_cuid" != "0" ]]; then
+        local _agent="gui/$_cuid/com.apple.screensharing.agent"
+        launchctl asuser "$_cuid" launchctl enable "$_agent" 2>/dev/null || true
+        launchctl asuser "$_cuid" launchctl kickstart -k "$_agent" 2>/dev/null || true
+    else
+        echo "  WARNING: could not resolve GUI console user — screen capture" >&2
+        echo "  agent not kicked; remote view may be black until you toggle" >&2
+        echo "  Screen Sharing in System Settings once." >&2
+    fi
 }
 
 set_env_value() {
