@@ -444,21 +444,18 @@ uninstall_all() {
         if [[ "$EUID" -eq 0 ]]; then
             echo ""
             echo "Disabling Screen Sharing / Remote Management..."
-            # kickstart -deactivate is unreliable on macOS 13+ (Sequoia/Tahoe): it
-            # stops the VNC daemon (port 5900) but frequently leaves the Remote
-            # Management master flag at "enabled", so RemoteManagementAgent /
-            # RemoteDesktop.agent keep running and the menu-bar icon
-            # (com.apple.screensharing.menuextra) stays up. So we (1) best-effort
-            # kickstart, (2) flip the master flag directly, then (3) tear down the
-            # live agents/daemons by their real launchd labels.
-            "$KICKSTART" -deactivate -configure -access -off 2>/dev/null || true
-            "$KICKSTART" -configure -clientopts -setvnclegacy -vnclegacy no 2>/dev/null || true
-
-            # Master switch kickstart -activate sets to "enabled". Writing it back
-            # to "disabled" is what actually turns Remote Management off (this lives
-            # under /Library, not /System, so it's writable by root, not SIP-locked).
-            RM_FLAG="/Library/Application Support/Apple/Remote Desktop/RemoteManagement.launchd"
-            [[ -f "$RM_FLAG" ]] && printf 'disabled' > "$RM_FLAG" 2>/dev/null || true
+            # kickstart MUST run inside the user's GUI (Aqua) session. From the
+            # tray's `do shell script with administrator privileges` context (root
+            # but DETACHED from the GUI session), a bare `kickstart -deactivate`
+            # does NOT stop remotemanagementd — which then re-asserts the master
+            # flag back to "enabled" and the menu-bar icon returns. Wrapping it in
+            # `launchctl asuser "$tgt_uid"` matches the working enable path (and a
+            # session-attached `sudo` in Terminal). Fall back to bare root only if
+            # we couldn't resolve the user.
+            local _ks=("$KICKSTART")
+            [[ -n "$tgt_uid" ]] && _ks=(launchctl asuser "$tgt_uid" "$KICKSTART")
+            "${_ks[@]}" -deactivate -configure -access -off 2>/dev/null || true
+            "${_ks[@]}" -configure -clientopts -setvnclegacy -vnclegacy no 2>/dev/null || true
 
             # Tear down the running user agents (menu-bar icon = screensharing.menuextra).
             if [[ -n "$tgt_uid" ]]; then
@@ -478,11 +475,17 @@ uninstall_all() {
             done
             launchctl unload -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
 
+            # Flip the master flag LAST, after the agents/daemons are down, so
+            # nothing is left alive to re-assert "enabled" after us. (Lives under
+            # /Library, not /System — root-writable, not SIP-locked.)
+            RM_FLAG="/Library/Application Support/Apple/Remote Desktop/RemoteManagement.launchd"
+            [[ -f "$RM_FLAG" ]] && printf 'disabled' > "$RM_FLAG" 2>/dev/null || true
+
             # Kill any stragglers so the menu-bar icon disappears immediately
             # instead of lingering until the next logout.
             killall SSMenuAgent ARDAgent 2>/dev/null || true
 
-            # Remove the custom VNC password file we wrote on enable.
+            # Remove the custom VNC password file kickstart wrote on enable.
             rm -f /Library/Preferences/com.apple.VNCSettings.txt 2>/dev/null || true
             echo "  Screen Sharing / Remote Management disabled"
         else
@@ -717,6 +720,39 @@ install_novnc() {
             echo "ERROR: noVNC clone failed" >&2
             return 1
         fi
+    fi
+
+    # Patch noVNC to prefer password-only VNC auth (security type 2) over Apple
+    # Remote Desktop auth (type 30). macOS advertises type 30 *first*, so stock
+    # noVNC negotiates ARD and prompts for a macOS username + password. We want
+    # password-only access using the legacy VNC password, so reorder the
+    # client's security-type selection to pick type 2 whenever the server offers
+    # it. Idempotent: safe to re-run on an existing clone.
+    local rfb_js="$NOVNC_DIR/core/rfb.js"
+    if [[ -f "$rfb_js" ]]; then
+        echo "  Patching noVNC to prefer password-only VNC auth..."
+        "$PYTHON_BIN" - "$rfb_js" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    src = f.read()
+marker = "for (let type of types) {"
+repl = (
+    "let _unifyTypes = Array.from(types);\n"
+    "            if (_unifyTypes.includes(2)) { _unifyTypes = [2].concat("
+    "_unifyTypes.filter(function (t) { return t !== 2; })); }\n"
+    "            for (let type of _unifyTypes) {"
+)
+if "_unifyTypes" in src:
+    print("    noVNC already patched")
+elif marker in src:
+    with open(path, "w") as f:
+        f.write(src.replace(marker, repl, 1))
+    print("    noVNC patched (prefer VNC-auth type 2)")
+else:
+    sys.stderr.write("    WARNING: noVNC security-type marker not found; "
+                     "client may prompt for username+password\n")
+PYEOF
     fi
 
     echo "  Creating custom.html..."
