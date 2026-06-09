@@ -11,16 +11,13 @@
     margin: 0;
     padding: 16px 4px;
   }
-  h2 { font-size: 16px; margin: 0 0 10px; }
-  p  { margin: 0 0 12px; }
+  h2 { font-size: 16px; margin: 0 0 10px; color: #1d1d1f; }
+  p  { margin: 0 0 12px; color: #1d1d1f; }
   ul { margin: 0 0 12px; padding-left: 20px; }
-  li { margin: 0 0 6px; }
-  .note {
-    background: #f2f7ff;
-    border-left: 3px solid #0a84ff;
-    padding: 10px 12px;
-    border-radius: 4px;
-    color: #333;
+  li { margin: 0 0 6px; color: #1d1d1f; }
+  code { font-size: 12px; }
+  @media (prefers-color-scheme: dark) {
+    body, h2, p, li { color: #f5f5f7; }
   }
 </style>
 </head>
@@ -35,9 +32,7 @@
     <li>Request your permission to enable <b>Screen Sharing</b>, so the desktop can be viewed remotely.</li>
     <li>Add a <b>menu-bar app</b> for starting/stopping services and managing settings.</li>
   </ul>
-  <div class="note">
-    Don't have your API key handy? Just click <b>Skip</b> when prompted — you can
-    add it any time from the menu-bar icon under <b>Settings…</b>.
-  </div>
+  <p>Don't have your API key handy? Just click <b>Skip</b> when prompted &mdash; you can
+     add it any time from the menu-bar icon under <b>Settings&hellip;</b>.</p>
 </body>
 </html>

@@ -11,32 +11,27 @@
     margin: 0;
     padding: 16px 4px;
   }
-  h2 { font-size: 16px; margin: 0 0 10px; }
-  p  { margin: 0 0 12px; }
+  h2 { font-size: 16px; margin: 0 0 10px; color: #1d1d1f; }
+  p  { margin: 0 0 12px; color: #1d1d1f; }
   ul { margin: 0 0 12px; padding-left: 20px; }
-  li { margin: 0 0 6px; }
-  .ok {
-    background: #effaf0;
-    border-left: 3px solid #34c759;
-    padding: 10px 12px;
-    border-radius: 4px;
-    color: #333;
-  }
+  li { margin: 0 0 6px; color: #1d1d1f; }
+  .lead { font-weight: 600; }
   code { font-size: 12px; }
+  @media (prefers-color-scheme: dark) {
+    body, h2, p, li { color: #f5f5f7; }
+  }
 </style>
 </head>
 <body>
   <h2>Installation Complete</h2>
-  <div class="ok">
-    <b>Setup now runs in the background</b> — you can close this installer.
-    <br>Setup is <b>complete once the Unify menu-bar icon (tray app) appears</b>
-    near the clock; it turns <b>green</b> when services are running.
-  </div>
+  <p class="lead">Setup now runs in the background &mdash; you can close this installer.</p>
+  <p>Setup is <b>complete once the Unify menu-bar icon (tray app) appears</b>
+     near the clock. It turns <b>green</b> when services are running.</p>
   <p>What happens next:</p>
   <ul>
     <li>Dependencies and services finish installing automatically (this can take a few minutes on first install).</li>
     <li>If you entered your API key, services start and Screen Sharing is enabled for you.</li>
-    <li>If you skipped the key, open the menu-bar icon and choose <b>Settings…</b> to enter it — setup completes after that (you'll be asked to approve Screen Sharing once).</li>
+    <li>If you skipped the key, open the menu-bar icon and choose <b>Settings&hellip;</b> to enter it &mdash; setup completes after that (you'll be asked to approve Screen Sharing once).</li>
   </ul>
   <p>To watch progress you can run:
      <br><code>tail -f /opt/unify-desktop-assistant/logs/postinstall-deferred.log</code></p>
