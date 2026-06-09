@@ -476,26 +476,44 @@ uninstall_all() {
         if [[ "$EUID" -eq 0 ]]; then
             echo ""
             echo "Disabling Screen Sharing / Remote Management..."
-            # Use the canonical SINGLE-call disable. The previous split form
-            # (`-deactivate -stop`, then a separate `-configure -access -off`) left
-            # /Library/Application Support/Apple/Remote Desktop/RemoteManagement.launchd
-            # at "enabled", so macOS kept SSMenuAgent (the menu-bar icon) and
-            # ARDAgent running even though port 5900 was down. The combined form
-            # writes "disabled" atomically. Run inside the user's GUI (Aqua)
-            # session (asuser), mirroring the enable path, with a root fallback.
+            # kickstart -deactivate is unreliable on macOS 13+ (Sequoia/Tahoe): it
+            # stops the VNC daemon (port 5900) but frequently leaves the Remote
+            # Management master flag at "enabled", so RemoteManagementAgent /
+            # RemoteDesktop.agent keep running and the menu-bar icon
+            # (com.apple.screensharing.menuextra) stays up. So we (1) best-effort
+            # kickstart, (2) flip the master flag directly, then (3) tear down the
+            # live agents/daemons by their real launchd labels.
+            "$KICKSTART" -deactivate -configure -access -off 2>/dev/null || true
+            "$KICKSTART" -configure -clientopts -setvnclegacy -vnclegacy no 2>/dev/null || true
+
+            # Master switch kickstart -activate sets to "enabled". Writing it back
+            # to "disabled" is what actually turns Remote Management off (this lives
+            # under /Library, not /System, so it's writable by root, not SIP-locked).
+            RM_FLAG="/Library/Application Support/Apple/Remote Desktop/RemoteManagement.launchd"
+            [[ -f "$RM_FLAG" ]] && printf 'disabled' > "$RM_FLAG" 2>/dev/null || true
+
+            # Tear down the running user agents (menu-bar icon = screensharing.menuextra).
             if [[ -n "$tgt_uid" ]]; then
-                launchctl asuser "$tgt_uid" "$KICKSTART" -deactivate -configure -access -off 2>/dev/null || true
-                launchctl asuser "$tgt_uid" "$KICKSTART" -configure -clientopts -setvnclegacy -vnclegacy no 2>/dev/null || true
-            else
-                "$KICKSTART" -deactivate -configure -access -off 2>/dev/null || true
-                "$KICKSTART" -configure -clientopts -setvnclegacy -vnclegacy no 2>/dev/null || true
+                for _label in com.apple.screensharing.menuextra \
+                              com.apple.RemoteDesktop.agent \
+                              com.apple.RemoteManagementAgent \
+                              com.apple.screensharing.agent; do
+                    launchctl bootout "gui/$tgt_uid/$_label" 2>/dev/null || true
+                done
             fi
+
+            # Tear down the system daemons (best-effort; some may be SIP-managed).
+            for _d in com.apple.remotemanagementd \
+                      com.apple.RemoteDesktop.PrivilegeProxy \
+                      com.apple.screensharing; do
+                launchctl bootout "system/$_d" 2>/dev/null || true
+            done
             launchctl unload -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
-            launchctl bootout system/com.apple.screensharing 2>/dev/null || true
-            # Drop the menu-bar icon now instead of at next logout. With Remote
-            # Management disabled these won't relaunch showing an icon.
-            killall SSMenuAgent 2>/dev/null || true
-            killall ARDAgent 2>/dev/null || true
+
+            # Kill any stragglers so the menu-bar icon disappears immediately
+            # instead of lingering until the next logout.
+            killall SSMenuAgent ARDAgent 2>/dev/null || true
+
             # Remove the custom VNC password file we wrote on enable.
             rm -f /Library/Preferences/com.apple.VNCSettings.txt 2>/dev/null || true
             echo "  Screen Sharing / Remote Management disabled"
