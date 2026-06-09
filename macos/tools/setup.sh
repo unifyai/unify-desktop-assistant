@@ -436,7 +436,15 @@ uninstall_all() {
     # LaunchAgents.
     local tgt_user tgt_home tgt_uid
     tgt_user="${SUDO_USER:-}"
+    # scutil is the canonical way to find the GUI console user. `stat -f '%Su'
+    # /dev/console` is unreliable (on some macOS versions /dev/console is owned
+    # by root even with a user logged in), which makes the tray-context uninstall
+    # (where SUDO_USER is empty) resolve to "root" and fail to disable Screen
+    # Sharing in the user's session.
     if [[ -z "$tgt_user" || "$tgt_user" == "root" ]]; then
+        tgt_user="$(scutil <<< 'show State:/Users/ConsoleUser' 2>/dev/null | awk '/Name :/ { print $3 }')"
+    fi
+    if [[ -z "$tgt_user" || "$tgt_user" == "root" || "$tgt_user" == "loginwindow" ]]; then
         tgt_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
     fi
     [[ -z "$tgt_user" || "$tgt_user" == "root" ]] && tgt_user="$USER"

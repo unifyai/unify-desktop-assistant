@@ -16,9 +16,19 @@ LOG_DIR="$APP_DIR/logs"
 
 echo "[postinstall] Configuring Unify Desktop Assistant..."
 
-# Determine the real user (installer runs as root)
-# $USER is root during pkg install; console user is the real one
-TARGET_USER="$(stat -f '%Su' /dev/console 2>/dev/null || echo "${SUDO_USER:-$USER}")"
+# Determine the real (GUI console) user. The installer runs as root, so $USER is
+# root. Resolve the logged-in user via scutil — the canonical method — because
+# `stat -f '%Su' /dev/console` is unreliable (on some macOS versions/states
+# /dev/console is owned by root even with a user logged in, which silently
+# skipped the API-key prompt and the user-context setup). Fall back to the
+# legacy methods only if scutil yields nothing usable.
+TARGET_USER="$(scutil <<< 'show State:/Users/ConsoleUser' 2>/dev/null | awk '/Name :/ { print $3 }')"
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "loginwindow" ] || [ "$TARGET_USER" = "root" ]; then
+    TARGET_USER="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+fi
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+    TARGET_USER="${SUDO_USER:-$USER}"
+fi
 TARGET_HOME="$(eval echo "~$TARGET_USER")"
 TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || echo "")"
 
