@@ -722,39 +722,6 @@ install_novnc() {
         fi
     fi
 
-    # Patch noVNC to prefer password-only VNC auth (security type 2) over Apple
-    # Remote Desktop auth (type 30). macOS advertises type 30 *first*, so stock
-    # noVNC negotiates ARD and prompts for a macOS username + password. We want
-    # password-only access using the legacy VNC password, so reorder the
-    # client's security-type selection to pick type 2 whenever the server offers
-    # it. Idempotent: safe to re-run on an existing clone.
-    local rfb_js="$NOVNC_DIR/core/rfb.js"
-    if [[ -f "$rfb_js" ]]; then
-        echo "  Patching noVNC to prefer password-only VNC auth..."
-        "$PYTHON_BIN" - "$rfb_js" <<'PYEOF'
-import sys
-path = sys.argv[1]
-with open(path) as f:
-    src = f.read()
-marker = "for (let type of types) {"
-repl = (
-    "let _unifyTypes = Array.from(types);\n"
-    "            if (_unifyTypes.includes(2)) { _unifyTypes = [2].concat("
-    "_unifyTypes.filter(function (t) { return t !== 2; })); }\n"
-    "            for (let type of _unifyTypes) {"
-)
-if "_unifyTypes" in src:
-    print("    noVNC already patched")
-elif marker in src:
-    with open(path, "w") as f:
-        f.write(src.replace(marker, repl, 1))
-    print("    noVNC patched (prefer VNC-auth type 2)")
-else:
-    sys.stderr.write("    WARNING: noVNC security-type marker not found; "
-                     "client may prompt for username+password\n")
-PYEOF
-    fi
-
     echo "  Creating custom.html..."
 
     cat > "$NOVNC_DIR/custom.html" <<'CUSTOMHTML'
