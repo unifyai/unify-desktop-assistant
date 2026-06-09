@@ -439,6 +439,21 @@ uninstall_all() {
     echo ""
     echo "=== Uninstalling Unify Desktop Assistant ==="
 
+    # Resolve the real (console) user up-front. Uninstall runs as root, so $USER
+    # is "root" and $HOME is /var/root. SUDO_USER is set when invoked via `sudo`
+    # (CLI), but NOT when invoked via the tray's `osascript … with administrator
+    # privileges`, so we fall back to the logged-in console user. This is needed
+    # both to reach the user's GUI session (Screen Sharing) and to find the user's
+    # LaunchAgents.
+    local tgt_user tgt_home tgt_uid
+    tgt_user="${SUDO_USER:-}"
+    if [[ -z "$tgt_user" || "$tgt_user" == "root" ]]; then
+        tgt_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+    fi
+    [[ -z "$tgt_user" || "$tgt_user" == "root" ]] && tgt_user="$USER"
+    tgt_uid="$(id -u "$tgt_user" 2>/dev/null || echo "")"
+    tgt_home="$(eval echo "~$tgt_user")"
+
     # 1. Stop all services
     stop_all_services
 
@@ -447,10 +462,23 @@ uninstall_all() {
         if [[ "$EUID" -eq 0 ]]; then
             echo ""
             echo "Disabling Screen Sharing..."
-            "$KICKSTART" -deactivate -stop 2>/dev/null || true
-            "$KICKSTART" -configure -access -off 2>/dev/null || true
-            "$KICKSTART" -configure -clientopts -setvnclegacy -vnclegacy no 2>/dev/null || true
+            # kickstart must run inside the user's GUI (Aqua) session to actually
+            # stop the running ARD agent that binds port 5900 — exactly mirroring
+            # the enable path. From the tray's privileged-but-sessionless root
+            # context a bare kickstart only rewrites config and leaves 5900 up.
+            if [[ -n "$tgt_uid" ]]; then
+                launchctl asuser "$tgt_uid" "$KICKSTART" -deactivate -stop 2>/dev/null || true
+                launchctl asuser "$tgt_uid" "$KICKSTART" -configure -access -off 2>/dev/null || true
+                launchctl asuser "$tgt_uid" "$KICKSTART" -configure -clientopts -setvnclegacy -vnclegacy no 2>/dev/null || true
+            else
+                "$KICKSTART" -deactivate -stop 2>/dev/null || true
+                "$KICKSTART" -configure -access -off 2>/dev/null || true
+                "$KICKSTART" -configure -clientopts -setvnclegacy -vnclegacy no 2>/dev/null || true
+            fi
             launchctl unload -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+            launchctl bootout system/com.apple.screensharing 2>/dev/null || true
+            # Remove the custom VNC password file we wrote on enable.
+            rm -f /Library/Preferences/com.apple.VNCSettings.txt 2>/dev/null || true
             echo "  Screen Sharing disabled"
         else
             echo ""
@@ -477,15 +505,9 @@ uninstall_all() {
         echo "  Removed rathole directory"
     fi
 
-    # 4. Remove launchd agents
+    # 4. Remove launchd agents (tgt_user/tgt_home/tgt_uid resolved at top)
     echo ""
     echo "Removing launchd agents..."
-    # Resolve the real user (uninstall is run via sudo, so $HOME/id -u are root's)
-    local tgt_user tgt_home tgt_uid
-    tgt_user="${SUDO_USER:-$USER}"
-    tgt_home=$(eval echo "~$tgt_user")
-    tgt_uid=$(id -u "$tgt_user" 2>/dev/null || echo "")
-
     for agent in com.unify.tray; do
         local plist="$tgt_home/Library/LaunchAgents/${agent}.plist"
         if [[ -f "$plist" ]]; then
