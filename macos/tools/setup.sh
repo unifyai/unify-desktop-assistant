@@ -595,7 +595,7 @@ uninstall_all() {
     # 4. Remove launchd agents (tgt_user/tgt_home/tgt_uid resolved at top)
     echo ""
     echo "Removing launchd agents..."
-    for agent in com.unify.tray; do
+    for agent in com.unify.tray com.unify.tunnel; do
         local plist="$tgt_home/Library/LaunchAgents/${agent}.plist"
         if [[ -f "$plist" ]]; then
             if [[ -n "$tgt_uid" ]]; then
@@ -1071,6 +1071,11 @@ register_tunnel() {
         printf '%s\n' "$client_config" > "$RATHOLE_CONFIG"
     fi
 
+    # Kick the launchd tunnel agent so the fresh token/config is picked up now.
+    # The agent is bootstrapped by setup_autostart (which runs before this in the
+    # install flow); harmless no-op if it isn't loaded yet.
+    launchctl kickstart -k "gui/$(id -u)/com.unify.tunnel" 2>/dev/null || true
+
     echo "  Tunnel registered: $tunnel_id"
     echo "  Public URL: $tunnel_url"
 }
@@ -1079,35 +1084,33 @@ start_tunnel() {
     echo ""
     echo "=== Starting Tunnel ==="
 
-    if [[ ! -x "$RATHOLE_BIN" ]]; then
-        echo "  Rathole not installed, skipping tunnel start"
+    # rathole is run by the com.unify.tunnel launchd agent (KeepAlive PathState:
+    # alive whenever client.toml exists). We just ensure the agent is loaded and
+    # kick it so a freshly-written config/token is picked up immediately. This is
+    # idempotent: `bootstrap` is a no-op if already loaded, and re-loads the agent
+    # after an explicit --stop (which boots it out).
+    local domain="gui/$(id -u)"
+    local tunnel_plist="$HOME/Library/LaunchAgents/com.unify.tunnel.plist"
+
+    if [[ ! -f "$tunnel_plist" ]]; then
+        echo "  Tunnel agent not installed, skipping (run setup to install it)"
         return
     fi
 
-    if [[ ! -f "$RATHOLE_CONFIG" ]]; then
-        echo "  No tunnel config found, skipping tunnel start"
-        return
-    fi
-
-    if pgrep -f "rathole.*client\.toml" &>/dev/null; then
-        echo "  Tunnel already running (PID $(pgrep -f 'rathole.*client\.toml' | head -1))"
-        return
-    fi
-
-    echo "  Starting rathole tunnel client..."
-    nohup "$RATHOLE_BIN" "$RATHOLE_CONFIG" > "$LOG_DIR/rathole.log" 2>&1 &
+    launchctl bootstrap "$domain" "$tunnel_plist" 2>/dev/null || true
+    launchctl kickstart -k "$domain/com.unify.tunnel" 2>/dev/null || true
 
     sleep 2
 
     if pgrep -f "rathole.*client\.toml" &>/dev/null; then
-        local pid
-        pid=$(pgrep -f 'rathole.*client\.toml' | head -1)
         local tunnel_url
         tunnel_url=$(get_env_value "TUNNEL_URL")
-        echo "  Tunnel running (PID $pid)"
+        echo "  Tunnel running"
         [[ -n "$tunnel_url" ]] && echo "  Public URL: $tunnel_url"
+    elif [[ ! -f "$RATHOLE_CONFIG" ]]; then
+        echo "  No tunnel config yet — agent will start rathole once registered"
     else
-        echo "  WARNING: Tunnel may have failed to start. Check log: $LOG_DIR/rathole.log"
+        echo "  WARNING: Tunnel may not be running. Check log: $LOG_DIR/rathole.log"
         if [[ -f "$LOG_DIR/rathole.log" ]]; then
             tail -5 "$LOG_DIR/rathole.log" 2>/dev/null | sed 's/^/    /'
         fi
@@ -1115,12 +1118,11 @@ start_tunnel() {
 }
 
 stop_tunnel() {
-    local pids
-    pids=$(pgrep -f "rathole.*client\.toml" 2>/dev/null || true)
-    if [[ -n "$pids" ]]; then
-        echo "$pids" | xargs kill -TERM 2>/dev/null || true
-        echo "  Stopped rathole tunnel"
-    fi
+    # Boot out the launchd agent so an explicit --stop stays down for the session
+    # (launchd would otherwise respawn rathole while client.toml exists). The
+    # agent reloads at next login from the LaunchAgents plist.
+    launchctl bootout "gui/$(id -u)/com.unify.tunnel" 2>/dev/null || true
+    echo "  Stopped rathole tunnel"
 }
 
 unregister_tunnel() {
@@ -1316,7 +1318,22 @@ setup_autostart() {
         "$template" > "$tray_plist"
     echo "  Autostart plist created: $tray_plist"
 
-    # (Re)load the tray agent so it starts now and at every login.
+    # Render the tunnel agent plist (rathole runs whenever client.toml exists;
+    # launchd owns its lifecycle via PathState KeepAlive).
+    local tunnel_template="$INSTALL_DIR/launchd/com.unify.tunnel.plist"
+    local tunnel_plist="$target_dir/com.unify.tunnel.plist"
+    if [[ -f "$tunnel_template" ]]; then
+        sed \
+            -e "s|%RATHOLE_BIN%|$RATHOLE_BIN|g" \
+            -e "s|%RATHOLE_CONFIG%|$RATHOLE_CONFIG|g" \
+            -e "s|%LOG_DIR%|$LOG_DIR|g" \
+            "$tunnel_template" > "$tunnel_plist"
+        echo "  Tunnel plist created: $tunnel_plist"
+    else
+        echo "  WARNING: tunnel plist template not found at $tunnel_template" >&2
+    fi
+
+    # (Re)load the tray + tunnel agents so they start now and at every login.
     if [[ "$EUID" -ne 0 ]]; then
         local domain="gui/$(id -u)"
         launchctl bootout "$domain/com.unify.tray" 2>/dev/null || true
@@ -1325,8 +1342,17 @@ setup_autostart() {
         else
             echo "  Tray agent will load at next login"
         fi
+
+        if [[ -f "$tunnel_plist" ]]; then
+            launchctl bootout "$domain/com.unify.tunnel" 2>/dev/null || true
+            if launchctl bootstrap "$domain" "$tunnel_plist" 2>/dev/null; then
+                echo "  Tunnel agent loaded"
+            else
+                echo "  Tunnel agent will load at next login"
+            fi
+        fi
     else
-        echo "  Skipping launchctl load (running as root) — tray loads at next user login"
+        echo "  Skipping launchctl load (running as root) — agents load at next user login"
     fi
 }
 
@@ -1462,10 +1488,10 @@ start_all_services() {
         echo "  Some services failed to start. Check the log files above for details."
     fi
 
-    # Start tunnel after local services are confirmed up
-    if $all_ok; then
-        start_tunnel
-    fi
+    # The tunnel is independent of the local services (it just forwards port
+    # 3000 to the agent). launchd owns its lifecycle, so we start it
+    # unconditionally rather than gating on VNC/websockify/agent being up.
+    start_tunnel
 }
 
 # =============================================================================
