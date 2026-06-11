@@ -1,86 +1,37 @@
-# Unity Assistant Desktop Remote Client
+# Unify Desktop Assistant for macOS
 
-## Prerequisites
+A macOS application that sets up your machine as a remote-controllable AI assistant workstation. Includes a menu bar tray app for easy service management.
 
-1. Homebrew
+## Quick Start
 
-`/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
+1. Download `unify-desktop-assistant_x.x.x_macos.pkg` from the latest GitHub Release
+2. Double-click to install and follow the prompts
+3. Enter your Unify API Key when prompted (or click **Skip** to add it later)
+4. Approve the Screen Sharing permission prompt when asked
+5. Wait for the installation to complete (might take about 10 minutes)
+6. The tray app will start automatically
 
-## Installations
+> If you clicked **Skip** in step 3, open the menu-bar icon, choose **Settings…**,
+> and enter your API Key there — setup finishes automatically (you'll be asked to
+> approve Screen Sharing once).
 
-### Download Homebrew Package
+> **Remote access credentials:** Remote access is **password-only** (no macOS
+> username required). The VNC password is derived from your Unify API Key, so
+> connections are authenticated automatically through your Unify dashboard.
 
-1. Install the CLI tool.
+## Using the Tray App
 
-`brew install --HEAD unifyai/unifyai/unify-desktop-assistant`
+After installation, the **Unify Desktop Assistant** icon appears in your menu bar.
 
-2. Proceed to local setup.
+**Click the icon for options:**
+- **▶ Start Services** - Start all background services
+- **■ Stop Services** - Stop all services
+- **📋 Copy Public URL** - Copy the tunnel URL to clipboard
+- **⚙ Settings** - Configure your API keys, view device/tunnel info
+- **📄 View Logs** - Open agent service logs
+- **❌ Quit** - Close the tray app
 
-### Local Setup
-
-Watch this video for [local setup](https://www.loom.com/share/c6db63fa38d54ed8ac9591dec5ab1d8a?sid=ee5d12ed-3106-41fd-9f24-5ffd70a50fba).
-
-1. Add the required environment variables.
-
-`unify-desktop-assistant add-env UNIFY_BASE_URL https://api.unify.ai/v0`
-
-`unify-desktop-assistant add-env UNIFY_KEY <your-key-value>`
-
-`unify-desktop-assistant add-env ANTHROPIC_API_KEY <your-key-value>`
-
-`unify-desktop-assistant add-env ASSISTANT_NAME <first> <last>`
-
-```bash
-set -a
-source "$(brew --prefix unifyai/unifyai/unify-desktop-assistant)/libexec/agent-service/.env"
-set +a
-```
-
-2. Install the required dependencies.
-
-`unify-desktop-assistant install`
-
-3. Create a user profile for the agent with the following details:
-
-Username: `<AGENT_NAME_FIRST_LAST>`
-
-Password: `<UNIFY_KEY>`
-
-4. Start the remote client app.
-
-`unify-desktop-assistant start`
-
-### HTTPS Tunnel
-
-1. If there isn't a default and secure external IP for controls, tunnel the service to HTTPS.
-
-a. For testing
-
-- Start the tunnel. A URL for testing will be provided.
-
-`unify-desktop-assistant tunnel`
-
-b. For production - WIP
-
-- Login to Cloudflare. This is a one time step.
-
-`cloudflared tunnel login`
-
-- Start the tunnel.
-
-`TUNNEL_HOSTNAME=<prod_hostname> TUNNEL_NAME=<prod_appname> unify-desktop-assistant tunnel`
-
-### Live Remote Viewing and Controls
-
-1. Tunnel the remote view.
-
-`unify-desktop-assistant liveview`
-
-2. View and control the desktop through the URL below. When prompted for username and password, use the details above.
-
-`<cloudflared-url>/vnc.html?resize=scale&autoreconnect=1&autoconnect=1`
-
-### Troubleshooting
-
-- Make sure `ANTHROPIC_API_KEY`, `UNIFY_BASE_URL` and `UNIFY_KEY` are in your `.env` file when starting the service.
-- When running with Actor, make sure `UNIFY_KEY` and at least `ASSISTANT_EMAIL=unity.agent@unity.ai` are present in your unity `.env` for the magnitude server auth to work.
+**Status colors:**
+- 🟢 Green - All services running
+- 🟡 Yellow - Some services running
+- 🔴 Red - All services stopped

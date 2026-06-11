@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# unify-desktop-assistant - CLI wrapper for Unify Desktop Assistant (macOS)
+#
+# Mirrors the interface of ubuntu/usr/bin/unify-desktop-assistant
+# for feature parity across platforms.
+
+set -euo pipefail
+
+APP_DIR="/opt/unify-desktop-assistant"
+SETUP_SCRIPT="$APP_DIR/tools/setup.sh"
+
+usage() {
+  cat <<USAGE
+Unify Desktop Assistant (macOS)
+
+Usage: unify-desktop-assistant <command> [options]
+
+Commands:
+  setup [opts]    Run full installation and configuration
+  start           Start all services (no install, no root needed)
+  stop            Stop all services
+  uninstall       Stop services, remove launchd agents & cleanup
+  status          Show service status
+  settings        Open the settings GUI (tray app)
+
+Setup Options:
+  --unify-key KEY         Unify API key (required for setup)
+  --orchestra-url URL     Orchestra URL (default: https://api.unify.ai/v0)
+  --unity-comms-url URL   Unity Comms URL
+  --force                 Force reinstall all components
+
+Examples:
+  sudo unify-desktop-assistant setup --unify-key "your-key"
+  unify-desktop-assistant start
+  unify-desktop-assistant stop
+  unify-desktop-assistant status
+
+USAGE
+}
+
+cmd="${1:-}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  setup)
+    exec bash "$SETUP_SCRIPT" "$@"
+    ;;
+  start)
+    exec bash "$SETUP_SCRIPT" --start "$@"
+    ;;
+  stop)
+    exec bash "$SETUP_SCRIPT" --stop "$@"
+    ;;
+  uninstall)
+    exec bash "$SETUP_SCRIPT" --uninstall "$@"
+    ;;
+  status)
+    echo "Unify Desktop Assistant - Service Status"
+    echo ""
+    check_port() {
+      local port=$1 name=$2
+      if lsof -iTCP:"$port" -sTCP:LISTEN -P >/dev/null 2>&1; then
+        echo "  [OK]   $name (port $port)"
+      else
+        echo "  [FAIL] $name (port $port)"
+      fi
+    }
+    check_port 5900 "Screen Sharing (VNC)"
+    check_port 6080 "websockify (noVNC)"
+    check_port 3000 "Agent Service"
+
+    if pgrep -f "rathole.*client\.toml" >/dev/null 2>&1; then
+      echo "  [OK]   Rathole tunnel"
+    else
+      echo "  [FAIL] Rathole tunnel"
+    fi
+    echo ""
+    ;;
+  settings)
+    if [[ -f "$APP_DIR/gui/unify-assistant.py" ]]; then
+      exec python3 "$APP_DIR/gui/unify-assistant.py" "$@"
+    else
+      echo "ERROR: GUI not found at $APP_DIR/gui/unify-assistant.py" >&2
+      exit 1
+    fi
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    echo ""
+    usage >&2
+    exit 1
+    ;;
+esac

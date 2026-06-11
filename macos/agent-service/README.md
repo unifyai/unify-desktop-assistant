@@ -1,6 +1,6 @@
 # Magnitude BrowserAgent Service
 
-This Node.js service acts as an HTTP wrapper for the Magnitude `BrowserAgent`, allowing a Python client (like the Hierarchical Actor) to perform autonomous web automation tasks.
+This Node.js service acts as an HTTP wrapper for the Magnitude `BrowserAgent`, allowing a Python client (like the CodeActActor) to perform autonomous web automation tasks.
 
 ## Setup
 
@@ -15,8 +15,12 @@ This Node.js service acts as an HTTP wrapper for the Magnitude `BrowserAgent`, a
     git clone <unity-repo-url>
     cd unity
 
-    # Clone Unity's magnitude fork into the magnitude/ subdirectory
-    git clone https://github.com/unifyai/magnitude.git magnitude
+    # Clone Unity's magnitude fork into the magnitude/ subdirectory (private repo - requires auth)
+    # Option 1: Using CLONE_TOKEN environment variable
+    git clone https://x-access-token:${CLONE_TOKEN}@github.com/unifyai/magnitude.git magnitude
+    # Option 2: Using gh CLI (if authenticated)
+    gh repo clone unifyai/magnitude magnitude
+
     cd magnitude
     git checkout unity-modifications  # Our branch with Unity enhancements
 
@@ -36,17 +40,25 @@ This Node.js service acts as an HTTP wrapper for the Magnitude `BrowserAgent`, a
     npm install
     ```
 
-4.  **Create Environment File**: This service requires an API key for the underlying Large Language Model and Unify.
+4.  **Create Environment File**: This service routes all LLM traffic through a UniLLM proxy and authenticates with Unify.
     Create a `.env` file in the root of this directory:
     ```
     # agent-service/.env
-    ANTHROPIC_API_KEY="sk-ant-..."    # or provide other LLM keys used by your magnitude-core config
-    UNIFY_BASE_URL="..."
+    ORCHESTRA_URL="..."
     UNIFY_KEY="..."
-    # Optional keys depending on configured clients in magnitude-core (baml clients)
-    GOOGLE_API_KEY="..."              # if using Google AI Studio clients
-    OPENROUTER_API_KEY="..."          # if using OpenRouter
-    OPENAI_API_KEY="..."              # if using OpenAI
+    # Hosted deploys usually provide UNITY_COMMS_URL; local gateway runs can
+    # provide UNITY_GATEWAY_URL; use UNITY_UNILLM_URL to point at a specific
+    # OpenAI-compatible UniLLM base URL directly.
+    UNITY_COMMS_URL="..."
+    # UNITY_GATEWAY_URL="http://localhost:8080"
+    # UNITY_UNILLM_URL="http://localhost:8080/unillm"
+    # UNITY_AGENT_SERVICE_LLM_MODEL="claude-4.6-sonnet@anthropic"
+    # Optional - enables POST /captcha/solve to delegate reCAPTCHA v2
+    # challenges to the AntiCaptcha worker pool.  Sign up at
+    # https://anti-captcha.com, deposit ~$5 (covers ~10k v2 solves), and
+    # copy the API key from the account dashboard.  When unset, the
+    # /captcha/solve handler returns 503 anticaptcha_key_missing.
+    ANTICAPTCHA_KEY="..."
     ```
 
 ## Running the Service
@@ -80,7 +92,7 @@ The `magnitude/` directory is our fork of the magnitude repository with Unity-sp
 
 - **Branch**: Always work on `unity-modifications` branch
 - **Upstream sync**: Use `upstream-main` branch to pull in latest magnitude changes
-- **Team sharing**: Push your changes to `https://github.com/unifyai/magnitude.git`
+- **Private repo**: This is a private fork; use `CLONE_TOKEN` or `gh` CLI for authenticated access
 
 See `MAGNITUDE_SETUP.md` in the repo root for detailed workflow instructions.
 
@@ -97,5 +109,6 @@ Notes:
 -   `POST /act`: Executes a high-level task on the current page.
 -   `POST /extract`: Extracts structured data from the current page.
 -   `GET /screenshot`: Returns a base64-encoded screenshot of the current page.
+-   `POST /captcha/solve`: Delegates the on-page reCAPTCHA v2 challenge to the AntiCaptcha worker pool, then injects the returned Google-signed token back into the live page. Requires `ANTICAPTCHA_KEY`. Body: `{ sessionId, variant?: "v2_checkbox" | "v2_invisible" }`.
 -   `POST /stop`: Gracefully shuts down the agent and browser.
 -   `GET /health`: Checks if the service is ready to accept requests.

@@ -1,0 +1,91 @@
+# Build macOS Installer (.pkg)
+#
+# Assembles the .pkg installer for Unify Desktop Assistant.
+# Manually triggered. Choose environment (main/staging) and version.
+# Publishes the .pkg to a GitHub Release.
+
+name: Build macOS Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment (bakes in API URLs)'
+        required: true
+        type: choice
+        options:
+          - main
+          - staging
+        default: main
+      version:
+        description: 'Version (e.g. 1.2.0). Leave empty to use default (1.0.0).'
+        required: false
+        type: string
+
+concurrency:
+  group: build-macos-installer-${{ inputs.environment }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build .pkg package
+        run: |
+          cd macos/installer
+
+          BUILD_ARGS=("--clean")
+
+          ENV="${{ inputs.environment }}"
+          if [ "$ENV" = "staging" ]; then
+            BUILD_ARGS+=("--staging")
+            echo "Building for STAGING environment"
+          else
+            echo "Building for PRODUCTION environment"
+          fi
+
+          VERSION="${{ inputs.version }}"
+          if [ -n "$VERSION" ]; then
+            BUILD_ARGS+=("--version" "$VERSION")
+            echo "Version override: $VERSION"
+          fi
+
+          echo "Running: ./build.sh ${BUILD_ARGS[*]}"
+          chmod +x build.sh
+          ./build.sh "${BUILD_ARGS[@]}"
+
+      - name: Determine version tag
+        id: version
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="1.0.0"
+          fi
+          TAG="v${VERSION}"
+          echo "Version: $VERSION, Tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Rename installer
+        run: |
+          PKG=$(ls macos/installer/output/*.pkg | head -1)
+          if [ "${{ inputs.environment }}" = "staging" ]; then
+            mv "$PKG" macos/installer/output/unify-desktop-assistant-staging.pkg
+          else
+            mv "$PKG" macos/installer/output/unify-desktop-assistant.pkg
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Unify Desktop Assistant ${{ steps.version.outputs.version }}
+          files: macos/installer/output/unify-desktop-assistant*.pkg
+          prerelease: ${{ inputs.environment == 'staging' }}
+          generate_release_notes: false

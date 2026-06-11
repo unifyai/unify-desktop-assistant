@@ -4,7 +4,7 @@ import http from 'http';
 import expressWs from 'express-ws';
 import WebSocket from 'ws';
 import util from 'util';
-import { startBrowserAgent, BrowserAgent, BrowserConnector, AgentError, BrowserOptions } from 'magnitude-core';
+import { startBrowserAgent, BrowserAgent, BrowserConnector, AgentError, BrowserOptions, AgentMemory, Observation } from 'magnitude-core';
 import { z, ZodTypeAny, ZodAny, ZodType } from 'zod';
 import { partitionHtml, serializeToMarkdown, PartitionOptions, MarkdownSerializerOptions } from 'magnitude-extract';
 import dotenv from 'dotenv';
@@ -12,151 +12,184 @@ dotenv.config();
 import os from 'os';
 import path from 'path';
 import fs from 'fs';
+import net from 'net';
 import { randomUUID } from 'crypto';
+import { ChildProcess, spawn, execSync } from 'child_process';
+import multer from 'multer';
+import { jsonSchemaToZod } from './jsonSchemaToZod';
+import { getLlmConfig } from './llmConfig';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-// --- JSON Schema to Zod Conversion Utility ---
-function jsonSchemaToZod(schema: any, definitions: any = {}, visitedRefs = new Set<string>()): ZodTypeAny {
-  if (typeof schema !== 'object' || schema === null) {
-    return z.any();
+// --- Debug logging helpers ---
+const MAGNITUDE_DEBUG = process.env.MAGNITUDE_DEBUG === 'true';
+const MAGNITUDE_LOG_DIR = process.env.MAGNITUDE_LOG_DIR || '';
+
+function makeActId(task: string): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const slug = task.slice(0, 40).replace(/[^a-zA-Z0-9]+/g, '_').replace(/_+$/, '');
+  return `${ts}_${slug}`;
+}
+
+function debugSaveImage(actId: string, label: string, base64Data: string): void {
+  if (!MAGNITUDE_DEBUG || !MAGNITUDE_LOG_DIR) return;
+  try {
+    const imgPath = path.join(MAGNITUDE_LOG_DIR, 'acts', actId, `${label}.png`);
+    fs.mkdirSync(path.dirname(imgPath), { recursive: true });
+    fs.writeFileSync(imgPath, Buffer.from(base64Data, 'base64'));
+  } catch (err) {
+    console.warn(`[debug] Failed to save image ${label}: ${err}`);
+  }
+}
+
+function debugSaveTrace(actId: string, trace: Record<string, any>): void {
+  if (!MAGNITUDE_DEBUG || !MAGNITUDE_LOG_DIR) return;
+  try {
+    const tracePath = path.join(MAGNITUDE_LOG_DIR, 'acts', actId, 'act_trace.json');
+    fs.mkdirSync(path.dirname(tracePath), { recursive: true });
+    fs.writeFileSync(tracePath, JSON.stringify(trace, null, 2));
+  } catch (err) {
+    console.warn(`[debug] Failed to save trace: ${err}`);
+  }
+}
+
+function debugLog(line: string): void {
+  if (!MAGNITUDE_DEBUG || !MAGNITUDE_LOG_DIR) return;
+  try {
+    fs.mkdirSync(MAGNITUDE_LOG_DIR, { recursive: true });
+    fs.appendFileSync(path.join(MAGNITUDE_LOG_DIR, 'magnitude.log'), line + '\n');
+  } catch (_) { /* best-effort */ }
+}
+
+// --- File System and Command Execution Utilities ---
+//
+// Workspace root for file operations, command execution, and browser downloads.
+// Matches Unity's get_local_root() default of ~/Unity/Local.
+// Override via UNITY_LOCAL_ROOT env var.
+const LOCAL_ROOT = process.env.UNITY_LOCAL_ROOT || path.join(os.homedir(), 'Unity', 'Local');
+try { fs.mkdirSync(LOCAL_ROOT, { recursive: true }); } catch (_e) { /* ignore */ }
+const DEFAULT_EXEC_TIMEOUT = 60 * 60 * 1000; // 1 hour
+
+
+// Multer configuration for multipart file uploads
+const uploadTempDir = path.join(os.tmpdir(), 'unity-uploads');
+try {
+  fs.mkdirSync(uploadTempDir, { recursive: true });
+} catch (_e) {
+  // ignore
+}
+
+const uploadMiddleware = multer({
+  dest: uploadTempDir,
+  limits: {
+    fileSize: 500 * 1024 * 1024, // 500MB per file
+    files: 100,
+  },
+});
+
+function sanitizePath(filename: string, baseDir: string): string {
+  const resolved = path.resolve(baseDir, filename);
+  const normalizedBase = path.resolve(baseDir);
+  if (!resolved.startsWith(normalizedBase + path.sep) && resolved !== normalizedBase) {
+    throw new Error(`Path traversal blocked: ${filename}`);
+  }
+  return resolved;
+}
+
+async function ensureDir(dirPath: string): Promise<void> {
+  await fs.promises.mkdir(dirPath, { recursive: true });
+}
+
+async function writeFileWithEncoding(
+  filepath: string,
+  content: string,
+  encoding: 'text' | 'base64' = 'text'
+): Promise<void> {
+  await ensureDir(path.dirname(filepath));
+  if (encoding === 'base64') {
+    const buffer = Buffer.from(content, 'base64');
+    await fs.promises.writeFile(filepath, buffer);
+  } else {
+    await fs.promises.writeFile(filepath, content, 'utf-8');
+  }
+}
+
+async function readFileWithEncoding(
+  filepath: string,
+  encoding: 'text' | 'base64' = 'text'
+): Promise<string> {
+  const buffer = await fs.promises.readFile(filepath);
+  return encoding === 'base64' ? buffer.toString('base64') : buffer.toString('utf-8');
+}
+
+interface ExecResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  duration: number;
+}
+
+type ShellMode = 'cmd' | 'powershell';
+
+function getShellConfig(shellMode: ShellMode): string | boolean {
+  const isWindows = process.platform === 'win32';
+
+  if (!isWindows) {
+    return true;  // Use default /bin/sh on Unix
   }
 
-  // Use root definitions if provided, otherwise extract from the current schema
-  const defs = Object.keys(definitions).length > 0 ? definitions : (schema.$defs || schema.definitions || {});
-
-  // Handle references and recursion
-  if (schema.$ref) {
-    const refName = schema.$ref;
-    if (visitedRefs.has(refName)) {
-      // If we've seen this ref in the current path, it's a recursive type.
-      // We return a lazy schema that will resolve later.
-      return z.lazy(() => jsonSchemaToZod({$ref: refName}, defs, new Set([...visitedRefs])));
-    }
-
-    visitedRefs.add(refName);
-
-    const refPath = refName.split('/');
-    const defName = refPath.pop();
-    const resolvedSchema = defs[defName];
-
-    if (!resolvedSchema) {
-      throw new Error(`Could not resolve schema reference: ${refName}`);
-    }
-    // Pass the definitions down to the recursive call
-    return jsonSchemaToZod(resolvedSchema, defs, visitedRefs);
+  if (shellMode === 'cmd') {
+    return 'cmd.exe';
   }
 
-  // Handle unions and optionals
-  if (schema.anyOf) {
-    const nonNullTypes = schema.anyOf.filter((s: any) => s.type !== 'null');
+  // PowerShell (default on Windows)
+  return 'powershell.exe';
+}
 
-    // Check if this is a simple optional type (e.g., string | null)
-    if (schema.anyOf.length > nonNullTypes.length && nonNullTypes.length === 1) {
-      const baseSchema = { ...schema, ...nonNullTypes[0] };
-      delete baseSchema.anyOf; // Prevent infinite recursion
+function executeCommand(command: string, cwd: string, timeout: number, shellMode: ShellMode = 'powershell'): Promise<ExecResult> {
+  return new Promise((resolve) => {
+    const startTime = Date.now();
+    let stdout = '';
+    let stderr = '';
+    let killed = false;
 
-      // Recursively call jsonSchemaToZod on the now-complete schema and make it optional
-      return jsonSchemaToZod(baseSchema, defs, visitedRefs).optional().nullable();
-    }
+    const proc = spawn(command, [], {
+      shell: getShellConfig(shellMode),
+      cwd,
+      timeout,
+    });
 
-    // Fallback for more complex unions (e.g., string | number)
-    const unionTypes = schema.anyOf.map((s: any) => jsonSchemaToZod(s, defs, visitedRefs));
-    return z.union(unionTypes as [ZodTypeAny, ZodTypeAny, ...ZodTypeAny[]]);
-  }
+    proc.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
 
-  // Handle type arrays
-  if (Array.isArray(schema.type)) {
-      // This is another common pattern for Optional fields.
-      const hasNull = schema.type.includes('null');
-      const nonNullTypes = schema.type.filter((t: string) => t !== 'null');
+    proc.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
 
-      if (hasNull && nonNullTypes.length === 1) {
-          // This handles cases like `type: ['number', 'null']`
-          const baseType = jsonSchemaToZod({ ...schema, type: nonNullTypes[0] }, defs, visitedRefs);
-          return baseType.optional().nullable();
+    proc.on('error', (err) => {
+      stderr += err.message;
+    });
+
+    proc.on('close', (code, signal) => {
+      const duration = Date.now() - startTime;
+      if (signal === 'SIGTERM') {
+        killed = true;
+        stderr += `\nProcess killed after ${timeout}ms timeout`;
       }
-
-      const types = schema.type.map((type: string) => jsonSchemaToZod({ ...schema, type }, defs, visitedRefs));
-      return z.union(types as [ZodTypeAny, ZodTypeAny, ...ZodTypeAny[]]);
-  }
-
-  // Handle enums and literals
-  if (schema.enum) {
-    if (schema.enum.length === 1) return z.literal(schema.enum[0]);
-    const isStringEnum = schema.enum.every((item: any) => typeof item === 'string');
-    if (isStringEnum) return z.enum(schema.enum as [string, ...string[]]);
-    return z.union(schema.enum.map((item: any) => z.literal(item)));
-  }
-  if (schema.const) return z.literal(schema.const);
-
-  switch (schema.type) {
-    case 'string': {
-      let zodString = z.string();
-      if (schema.minLength !== undefined) zodString = zodString.min(schema.minLength);
-      if (schema.maxLength !== undefined) zodString = zodString.max(schema.maxLength);
-      if (schema.pattern) zodString = zodString.regex(new RegExp(schema.pattern));
-      if (schema.format === 'email') zodString = zodString.email();
-      if (schema.format === 'uuid') zodString = zodString.uuid();
-      if (schema.format === 'uri' || schema.format === 'url') zodString = zodString.url();
-      if (schema.format === 'date-time') zodString = zodString.datetime();
-      return zodString;
-    }
-    case 'number':
-    case 'integer': {
-      let zodNum = schema.type === 'integer' ? z.number().int() : z.number();
-      if (schema.minimum !== undefined) zodNum = zodNum.gte(schema.minimum);
-      if (schema.exclusiveMinimum !== undefined) zodNum = zodNum.gt(schema.exclusiveMinimum);
-      if (schema.maximum !== undefined) zodNum = zodNum.lte(schema.maximum);
-      if (schema.exclusiveMaximum !== undefined) zodNum = zodNum.lt(schema.exclusiveMaximum);
-      if (schema.multipleOf !== undefined) zodNum = zodNum.multipleOf(schema.multipleOf);
-      return zodNum;
-    }
-    case 'boolean': return z.boolean();
-    case 'null': return z.null();
-    case 'array': {
-      let itemSchema: ZodTypeAny = z.any();
-      if (schema.items) {
-        itemSchema = jsonSchemaToZod(schema.items, defs, visitedRefs);
-      }
-      let zodArray = z.array(itemSchema);
-      if (schema.minItems !== undefined) zodArray = zodArray.min(schema.minItems);
-      if (schema.maxItems !== undefined) zodArray = zodArray.max(schema.maxItems);
-      return zodArray;
-    }
-    case 'object': {
-      const shape: { [key: string]: ZodTypeAny } = {};
-      if (schema.properties) {
-        for (const key in schema.properties) {
-          const propSchema = jsonSchemaToZod(schema.properties[key], defs, visitedRefs);
-          shape[key] = schema.required?.includes(key) ? propSchema : propSchema.optional();
-        }
-      }
-      let zodObject: ZodTypeAny = z.object(shape);
-      if (schema.additionalProperties === false) {
-        zodObject = z.object(shape).strict();
-      } else if (typeof schema.additionalProperties === 'object') {
-        zodObject = z.object(shape).catchall(jsonSchemaToZod(schema.additionalProperties, defs, visitedRefs));
-      }
-      return zodObject;
-    }
-  }
-
-  if (schema.properties) return jsonSchemaToZod({ ...schema, type: 'object' }, defs, visitedRefs);
-
-  return z.any();
+      resolve({
+        exitCode: code ?? (killed ? 124 : 1),
+        stdout,
+        stderr,
+        duration,
+      });
+    });
+  });
 }
 
 function getDefaultBrowserPaths() {
-  const base = path.join(os.tmpdir(), 'unify', 'assistant', 'browser');
-  const downloadsPath = path.join(base, 'install');
-  const tracesDir = path.join(base, 'traces');
-  try {
-    fs.mkdirSync(downloadsPath, { recursive: true });
-    fs.mkdirSync(tracesDir, { recursive: true });
-  } catch (_e) {
-    // ignore directory creation errors; downstream may still handle
-  }
+  const downloadsPath = path.join(LOCAL_ROOT, 'Downloads');
+  const tracesDir = path.join(LOCAL_ROOT, 'Traces');
   return { downloadsPath, tracesDir };
 }
 
@@ -164,12 +197,27 @@ const defaultBrowserPaths = getDefaultBrowserPaths();
 
 const app = express();
 const wsInstance = expressWs(app);
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '100mb' }));
+
+const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || '').split(',').filter(Boolean);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 // --- Authorization (Bearer) middleware ---
-function verifyApiKeyWithUnify(apiKey: string, assistant_email: string): Promise<boolean> {
+function verifyApiKeyWithUnify(apiKey: string): Promise<boolean> {
   return new Promise((resolve) => {
-    const url = new URL(`${process.env.UNIFY_BASE_URL}/assistant?email=${assistant_email}`);
+    const url = new URL(`${process.env.ORCHESTRA_URL}/user/basic-info`);
     const options = {
       method: 'GET',
       hostname: url.hostname,
@@ -180,7 +228,6 @@ function verifyApiKeyWithUnify(apiKey: string, assistant_email: string): Promise
       },
     };
 
-    // Use the appropriate request method based on protocol
     const requestLib = url.protocol === 'https:' ? https : http;
     const req = requestLib.request(options, (res) => {
       const code = res.statusCode || 0;
@@ -188,30 +235,10 @@ function verifyApiKeyWithUnify(apiKey: string, assistant_email: string): Promise
       res.on('data', (chunk) => { body += chunk; });
       res.on('end', () => {
         if (!(code >= 200 && code < 300)) return resolve(false);
-        if (!body || body.trim().length === 0) return resolve(false);
-        try {
-          // Using default assistant for testing, auth passes since apikey is valid
-          if (assistant_email.includes('agent') || assistant_email.includes('assistant')) {
-            return resolve(true);
-          }
-
-          const json = JSON.parse(body);
-          // Treat empty payloads as invalid: {"info": []}, {}, []
-          if (Array.isArray(json)) return resolve(json.length > 0);
-          if (json && typeof json === 'object') {
-            if (Array.isArray((json as any).info)) return resolve((json as any).info.length > 0);
-            return resolve(Object.keys(json).length > 0);
-          }
-          if (typeof json === 'string') return resolve(json.trim().length > 0);
-          return resolve(!!json);
-        } catch (_e) {
-          // Non-JSON: accept only if non-empty body
-          return resolve(body.trim().length > 0);
-        }
+        return resolve(true);
       });
     });
-    req.on('error', (err) => {
-
+    req.on('error', () => {
       resolve(false);
     });
     req.end();
@@ -224,17 +251,20 @@ async function auth(req: Request, res: Response, next: Function) {
   if (!match) {
     return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid API key' });
   }
-  const keys = match[1].split(' ');
-  const apikey = keys[0];
-  const assistant_email = keys[1];
+  const apiKey = match[1].trim();
 
+  // Check 1: Bearer token must match UNIFY_KEY
+  if (apiKey !== process.env.UNIFY_KEY) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Invalid API key' });
+  }
+
+  // Check 2: Verify with /user/basic-info endpoint
   try {
-    const ok = await verifyApiKeyWithUnify(apikey, assistant_email);
+    const ok = await verifyApiKeyWithUnify(apiKey);
     if (!ok) {
       return res.status(401).json({ error: 'unauthorized', message: 'API key verification failed' });
     }
   } catch (e) {
-
     return res.status(401).json({ error: 'unauthorized', message: 'API key verification failed' });
   }
 
@@ -243,12 +273,61 @@ async function auth(req: Request, res: Response, next: Function) {
 
 app.use(auth);
 
-// Session registry: maps sessionId to BrowserAgent
+// --- CLI argument parsing ---
+function parseIntArg(flag: string, defaultValue: number): number {
+  const idx = process.argv.indexOf(flag);
+  if (idx !== -1 && idx + 1 < process.argv.length) {
+    const val = parseInt(process.argv[idx + 1], 10);
+    return isNaN(val) ? defaultValue : val;
+  }
+  return defaultValue;
+}
+
+const ACT_HISTORY_DEPTH = parseIntArg('--history-depth', 5);
+console.log(`[memory-carryover] Act history depth: ${ACT_HISTORY_DEPTH}`);
+
+// --- Session registry ---
+interface ActHistoryEntry {
+  task: string;
+  observations: Observation[];
+}
+
 interface SessionInfo {
   agent: BrowserAgent;
-  mode: 'browser' | 'desktop';
+  mode: 'web' | 'desktop' | 'web-vm';
   createdAt: Date;
   lastAccessed: Date;
+  actHistory: ActHistoryEntry[];
+  latestScreenshot: string;
+  latestCursorPosition: { x: number; y: number } | null;
+}
+
+function cacheScreenshot(sessionId: string, screenshot: string, cursorPosition: { x: number; y: number } | null) {
+  const session = activeSessions.get(sessionId);
+  if (session && screenshot) {
+    session.latestScreenshot = screenshot;
+    session.latestCursorPosition = cursorPosition;
+  }
+}
+
+function refreshDesktopCache(triggerSessionId: string) {
+  const triggerSession = activeSessions.get(triggerSessionId);
+  if (!triggerSession || triggerSession.mode !== "web-vm") return;
+  const desktopEntry = [...activeSessions.entries()].find(([, s]) => s.mode === "desktop");
+  if (!desktopEntry) return;
+  const [deskId, deskSession] = desktopEntry;
+  (async () => {
+    try {
+      const connector = deskSession.agent.require(BrowserConnector);
+      const harness = connector.getHarness();
+      const rawImage = await harness.screenshot();
+      const image = await connector.transformScreenshot(rawImage);
+      const deskScreenshot = await image.toBase64();
+      cacheScreenshot(deskId, deskScreenshot, harness.getCursorPosition());
+    } catch (err) {
+      console.warn(`[cache] Desktop screenshot refresh failed: ${err}`);
+    }
+  })();
 }
 
 const activeSessions = new Map<string, SessionInfo>();
@@ -262,6 +341,7 @@ setInterval(() => {
       console.log(`Cleaning up inactive session: ${sessionId}`);
       session.agent.stop().catch((err: unknown) => console.error(`Error stopping session ${sessionId}:`, err));
       activeSessions.delete(sessionId);
+      broadcastSessionEvent(sessionId, 'timeout');
     }
   }
 }, 5 * 60 * 1000); // Check every 5 minutes
@@ -277,6 +357,10 @@ function broadcastLog(message: string) {
       client.send(message);
     }
   });
+}
+
+function broadcastSessionEvent(sessionId: string, reason: string) {
+  broadcastLog(JSON.stringify({ __type: 'session:closed', sessionId, reason }));
 }
 
 // Monkey-patch console methods to capture and broadcast logs
@@ -314,12 +398,19 @@ wsInstance.app.ws('/logs/stream', async (ws: WebSocket, req: Request) => {
     return;
   }
 
-  const keys = match[1].split(' ');
-  const apikey = keys[0];
-  const assistant_email = keys[1];
+  const apiKeyRaw = match[1].trim();
+  const apiKey = apiKeyRaw.split(/\s+/)[0];
 
+  // Check 1: Bearer token must match UNIFY_KEY
+  if (apiKey !== process.env.UNIFY_KEY) {
+    console.log('WebSocket connection rejected: Invalid API key');
+    ws.close(1008, 'Invalid API key');
+    return;
+  }
+
+  // Check 2: Verify with /user/basic-info endpoint
   try {
-    const ok = await verifyApiKeyWithUnify(apikey, assistant_email);
+    const ok = await verifyApiKeyWithUnify(apiKey);
     if (!ok) {
       console.log('WebSocket connection rejected: Auth failed');
       ws.close(1008, 'API key verification failed');
@@ -346,6 +437,180 @@ wsInstance.app.ws('/logs/stream', async (ws: WebSocket, req: Request) => {
 });
 
 
+// --- Demo Sites ---
+const DEMO_SITE_BASE_PORT = 4001;
+const demoSiteProcesses: Map<number, ChildProcess> = new Map();
+
+function isPortOpen(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ port, host: '127.0.0.1' });
+    sock.setTimeout(500);
+    sock.on('connect', () => { sock.destroy(); resolve(true); });
+    sock.on('error', () => { sock.destroy(); resolve(false); });
+    sock.on('timeout', () => { sock.destroy(); resolve(false); });
+  });
+}
+
+function waitForPort(port: number, timeoutMs = 5000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const check = async () => {
+      if (await isPortOpen(port)) return resolve(true);
+      if (Date.now() >= deadline) return resolve(false);
+      setTimeout(check, 200);
+    };
+    check();
+  });
+}
+
+function findDemoSitesRoot(): string | null {
+  // demo-sites/ lives inside agent-service/ so it's always co-located
+  const candidates = [
+    path.resolve(__dirname, '..', 'demo-sites'),           // dev: agent-service/src/../demo-sites
+    path.resolve(__dirname, '..', '..', 'demo-sites'),     // compiled: agent-service/dist/../../demo-sites
+    '/app/agent-service/demo-sites',                        // Docker
+  ];
+  for (const dir of candidates) {
+    if (fs.existsSync(dir)) return dir;
+  }
+  return null;
+}
+
+async function findFreePort(startFrom: number): Promise<number> {
+  let port = startFrom;
+  while (await isPortOpen(port) || demoSiteProcesses.has(port)) {
+    port++;
+  }
+  return port;
+}
+
+async function ensureDemoSites(urlMappings: Record<string, string>): Promise<Record<string, string>> {
+  const resolved: Record<string, string> = {};
+  const demoSitesRoot = findDemoSitesRoot();
+  if (!demoSitesRoot) {
+    console.warn('[demo-sites] No demo-sites directory found, skipping');
+    return resolved;
+  }
+
+  let nextPort = DEMO_SITE_BASE_PORT;
+
+  for (const [originalUrl, dirName] of Object.entries(urlMappings)) {
+    const siteDir = path.join(demoSitesRoot, dirName);
+    if (!fs.existsSync(siteDir)) {
+      console.warn(`[demo-sites] Directory '${dirName}' not found in ${demoSitesRoot}, skipping`);
+      continue;
+    }
+
+    const serverJs = path.join(siteDir, 'server.js');
+    const indexHtml = path.join(siteDir, 'index.html');
+
+    if (!fs.existsSync(serverJs) && !fs.existsSync(indexHtml)) {
+      console.warn(`[demo-sites] ${dirName} has no server.js or index.html, skipping`);
+      continue;
+    }
+
+    const port = await findFreePort(nextPort);
+    nextPort = port + 1;
+
+    if (fs.existsSync(serverJs)) {
+      console.log(`[demo-sites] Starting ${dirName} on port ${port} (node server.js)`);
+      const proc = spawn('node', [serverJs, String(port)], {
+        cwd: siteDir,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      proc.stdout?.on('data', (d: Buffer) => console.log(`[demo-sites:${dirName}] ${d.toString().trim()}`));
+      proc.stderr?.on('data', (d: Buffer) => console.error(`[demo-sites:${dirName}] ${d.toString().trim()}`));
+      proc.on('exit', (code) => console.log(`[demo-sites] ${dirName} exited with code ${code}`));
+      demoSiteProcesses.set(port, proc);
+    } else {
+      console.log(`[demo-sites] Starting static server for ${dirName} on port ${port}`);
+      const staticServer = http.createServer((req, res) => {
+        const filePath = path.join(siteDir, req.url === '/' ? 'index.html' : req.url || 'index.html');
+        fs.readFile(filePath, (err, data) => {
+          if (err) { res.writeHead(404); res.end('Not found'); return; }
+          const ext = path.extname(filePath).toLowerCase();
+          const mimeTypes: Record<string, string> = {'.html':'text/html','.css':'text/css','.js':'text/javascript','.json':'application/json','.png':'image/png','.jpg':'image/jpeg','.svg':'image/svg+xml'};
+          res.writeHead(200, { 'Content-Type': mimeTypes[ext] || 'application/octet-stream' });
+          res.end(data);
+        });
+      });
+      staticServer.listen(port, '0.0.0.0');
+      const fakeProc = { exitCode: null, kill: () => { staticServer.close(); } } as unknown as ChildProcess;
+      demoSiteProcesses.set(port, fakeProc);
+    }
+
+    const ready = await waitForPort(port);
+    if (ready) {
+      console.log(`[demo-sites] ${dirName} ready on port ${port}`);
+    } else {
+      console.error(`[demo-sites] ${dirName} failed to start on port ${port} within timeout`);
+    }
+
+    const localhostUrl = `http://localhost:${port}`;
+    let mappingKey: string;
+    try {
+      mappingKey = new URL(originalUrl).href;
+    } catch {
+      console.warn(`[demo-sites] Skipping invalid URL mapping for ${dirName}`);
+      continue;
+    }
+    resolved[mappingKey] = localhostUrl;
+
+    // /etc/hosts + Caddy setup so the real domain resolves to the demo site
+    try {
+      const origUrl = new URL(originalUrl);
+      const origHost = origUrl.hostname;
+
+      const hostsFile = fs.readFileSync('/etc/hosts', 'utf-8');
+      if (!hostsFile.includes(origHost)) {
+        fs.appendFileSync('/etc/hosts', `\n127.0.0.1 ${origHost}\n`);
+        console.log(`[demo-sites] Added /etc/hosts entry: 127.0.0.1 ${origHost}`);
+      } else {
+        console.log(`[demo-sites] /etc/hosts already has entry for ${origHost}`);
+      }
+
+      if (origUrl.protocol === 'https:') {
+        const caddyFile = fs.existsSync('/etc/caddy/Caddyfile')
+          ? fs.readFileSync('/etc/caddy/Caddyfile', 'utf-8') : '';
+        if (!caddyFile.includes(origHost + ' {')) {
+          const caddyBlock = `\n${origHost} {\n    tls internal\n    reverse_proxy localhost:${port}\n}\n`;
+          fs.appendFileSync('/etc/caddy/Caddyfile', caddyBlock);
+          console.log(`[demo-sites] Added Caddy block: ${origHost} -> localhost:${port}`);
+        } else {
+          console.log(`[demo-sites] Caddy already has block for ${origHost}`);
+        }
+      }
+    } catch (e) {
+      console.warn(`[demo-sites] Could not configure hosts/Caddy for ${originalUrl}: ${e}`);
+    }
+  }
+
+  // Reload Caddy if any new blocks were added
+  try {
+    if (fs.existsSync('/etc/caddy/Caddyfile')) {
+      execSync('caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1', { timeout: 10000 });
+      console.log('[demo-sites] Caddy reloaded with new demo site routes');
+    }
+  } catch (e) {
+    console.warn(`[demo-sites] Caddy reload failed: ${e}`);
+  }
+
+  return resolved;
+}
+
+// Cleanup demo site processes on exit
+function cleanupDemoSites() {
+  for (const [port, proc] of demoSiteProcesses) {
+    try { proc.kill(); } catch {}
+    console.log(`[demo-sites] Stopped process on port ${port}`);
+  }
+  demoSiteProcesses.clear();
+}
+process.on('SIGTERM', cleanupDemoSites);
+process.on('SIGINT', cleanupDemoSites);
+process.on('exit', cleanupDemoSites);
+
+
 // --- Agent Initialization ---
 console.log(`Starting Magnitude BrowserAgent...`);
 app.listen(port, () => {
@@ -353,9 +618,18 @@ app.listen(port, () => {
 });
 
 const isAgentReady = (req: Request, res: Response, next: Function) => {
-  const sessionId = req.body.sessionId;
+  let sessionId = req.body.sessionId;
   if (!sessionId) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
+    // Desktop mode is singleton (one physical display, one session).
+    // Callers that omit sessionId are targeting the desktop.
+    const desktopEntry = [...activeSessions.entries()]
+      .find(([, s]) => s.mode === "desktop");
+    if (desktopEntry) {
+      sessionId = desktopEntry[0];
+      req.body.sessionId = sessionId;
+    } else {
+      return res.status(400).json({ error: 'no_desktop_session', message: 'No active desktop session. Call /start with mode=desktop first.' });
+    }
   }
   const session = activeSessions.get(sessionId);
   if (!session) {
@@ -365,30 +639,55 @@ const isAgentReady = (req: Request, res: Response, next: Function) => {
   next();
 };
 
-const getLaunchOptions = (headless: boolean, downloadsPath: string | null = null, tracesDir: string | null = null) => {
-  return { launchOptions: {
-    headless: headless,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--disable-features=IsolateOrigins,site-per-process",
-      // "--enable-features=WebRtcV4L2VideoCapture",
-      // "--auto-select-window-capture-source-by-title=Google",
-      '--auto-select-desktop-capture-source="Entire screen"',
-    ],
-    downloadsPath: downloadsPath || undefined,
-    tracesDir: tracesDir || undefined,
-  }}
+const getLaunchOptions = (
+  headless: boolean,
+  downloadsPath: string | null = null,
+  tracesDir: string | null = null,
+  storageStateName: string | null = null,
+) => {
+  // ``storageStateName`` is forwarded to magnitude-core's BrowserProvider,
+  // which loads ~/.magnitude/browser_states/<safeName>.json (cookies +
+  // localStorage + sessionStorage) before any page renders.  Used by
+  // brain.influencers.youtube to keep one operator-supervised Google
+  // login persistent across subsequent headless extraction runs.
+  const opts: any = {
+    launchOptions: {
+      headless: headless,
+      args: [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=IsolateOrigins,site-per-process",
+        // "--enable-features=WebRtcV4L2VideoCapture",
+        // "--auto-select-window-capture-source-by-title=Google",
+        '--auto-select-desktop-capture-source="Entire screen"',
+      ],
+      downloadsPath: downloadsPath || undefined,
+      tracesDir: tracesDir || undefined,
+    },
+  };
+  if (storageStateName) {
+    opts.storageStateName = storageStateName;
+  }
+  return opts;
 };
 
 const startDesktop = async (): Promise<BrowserAgent> => {
   try {
+    const encodedPassword = encodeURIComponent(process.env.UNIFY_KEY || '');
+    const desktopUrl = `http://localhost:6080/custom.html?password=${encodedPassword}`;
+    const desktopOrigin = new URL(desktopUrl).origin;
     const agent = await startBrowserAgent({
-      url: `http://localhost:6080/custom.html?password=${process.env.UNIFY_KEY}`,
+      url: desktopUrl,
       browser: getLaunchOptions(true),
       prompt: "You're controlling a noVNC virtual desktop page. Do not navigate to other page and use mouse and keyboard to control the browser and apps within the virtual desktop. There may be a terminal (xterm) app launched in the desktop for use.",
       narrate: true,
+      llm: getLlmConfig()
     });
     agent.context.setDefaultNavigationTimeout(90000);
+    // Auto-grant clipboard permissions so the noVNC "Share clipboard?" popup is suppressed
+    await agent.context.grantPermissions(
+      ['clipboard-read', 'clipboard-write'],
+      { origin: desktopOrigin },
+    );
     console.log("✅ Desktop BrowserAgent started successfully.");
     return agent;
   } catch (err) {
@@ -397,12 +696,23 @@ const startDesktop = async (): Promise<BrowserAgent> => {
   }
 }
 
-const startBrowser = async (headless: boolean): Promise<BrowserAgent> => {
+const startBrowser = async (
+  headless: boolean,
+  urlMappings?: Record<string, string>,
+  storageStateName?: string,
+): Promise<BrowserAgent> => {
   try {
     const agent = await startBrowserAgent({
-      url: "https://www.duckduckgo.com/",
-      browser: getLaunchOptions(headless, defaultBrowserPaths.downloadsPath, defaultBrowserPaths.tracesDir),
+      url: "https://www.google.com/",
+      browser: getLaunchOptions(
+        headless,
+        defaultBrowserPaths.downloadsPath,
+        defaultBrowserPaths.tracesDir,
+        storageStateName ?? null,
+      ),
       narrate: true,
+      urlMappings,
+      llm: getLlmConfig()
     });
     agent.context.setDefaultNavigationTimeout(90000);
     console.log("✅ BrowserAgent started successfully.");
@@ -413,20 +723,566 @@ const startBrowser = async (headless: boolean): Promise<BrowserAgent> => {
   }
 }
 
+const startBrowserOnVm = async (urlMappings?: Record<string, string>): Promise<BrowserAgent> => {
+  try {
+    const agent = await startBrowserAgent({
+      url: "https://www.google.com/",
+      browser: {
+        launchOptions: {
+          headless: false,
+          args: [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            '--auto-select-desktop-capture-source="Entire screen"',
+          ],
+          downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
+          tracesDir: defaultBrowserPaths.tracesDir || undefined,
+        },
+        contextOptions: { viewport: null, ignoreHTTPSErrors: true },
+      },
+      narrate: true,
+      urlMappings,
+      llm: getLlmConfig()
+    });
+    agent.context.setDefaultNavigationTimeout(90000);
+    console.log("✅ Web-VM BrowserAgent started successfully.");
+    return agent;
+  } catch (err) {
+    console.error("❌ Failed to start Web-VM BrowserAgent:", err);
+    throw err;
+  }
+}
+
+// --- Google Meet browser launcher ---
+const startGoogleMeetBrowser = async (meetUrl: string): Promise<BrowserAgent> => {
+  try {
+    const agent = await startBrowserAgent({
+      url: meetUrl,
+      browser: {
+        launchOptions: {
+          headless: false,
+          args: [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            '--auto-select-desktop-capture-source="Entire screen"',
+            '--auto-select-tab-capture-source-by-title=Desktop',
+          ],
+          env: {
+            ...process.env,
+            PULSE_SINK: "agent_sink",
+            PULSE_SOURCE: "meet_mic",
+          },
+          downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
+          tracesDir: defaultBrowserPaths.tracesDir || undefined,
+        },
+        contextOptions: {
+          viewport: null,
+          ignoreHTTPSErrors: true,
+          permissions: ['camera', 'microphone'],
+        },
+      },
+      narrate: true,
+      llm: getLlmConfig()
+    });
+    agent.context.setDefaultNavigationTimeout(90000);
+    console.log("✅ Google Meet BrowserAgent started successfully.");
+    return agent;
+  } catch (err) {
+    console.error("❌ Failed to start Google Meet BrowserAgent:", err);
+    throw err;
+  }
+};
+
+// --- Google Meet session management ---
+type GoogleMeetStatus = 'joining' | 'lobby' | 'active' | 'ended' | 'removed' | 'error';
+
+interface GoogleMeetParticipant {
+  name: string;
+  isSpeaking: boolean;
+}
+
+interface GoogleMeetSessionInfo {
+  agent: BrowserAgent;
+  status: GoogleMeetStatus;
+  meetUrl: string;
+  displayName: string;
+  createdAt: Date;
+  participants: GoogleMeetParticipant[];
+  activeSpeaker: string | null;
+  pollIntervalId: ReturnType<typeof setInterval> | null;
+  latestScreenshot: string | null;
+  presenting: boolean;
+  desktopTabPage: any | null;
+}
+
+const googleMeetSessions = new Map<string, GoogleMeetSessionInfo>();
+
+type GoogleMeetJoinResult =
+  | { status: 'active' | 'lobby' }
+  | { status: 'error'; reason: string };
+
+const MEET_PREPARE_TASK = (displayName: string) =>
+  `You are on a Google Meet pre-join screen. Complete these steps in order:\n` +
+  `1. Dismiss any popups, tooltips, or overlays (e.g. "Got it" button, cookie banners).\n` +
+  `2. If there is a "Your name" text input, clear it and type: ${displayName}\n` +
+  `3. Turn OFF the camera if it is on (click its toggle button). Leave the microphone ON.\n` +
+  `Do NOT change audio device selections — they are handled separately.\n` +
+  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
+  `If the page shows a fatal error like "invalid meeting link" or "this meeting has ended", do nothing — just stop.`;
+
+const MEET_CLICK_JOIN_TASK =
+  `You are on a Google Meet pre-join screen. The audio devices have already been configured.\n` +
+  `Click the "Ask to join" or "Join now" button to enter the meeting.\n` +
+  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
+  `If the page shows a fatal error like "invalid meeting link" or "this meeting has ended", do nothing — just stop.`;
+
+const MEET_PRESENT_TAB_TASK =
+  `You are in an active Google Meet call.\n` +
+  `Click the "Present now" button (screen share icon in the bottom toolbar).\n` +
+  `Then select "A tab" from the options that appear.\n` +
+  `A tab will be auto-selected — just confirm the selection if a dialog appears.\n` +
+  `Do NOT select "Your entire screen" or "A window".`;
+
+const MEET_STOP_PRESENT_TASK =
+  `You are in an active Google Meet call and currently presenting a tab.\n` +
+  `Click the "Stop presenting" or "Stop sharing" button to end the presentation.\n` +
+  `If there is no stop button visible, look for a "You are presenting" banner or bar and click stop there.`;
+
+const MEET_LEAVE_TASK =
+  `You are in an active Google Meet call.\n` +
+  `Click the red "Leave call" button (the phone-handset icon) in the bottom toolbar.\n` +
+  `If a confirmation dialog appears with options like "Just leave the call" and ` +
+  `"End the call for everyone", click "Just leave the call" — do NOT end for everyone.\n` +
+  `If the meeting has already ended (e.g. "You left the meeting" is visible), do nothing — just stop.`;
+
+const MEET_PREPARE_MAX_ITERATIONS = 3;
+const MEET_JOIN_MAX_ITERATIONS = 3;
+const MEET_PRESENT_MAX_ITERATIONS = 3;
+
+async function runMagnitudeLoop(
+  agent: BrowserAgent,
+  task: string,
+  maxIterations: number,
+  label: string,
+): Promise<void> {
+  const memory = new AgentMemory({ promptCaching: true });
+
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    if (iteration > 0) {
+      console.log(`[${label}] Iteration ${iteration + 1}: re-observing...`);
+    }
+
+    await agent.recordConnectorObservations(memory);
+    const context = await agent.buildContext(memory);
+    const { reasoning, actions } = await agent.models.partialAct(context, task, [], agent.actions);
+
+    console.log(`[${label}] Iteration ${iteration + 1} reasoning: ${reasoning}`);
+    console.log(`[${label}] Planned ${actions.length} action(s): ${actions.map(a => a.variant).join(', ')}`);
+    memory.recordThought(reasoning);
+
+    if (actions.length === 0) {
+      console.log(`[${label}] LLM planned zero actions — stopping.`);
+      break;
+    }
+
+    const taskDone = actions.some(a => a.variant === 'task:done');
+
+    for (const action of actions) {
+      const actionDef = agent.identifyAction(action);
+      console.log(`[${label}] Executing: ${actionDef.render(action)}`);
+      await agent.exec(action, memory);
+    }
+
+    if (taskDone) {
+      console.log(`[${label}] LLM signalled task:done.`);
+      break;
+    }
+  }
+}
+
+/**
+ * Best-effort: drive the LLM to click the in-meeting Leave button before
+ * tearing down the browser session. A graceful click means the meeting
+ * server records a clean exit (vs. the abrupt "connection lost" other
+ * participants see when the browser process is killed mid-call).
+ *
+ * Always safe to call:
+ *   - No-ops if the meeting is already ended / removed / errored.
+ *   - Bounded by an outer timeout so a stuck Magnitude loop cannot block
+ *     teardown.
+ *   - Failures are logged and swallowed; the caller should still run the
+ *     unconditional `agent.stop()` afterwards.
+ */
+async function clickLeaveButton(
+  session: GoogleMeetSessionInfo | TeamsMeetSessionInfo,
+  channel: 'google_meet' | 'teams_meet',
+): Promise<void> {
+  if (
+    session.status === 'ended' ||
+    session.status === 'removed' ||
+    session.status === 'error'
+  ) {
+    return;
+  }
+
+  const isGoogle = channel === 'google_meet';
+  const task = isGoogle ? MEET_LEAVE_TASK : TEAMS_LEAVE_TASK;
+  const label = isGoogle ? 'googlemeet/leave-click' : 'teamsmeet/leave-click';
+  const maxIters = isGoogle ? MEET_PRESENT_MAX_ITERATIONS : TEAMS_PRESENT_MAX_ITERATIONS;
+
+  try {
+    await session.agent.page.bringToFront();
+    await Promise.race([
+      runMagnitudeLoop(session.agent, task, maxIters, label),
+      new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error('leave_click_timeout')), 8000),
+      ),
+    ]);
+    // Brief grace so the meeting server registers the leave RPC before we
+    // kill the underlying socket via `agent.stop()`.
+    await sleep(500);
+  } catch (err) {
+    console.warn(`[${label}] best-effort leave click failed: ${err}`);
+  }
+}
+
+/**
+ * Open Google Meet Settings dialog via Playwright (deterministic), then hand
+ * off to the LLM to navigate the Audio tab and select devices (visual).
+ */
+async function openMeetSettings(page: any): Promise<boolean> {
+  const tag = '[googlemeet/devices]';
+
+  try {
+    const moreBtn = page.locator(
+      'button[aria-label*="More options" i], button[aria-label*="more actions" i], button[aria-label*="More" i][aria-haspopup]'
+    ).first();
+    if (!await moreBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      console.log(`${tag} Triple-dots menu button not found`);
+      return false;
+    }
+    console.log(`${tag} Opening More options menu...`);
+    await moreBtn.click();
+    await page.waitForTimeout(500);
+
+    const settingsItem = page.locator(
+      'li:has-text("Settings"), [role="menuitem"]:has-text("Settings"), span:has-text("Settings")'
+    ).first();
+    if (!await settingsItem.isVisible({ timeout: 2000 }).catch(() => false)) {
+      console.log(`${tag} "Settings" menu item not found — closing menu`);
+      await page.keyboard.press('Escape');
+      return false;
+    }
+    console.log(`${tag} Clicking Settings...`);
+    await settingsItem.click();
+    await page.waitForTimeout(800);
+    console.log(`${tag} Settings dialog opened`);
+    return true;
+  } catch (err) {
+    console.log(`${tag} Error opening Settings: ${err}`);
+    await page.keyboard.press('Escape').catch(() => {});
+    return false;
+  }
+}
+
+const MEET_AUDIO_TAB_TASK =
+  `You are in the Google Meet Settings dialog.\n` +
+  `Click the "Audio" tab on the left side of the dialog.\n` +
+  `Do NOT close the dialog.`;
+
+const MEET_SELECT_MIC_TASK = (micLabel: string) =>
+  `You are in the Google Meet Settings dialog, on the Audio tab.\n` +
+  `Click the Microphone dropdown and select the option containing "${micLabel}".\n` +
+  `Do NOT close the dialog.`;
+
+const MEET_SELECT_SPEAKER_TASK = (speakerLabel: string) =>
+  `You are in the Google Meet Settings dialog, on the Audio tab.\n` +
+  `Click the Speakers dropdown and select the option containing "${speakerLabel}".\n` +
+  `Then close the settings dialog by clicking the X button.`;
+
+const MEET_AUDIO_MAX_ITERATIONS = 3;
+
+async function googleMeetJoinFlow(agent: BrowserAgent, displayName: string): Promise<GoogleMeetJoinResult> {
+  const page = agent.page;
+  await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+
+  const pageUrl = page.url?.() ?? 'unknown';
+  console.log(`[googlemeet/join] Page loaded: url=${pageUrl}`);
+
+  // Phase 1: LLM handles variable UI (popups, name, camera)
+  console.log('[googlemeet/join] Phase 1: prepare...');
+  await runMagnitudeLoop(agent, MEET_PREPARE_TASK(displayName), MEET_PREPARE_MAX_ITERATIONS, 'googlemeet/prepare');
+
+  // Phase 1b: Audio device selection — Playwright opens Settings, LLM handles each step
+  console.log('[googlemeet/join] Phase 1b: opening Settings for audio device selection...');
+  const settingsOpened = await openMeetSettings(page);
+  if (settingsOpened) {
+    console.log('[googlemeet/join] Phase 1b-i: navigating to Audio tab...');
+    await runMagnitudeLoop(agent, MEET_AUDIO_TAB_TASK, MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/audio-tab');
+
+    console.log('[googlemeet/join] Phase 1b-ii: selecting microphone...');
+    await runMagnitudeLoop(agent, MEET_SELECT_MIC_TASK('agent_sink'), MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/select-mic');
+
+    console.log('[googlemeet/join] Phase 1b-iii: selecting speaker + closing...');
+    await runMagnitudeLoop(agent, MEET_SELECT_SPEAKER_TASK('meet_sink'), MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/select-speaker');
+  } else {
+    console.log('[googlemeet/join] Phase 1b: Could not open Settings — using default devices');
+  }
+
+  // Phase 2: click join
+  console.log('[googlemeet/join] Phase 2: clicking join...');
+  await runMagnitudeLoop(agent, MEET_CLICK_JOIN_TASK, MEET_JOIN_MAX_ITERATIONS, 'googlemeet/click-join');
+
+  // Determine outcome by checking the page state after the agent finished
+  await sleep(2000);
+
+  const meetingActive = await page.locator(
+    '[data-meeting-title], [aria-label*="meeting details" i], [data-call-duration]'
+  ).first().isVisible({ timeout: 5000 }).catch(() => false);
+  if (meetingActive) return { status: 'active' };
+
+  const inLobby = await page.locator(
+    'text=/waiting|asking to join|let you in/i'
+  ).first().isVisible({ timeout: 3000 }).catch(() => false);
+  if (inLobby) return { status: 'lobby' };
+
+  const hasError = await page.locator(
+    'text=/invalid meeting|meeting has ended|no longer available|meeting not found/i'
+  ).first().isVisible({ timeout: 1000 }).catch(() => false);
+  if (hasError) {
+    const errorMsg = await page.locator('text=/invalid meeting|meeting has ended|no longer available|meeting not found/i').first().textContent().catch(() => 'unknown');
+    return { status: 'error', reason: `meet_page_error: "${errorMsg}" (url=${pageUrl})` };
+  }
+
+  const hasJoinBtn = await page.locator(
+    'button:has-text("Ask to join"), button:has-text("Join now"), button:has-text("Join")'
+  ).first().isVisible({ timeout: 1000 }).catch(() => false);
+  if (hasJoinBtn) {
+    return { status: 'error', reason: `join_button_still_visible: Agent completed but join button was not clicked (url=${pageUrl})` };
+  }
+
+  // No definitive signal — assume we're waiting for admission
+  return { status: 'lobby' };
+}
+
+async function googleMeetPollState(sessionId: string): Promise<void> {
+  const session = googleMeetSessions.get(sessionId);
+  if (!session || session.status === 'ended' || session.status === 'error') return;
+
+  try {
+    const page = session.agent.page;
+
+    // Detect if meeting has ended
+    const meetingEnded = await page.locator(
+      'text=/meeting has ended|you left the meeting|removed from the meeting|kicked/i'
+    ).first().isVisible({ timeout: 500 }).catch(() => false);
+
+    if (meetingEnded) {
+      session.status = 'ended';
+      return;
+    }
+
+    // If we were in the lobby, check if we're admitted now
+    if (session.status === 'lobby') {
+      const admitted = await page.locator(
+        '[data-meeting-title], [aria-label*="meeting details" i], [data-call-duration]'
+      ).first().isVisible({ timeout: 500 }).catch(() => false);
+      if (admitted) session.status = 'active';
+
+      // Check if denied
+      const denied = await page.locator(
+        'text=/denied|not allowed|can\'t join/i'
+      ).first().isVisible({ timeout: 500 }).catch(() => false);
+      if (denied) {
+        session.status = 'removed';
+        return;
+      }
+    }
+
+    // Scrape participants and active speaker from the DOM
+    const participants: GoogleMeetParticipant[] = [];
+    let activeSpeaker: string | null = null;
+
+    // Google Meet shows participant tiles; the active speaker has a highlighted border
+    const speakerElements = await page.locator(
+      '[data-self-name], [data-participant-id]'
+    ).all().catch(() => []);
+
+    for (const el of speakerElements) {
+      const name = await el.getAttribute('data-self-name').catch(() => null)
+        || await el.innerText().catch(() => null);
+      if (!name) continue;
+
+      const parentClasses = await el.evaluate(
+        (node: Element) => node.closest('[class]')?.className || ''
+      ).catch(() => '');
+      const isSpeaking = parentClasses.includes('speaking') ||
+        (await el.locator('[class*="speaking" i]').first().isVisible({ timeout: 100 }).catch(() => false));
+
+      const cleanName = name.split('\n')[0].trim();
+      participants.push({ name: cleanName, isSpeaking });
+      if (isSpeaking) activeSpeaker = cleanName;
+    }
+
+    session.participants = participants;
+    session.activeSpeaker = activeSpeaker;
+
+    // Cache a screenshot of the Meet tab for non-blocking reads
+    try {
+      const raw = await session.agent.page.screenshot({ type: 'jpeg', quality: 85 });
+      session.latestScreenshot = Buffer.from(raw).toString('base64');
+    } catch {
+      // Screenshot may fail transiently; keep the previous cached value
+    }
+  } catch {
+    // Browser may have disconnected
+    session.status = 'error';
+  }
+}
+
 // --- API Endpoints ---
 app.post('/start', async (req: Request, res: Response) => {
-  const { headless, mode } = req.body;
-  if (!mode || (mode !== "desktop" && mode !== "browser")) {
-    return res.status(400).json({ error: 'bad_request', message: 'Mode is required and must be either "desktop" or "browser".' });
+  // ``storageStateName`` is optional. When set, the magnitude
+  // BrowserProvider loads ~/.magnitude/browser_states/<safeName>.json
+  // (cookies + localStorage + sessionStorage) before any page renders so
+  // the new session boots already-authenticated. Currently only honoured
+  // for ``mode === 'web'``.
+  const { headless, mode, label, urlMappings, storageStateName } = req.body;
+  if (!mode || !['desktop', 'web', 'web-vm'].includes(mode)) {
+    return res.status(400).json({
+      error: 'bad_request',
+      message:
+        'Mode is required and must be "desktop", "web", or "web-vm".',
+    });
+  }
+
+  // Desktop mode is singleton -- one physical display, one session.
+  // Close any existing desktop session before creating a new one.
+  if (mode === "desktop") {
+    for (const [existingId, existing] of activeSessions.entries()) {
+      if (existing.mode === "desktop") {
+        console.log(`Replacing existing desktop session: ${existingId}`);
+        existing.agent.stop().catch((err: unknown) =>
+          console.error(`Error stopping old desktop session: ${err}`)
+        );
+        activeSessions.delete(existingId);
+        broadcastSessionEvent(existingId, 'replaced');
+      }
+    }
   }
 
   const sessionId = randomUUID();
+  const t0 = Date.now();
+  console.log(`[start] BEGIN mode=${mode} sessionId=${sessionId}`);
   try {
     let agent: BrowserAgent;
+    const rawMappings = urlMappings && typeof urlMappings === 'object' ? urlMappings as Record<string, string> : undefined;
+    const resolvedMappings = rawMappings ? await ensureDemoSites(rawMappings) : undefined;
+    const mappings = resolvedMappings && Object.keys(resolvedMappings).length > 0 ? resolvedMappings : undefined;
+
     if (mode === "desktop") {
       agent = await startDesktop();
+    } else if (mode === "web-vm") {
+      agent = await startBrowserOnVm(mappings);
     } else {
-      agent = await startBrowser(headless ?? false);
+      agent = await startBrowser(
+        headless ?? false,
+        mappings,
+        typeof storageStateName === 'string' && storageStateName ? storageStateName : undefined,
+      );
+    }
+    console.log(`[start] agent_created=${Date.now() - t0}ms mode=${mode}`);
+
+    // ── Diagnostic logging for URL mapping debugging ────────────────────
+    if (mappings) {
+      console.log(`[url-map-diag] urlMappings received by agent: ${JSON.stringify(mappings)}`);
+
+      // Verify each demo site is actually reachable right now
+      for (const [original, replacement] of Object.entries(mappings)) {
+        console.log(`[url-map-diag] Mapping: ${original} -> ${replacement}`);
+        try {
+          const testResp = await fetch(replacement, { redirect: 'manual' });
+          console.log(`[url-map-diag] Fetch test ${replacement} -> status=${testResp.status}, headers=${JSON.stringify(Object.fromEntries([...testResp.headers.entries()].filter(([k]) => ['content-type','location','content-length'].includes(k.toLowerCase()))))}`);
+        } catch (e) {
+          console.error(`[url-map-diag] Fetch test ${replacement} -> FAILED: ${e}`);
+        }
+      }
+
+      // Log all registered routes on the context (Playwright exposes them via internal state)
+      try {
+        // Check if magnitude registered any routes by inspecting the context
+        const page = agent.page;
+        console.log(`[url-map-diag] Current page URL after agent start: ${page.url()}`);
+      } catch (e) {
+        console.warn(`[url-map-diag] Could not read page URL: ${e}`);
+      }
+
+      // Add a catch-all diagnostic route that logs EVERY request the browser makes.
+      // Uses route.fallback() so it doesn't interfere with magnitude's routes --
+      // if magnitude's route already handled it, this won't fire.
+      // If this DOES fire for a mapped URL, it means magnitude's route did NOT catch it.
+      try {
+        await agent.context.route('**/*', async (route) => {
+          const req = route.request();
+          const url = req.url();
+          const isNav = req.isNavigationRequest();
+          const method = req.method();
+          const resourceType = req.resourceType();
+
+          // Log all navigation requests + anything hitting a mapped domain
+          const mappedEntries = Object.entries(mappings!);
+          let matchInfo = 'no-match';
+          for (const [orig] of mappedEntries) {
+            const origHost = new URL(orig).hostname;
+            if (url.includes(origHost)) {
+              matchInfo = `matches-domain:${origHost}`;
+              // This request matched a mapped domain but reached our fallback,
+              // meaning magnitude's context.route() did NOT intercept it.
+              console.warn(`[url-map-diag] ⚠️ LEAKED REQUEST: ${method} ${url} (magnitude route did NOT intercept this)`);
+              // Check if URL exactly matches what magnitude should catch
+              const urlObj = new URL(url);
+              console.warn(`[url-map-diag]   url.href=${urlObj.href}, original=${orig}, startsWith(orig+/)=${urlObj.href.startsWith(orig + '/')}, equals=${urlObj.href === orig}`);
+              break;
+            }
+          }
+
+          if (isNav) {
+            console.log(`[url-map-diag] NAV ${method} ${url} (type=${resourceType}, ${matchInfo})`);
+          }
+
+          await route.fallback();
+        });
+        console.log(`[url-map-diag] Diagnostic catch-all route installed`);
+      } catch (e) {
+        console.warn(`[url-map-diag] Failed to install diagnostic route: ${e}`);
+      }
+    } else {
+      console.log(`[url-map-diag] No urlMappings provided for this session`);
+    }
+    // ── End diagnostic logging ───────────────────────────────────────────
+
+    if (label && mode === 'web-vm') {
+      try {
+        await agent.context.addInitScript(`
+          (function() {
+            function _injectBadge() {
+              if (document.getElementById('__mag_session_badge')) return;
+              var b = document.createElement('div');
+              b.id = '__mag_session_badge';
+              b.textContent = ${JSON.stringify(String(label))};
+              b.style.cssText = 'position:fixed;top:4px;right:4px;z-index:2147483647;'
+                + 'background:rgba(30,30,30,0.85);color:#fff;padding:2px 8px;'
+                + 'font:bold 12px/16px system-ui,sans-serif;border-radius:4px;'
+                + 'pointer-events:none;user-select:none;';
+              (document.body || document.documentElement).appendChild(b);
+            }
+            if (document.body) _injectBadge();
+            else document.addEventListener('DOMContentLoaded', _injectBadge);
+          })();
+        `);
+      } catch (badgeErr) {
+        console.warn(`[start] Badge injection failed: ${badgeErr}`);
+      }
     }
 
     activeSessions.set(sessionId, {
@@ -434,10 +1290,15 @@ app.post('/start', async (req: Request, res: Response) => {
       mode,
       createdAt: new Date(),
       lastAccessed: new Date(),
+      actHistory: [],
+      latestScreenshot: '',
+      latestCursorPosition: null,
     });
 
+    console.log(`[start] DONE mode=${mode} sessionId=${sessionId} total=${Date.now() - t0}ms active_sessions=${activeSessions.size}`);
     res.json({ status: 'started', sessionId });
   } catch (err) {
+    console.error(`[start] ERROR mode=${mode} after ${Date.now() - t0}ms:`, err);
     handleAgentError(err, res);
   }
 });
@@ -455,12 +1316,249 @@ app.post('/nav', isAgentReady, async (req: Request, res: Response) => {
 });
 
 app.post('/act', isAgentReady, async (req: Request, res: Response) => {
-  const { task, sessionId, override_cache } = req.body;
+  const { task, sessionId, lineage, verify } = req.body;
   if (!task) return res.status(400).json({ error: 'bad_request', message: 'Task description is required.' });
   try {
     const session = activeSessions.get(sessionId)!;
-    await session.agent.act(task, { override_cache: override_cache === true } as any);
-    res.json({ status: 'success', message: `Task "${task}" completed.` });
+    const agent = session.agent;
+    const actId = makeActId(task);
+
+    const lineageLabel = Array.isArray(lineage) && lineage.length > 0
+      ? `[${lineage.join('->')}->desktop.act] `
+      : '[desktop.act] ';
+
+    const memory = new AgentMemory({ promptCaching: true });
+
+    // Fresh web/web-vm sessions already have a browser open and loaded.
+    // Tell the LLM so it can no-op (return an empty action list) if the
+    // task is simply asking to open a browser.
+    if (session.actHistory.length === 0 && session.mode !== 'desktop') {
+      memory.recordObservation(new Observation(
+        'thought' as any,
+        'user',
+        'This is a freshly created browser session — the browser is already open and loaded. '
+        + 'If the task is simply asking to open a browser, open a new browser window, or launch a browser, '
+        + 'this has already been accomplished. Return an empty actions list.'
+      ));
+    }
+
+    if (session.actHistory.length > 0) {
+      let injectedCount = 0;
+      for (const entry of session.actHistory) {
+        memory.recordObservation(new Observation(
+          'thought' as any,
+          'user',
+          `Previously completed task: "${entry.task}"`
+        ));
+        injectedCount++;
+        for (const obs of entry.observations) {
+          memory.recordObservation(obs);
+          injectedCount++;
+        }
+      }
+      console.log(`${lineageLabel}📋 Injecting history from ${session.actHistory.length} previous acts (${injectedCount} observations)`);
+    } else {
+      console.log(`${lineageLabel}📋 No prior act history in session`);
+    }
+
+    const boundary = memory.observationCount;
+
+    const actT0 = Date.now();
+    console.log(`${lineageLabel}🧠 Planning actions for: "${task}"${verify ? ' (verify=true)' : ''}`);
+
+    const actActions = verify
+      ? agent.actions
+      : agent.actions.filter(a => !a.name.startsWith('task:'));
+    const MAX_VERIFY_ITERATIONS = 5;
+    const actionTraces: any[] = [];
+    const iterationReasonings: string[] = [];
+    const iterationPlannedActions: any[][] = [];
+    let totalActionsExecuted = 0;
+
+    for (let iteration = 0; iteration < (verify ? MAX_VERIFY_ITERATIONS : 1); iteration++) {
+      if (iteration > 0) {
+        console.log(`${lineageLabel}🔄 Verify pass ${iteration + 1}: re-observing and re-planning...`);
+      }
+
+      await agent.recordConnectorObservations(memory);
+
+      if (MAGNITUDE_DEBUG) {
+        try {
+          const harness = agent.require(BrowserConnector).getHarness();
+          const planImg = await harness.screenshot();
+          debugSaveImage(actId, iteration === 0 ? 'planning_screenshot' : `verify_${iteration}_screenshot`, await planImg.toBase64());
+
+          if (session.mode === 'desktop') {
+            debugSaveImage(actId, iteration === 0 ? 'native_screenshot' : `verify_${iteration}_native`, nativeScreenshot());
+          }
+        } catch (debugErr) {
+          console.warn(`[debug] Pre-plan screenshot capture failed: ${debugErr}`);
+        }
+      }
+
+      const context = await agent.buildContext(memory);
+      const { reasoning, actions } = await agent.models.partialAct(context, task, [], actActions);
+
+      const planMs = Date.now() - actT0;
+      console.log(`${lineageLabel}💭 Reasoning [${planMs}ms]: ${reasoning}`);
+      console.log(`${lineageLabel}📋 Planned ${actions.length} action(s): ${actions.map(a => a.variant).join(', ')}`);
+
+      iterationReasonings.push(reasoning);
+      iterationPlannedActions.push(actions);
+      memory.recordThought(reasoning);
+
+      for (let i = 0; i < actions.length; i++) {
+        const action = actions[i];
+        const actionDef = agent.identifyAction(action);
+        const rendered = actionDef.render(action);
+        const detail = JSON.stringify(action);
+        console.log(`${lineageLabel}🛠️ Action ${totalActionsExecuted + i + 1}: ${rendered} ${detail}`);
+
+        const actionT0 = Date.now();
+        let actionError: string | undefined;
+        try {
+          await agent.exec(action, memory);
+        } catch (err) {
+          actionError = err instanceof Error ? err.message : String(err);
+          throw err;
+        } finally {
+          const actionMs = Date.now() - actionT0;
+          console.log(`${lineageLabel}✅ Completed ${action.variant} [${actionMs}ms]`);
+
+          const actionTrace: any = {
+            index: totalActionsExecuted + i,
+            iteration,
+            variant: action.variant,
+            params: action,
+            rendered,
+            executionMs: actionMs,
+          };
+          if (actionError) actionTrace.error = actionError;
+
+          if (MAGNITUDE_DEBUG) {
+            try {
+              const harness = agent.require(BrowserConnector).getHarness();
+              const postImg = await harness.screenshot();
+              const coordLabel = ('x' in action && 'y' in action)
+                ? `_${action.x}_${action.y}`
+                : ('from' in action && typeof action.from === 'object')
+                  ? `_${action.from.x}_${action.from.y}`
+                  : '';
+              const padIdx = String(totalActionsExecuted + i + 1).padStart(3, '0');
+              debugSaveImage(
+                actId,
+                `post_action/${padIdx}_${action.variant.replace(/:/g, '_')}${coordLabel}`,
+                await postImg.toBase64(),
+              );
+            } catch (debugErr) {
+              console.warn(`[debug] Post-action screenshot failed: ${debugErr}`);
+            }
+          }
+
+          actionTraces.push(actionTrace);
+        }
+      }
+
+      totalActionsExecuted += actions.length;
+
+      const taskDone = actions.some(a => a.variant === 'task:done');
+      if (!verify || taskDone) break;
+    }
+
+    const totalMs = Date.now() - actT0;
+    console.log(`${lineageLabel}🏁 ${totalActionsExecuted} action(s) executed across ${iterationReasonings.length} iteration(s) [${totalMs}ms]`);
+
+    debugSaveTrace(actId, {
+      actId,
+      task,
+      verify: !!verify,
+      lineage: lineage ?? [],
+      sessionMode: session.mode,
+      sessionId,
+      reasoning: iterationReasonings.join('\n---\n'),
+      plannedActions: iterationPlannedActions,
+      actionTraces,
+      iterations: iterationReasonings.length,
+      totalMs,
+      historyDepth: session.actHistory.length,
+      observationCountBefore: boundary,
+    });
+
+    const newObservations = memory.getObservationsSlice(boundary);
+    const filtered = newObservations.filter(obs => {
+      const src = obs.source;
+      return src.startsWith('thought') || src.startsWith('action:taken:');
+    });
+
+    session.actHistory.push({ task, observations: filtered });
+    if (session.actHistory.length > ACT_HISTORY_DEPTH) {
+      session.actHistory = session.actHistory.slice(-ACT_HISTORY_DEPTH);
+    }
+
+    console.log(`[memory-carryover] Stored ${filtered.length} filtered observations for task "${task}" (history: ${session.actHistory.length}/${ACT_HISTORY_DEPTH})`);
+
+    const thoughts = filtered
+      .filter(obs => obs.source.startsWith('thought'))
+      .map(obs => String(obs.content))
+      .join('\n');
+
+    let screenshot = '';
+    try {
+      const connector = session.agent.require(BrowserConnector);
+      const harness = connector.getHarness();
+      const rawImage = await harness.screenshot();
+      const image = await connector.transformScreenshot(rawImage);
+      screenshot = await image.toBase64();
+      cacheScreenshot(sessionId, screenshot, harness.getCursorPosition());
+    } catch (screenshotErr) {
+      console.warn(`[act] Post-act screenshot failed: ${screenshotErr}`);
+    }
+
+    res.json({ status: 'success', summary: thoughts, screenshot });
+    refreshDesktopCache(sessionId);
+  } catch (err) {
+    handleAgentError(err, res);
+  }
+});
+
+app.post('/execute-actions', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId, actions } = req.body;
+  if (!actions || !Array.isArray(actions) || actions.length === 0) {
+    return res.status(400).json({
+      error: 'bad_request',
+      message: 'actions is required and must be a non-empty array of action objects.',
+    });
+  }
+
+  try {
+    const session = activeSessions.get(sessionId)!;
+    const agent = session.agent;
+    const t0 = Date.now();
+
+    const variants = actions.map((a: any) => a.variant).join(', ');
+    console.log(`[execute-actions] Executing ${actions.length} action(s) [${variants}] for session ${sessionId}`);
+
+    await agent.executeTrajectory(actions, { memory: agent.memory, recordObservations: false });
+
+    const execMs = Date.now() - t0;
+    console.log(`[execute-actions] ${actions.length} action(s) executed [${execMs}ms]`);
+
+    let screenshot = '';
+    let cursorPosition: { x: number; y: number } | null = null;
+    try {
+      const connector = agent.require(BrowserConnector);
+      const harness = connector.getHarness();
+      const rawImage = await harness.screenshot();
+      const image = await connector.transformScreenshot(rawImage);
+      screenshot = await image.toBase64();
+      cursorPosition = harness.getCursorPosition();
+      cacheScreenshot(sessionId, screenshot, cursorPosition);
+    } catch (screenshotErr) {
+      console.warn(`[execute-actions] Post-execution screenshot failed: ${screenshotErr}`);
+    }
+
+    res.json({ status: 'success', screenshot, cursorPosition });
+    refreshDesktopCache(sessionId);
   } catch (err) {
     handleAgentError(err, res);
   }
@@ -478,9 +1576,13 @@ app.post('/extract', isAgentReady, async (req: Request, res: Response) => {
     try {
       const zodSchema = schema ? jsonSchemaToZod(schema) : z.string();
       const session = activeSessions.get(sessionId)!;
+      const shouldBypassDomProcessing =
+        bypassDomProcessing === true || session.mode === 'desktop';
 
-      // If bypassDomProcessing is true, use screenshot-only extraction
-      if (bypassDomProcessing === true) {
+      // Desktop sessions are rendered through the live noVNC iframe, so DOM
+      // expansion is both meaningless and destructive. Always use screenshot-
+      // only extraction there, even if the caller forgets to request it.
+      if (shouldBypassDomProcessing) {
         const screenshot = await session.agent.require(BrowserConnector).getHarness().screenshot();
         const data = await (session.agent.models as any).extract(instructions, zodSchema as ZodTypeAny, screenshot, '');
         return res.json({ data });
@@ -516,24 +1618,172 @@ app.post('/query', isAgentReady, async (req: Request, res: Response) => {
   try {
     const zodSchema: ZodTypeAny = schema ? jsonSchemaToZod(schema) : z.any();
     const session = activeSessions.get(sessionId)!;
-    const queryFn = (session.agent as unknown as { query: (q: unknown, s: ZodTypeAny) => Promise<unknown> }).query;
-    const dataUnknown: unknown = await queryFn(query, zodSchema);
-    res.json({ data: dataUnknown });
+    const data: unknown = await (session.agent as any).query(query, zodSchema);
+    res.json({ data });
   } catch (err) {
     handleAgentError(err, res);
   }
 });
 
+// --- Native desktop screenshot via OS commands ---
+
+function nativeScreenshotCommand(dest: string): string {
+  switch (process.platform) {
+    case 'win32':
+      // PowerShell: capture full primary screen using System.Drawing
+      return [
+        'powershell.exe -NoProfile -Command "',
+        'Add-Type -AssemblyName System.Windows.Forms;',
+        'Add-Type -AssemblyName System.Drawing;',
+        '$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds;',
+        '$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height);',
+        '$g = [System.Drawing.Graphics]::FromImage($bmp);',
+        '$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size);',
+        '$g.Dispose();',
+        `$bmp.Save('${dest.replace(/'/g, "''")}');`,
+        '$bmp.Dispose();"',
+      ].join(' ');
+    case 'darwin':
+      return `screencapture -x "${dest}"`;
+    default:
+      // Linux / other Unix — xfce4-screenshooter ships with xfce4-goodies
+      // (installed in the desktop Docker image). Falls back to scrot, then
+      // ImageMagick's import for non-XFCE environments.
+      return `xfce4-screenshooter -f -s "${dest}" 2>/dev/null || scrot "${dest}" 2>/dev/null || import -window root "${dest}"`;
+  }
+}
+
+function nativeScreenshot(): string {
+  const dest = path.join(os.tmpdir(), `unity-screenshot-${randomUUID()}.png`);
+  try {
+    execSync(nativeScreenshotCommand(dest), { timeout: 10_000 });
+    const buf = fs.readFileSync(dest);
+    return buf.toString('base64');
+  } finally {
+    try { fs.unlinkSync(dest); } catch (_) { /* already cleaned or never created */ }
+  }
+}
+
+let _screenshotInFlight = 0;
+
 app.post('/screenshot', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  _screenshotInFlight++;
+  const t0 = Date.now();
+  const session = activeSessions.get(sessionId)!;
+  console.log(`[screenshot] START session=${sessionId} mode=${session.mode} in_flight=${_screenshotInFlight}`);
+  try {
+    // Use harness screenshot + transformScreenshot for ALL modes. This ensures the
+    // screenshot coordinate space matches the click coordinate space (both go through
+    // the Playwright page). For desktop mode, this captures the noVNC page which
+    // renders the VM desktop with noVNC's own scaling — the same coordinate space
+    // that page.mouse.click() uses.
+    const connector = session.agent.require(BrowserConnector);
+    const harness = connector.getHarness();
+    const tHarness = Date.now();
+    console.log(`[screenshot] harness_acquired=${tHarness - t0}ms`);
+    const rawImage = await harness.screenshot();
+    const tCapture = Date.now();
+    console.log(`[screenshot] playwright_capture=${tCapture - tHarness}ms`);
+    const image = await connector.transformScreenshot(rawImage);
+    const base64Image = await image.toBase64();
+    const cursorPosition = harness.getCursorPosition();
+    const tEncode = Date.now();
+    console.log(`[screenshot] base64_encode=${tEncode - tCapture}ms b64_len=${base64Image.length} total=${tEncode - t0}ms`);
+
+    cacheScreenshot(sessionId, base64Image, cursorPosition);
+    res.json({ screenshot: base64Image, cursorPosition });
+    _screenshotInFlight--;
+    console.log(`[screenshot] DONE total=${Date.now() - t0}ms in_flight=${_screenshotInFlight}`);
+  } catch (err) {
+    _screenshotInFlight--;
+    console.error(`[screenshot] ERROR after ${Date.now() - t0}ms in_flight=${_screenshotInFlight}:`, err);
+    handleAgentError(err, res, 'screenshot_failed');
+  }
+});
+
+app.post('/screenshot/latest', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  const session = activeSessions.get(sessionId)!;
+  if (session.latestScreenshot) {
+    res.json({ screenshot: session.latestScreenshot, cursorPosition: session.latestCursorPosition });
+  } else {
+    try {
+      const connector = session.agent.require(BrowserConnector);
+      const harness = connector.getHarness();
+      const rawImage = await harness.screenshot();
+      const image = await connector.transformScreenshot(rawImage);
+      const screenshot = await image.toBase64();
+      const cursorPosition = harness.getCursorPosition();
+      cacheScreenshot(sessionId!, screenshot, cursorPosition);
+      res.json({ screenshot, cursorPosition });
+    } catch (err) {
+      handleAgentError(err, res, 'screenshot_failed');
+    }
+  }
+});
+
+app.post('/eval', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId, expression } = req.body;
+  if (!expression) {
+    return res.status(400).json({ error: 'bad_request', message: 'expression is required.' });
+  }
+  try {
+    const session = activeSessions.get(sessionId)!;
+    const harness = session.agent.require(BrowserConnector).getHarness();
+    const result = await harness.page.evaluate(expression);
+    res.json({ result });
+  } catch (err) {
+    handleAgentError(err, res, 'eval_failed');
+  }
+});
+
+app.post('/viewport-info', isAgentReady, async (req: Request, res: Response) => {
   const { sessionId } = req.body;
   try {
     const session = activeSessions.get(sessionId)!;
     const harness = session.agent.require(BrowserConnector).getHarness();
-    const image = await harness.screenshot();
-    const base64Image = await image.toBase64();
-    res.json({ screenshot: base64Image });
+    const page = harness.page;
+
+    const playwrightViewport = page.viewportSize();
+
+    const jsInfo = await page.evaluate(() => ({
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      outerWidth: window.outerWidth,
+      outerHeight: window.outerHeight,
+      devicePixelRatio: window.devicePixelRatio,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      clientWidth: document.documentElement.clientWidth,
+      clientHeight: document.documentElement.clientHeight,
+      screenWidth: window.screen.width,
+      screenHeight: window.screen.height,
+      screenAvailWidth: window.screen.availWidth,
+      screenAvailHeight: window.screen.availHeight,
+    }));
+
+    const screenshotBuffer = await page.screenshot({ type: 'png' });
+    // PNG IHDR: width at bytes 16-19, height at bytes 20-23 (big-endian uint32)
+    const rawScreenshotDims = {
+      width: screenshotBuffer.readUInt32BE(16),
+      height: screenshotBuffer.readUInt32BE(20),
+    };
+
+    console.log(`[viewport-info] mode=${session.mode} playwright=${JSON.stringify(playwrightViewport)} js=${JSON.stringify(jsInfo)} rawScreenshot=${JSON.stringify(rawScreenshotDims)}`);
+
+    res.json({
+      mode: session.mode,
+      playwrightViewport,
+      jsViewport: jsInfo,
+      rawScreenshotDims,
+      rescaledScreenshotDims: {
+        width: Math.round(rawScreenshotDims.width / jsInfo.devicePixelRatio),
+        height: Math.round(rawScreenshotDims.height / jsInfo.devicePixelRatio),
+      },
+    });
   } catch (err) {
-    handleAgentError(err, res, 'screenshot_failed');
+    handleAgentError(err, res, 'viewport_info_failed');
   }
 });
 
@@ -685,6 +1935,304 @@ app.post('/content', isAgentReady, async (req: Request, res: Response) => {
   }
 });
 
+// --- /captcha/solve endpoint: Delegate reCAPTCHA v2 to AntiCaptcha ---
+//
+// Extracts the sitekey from the live page, submits a RecaptchaV2TaskProxyless
+// task to api.anti-captcha.com, polls for the worker-solved token, and
+// injects it back into the page so the page's own submit flow accepts the
+// verification. Returns once injection succeeds.
+//
+// The handler is deterministic and decoupled from magnitude-core's LLM
+// action vocabulary: it is meant to be reached for by orchestration code
+// after a separate ``observe()`` call has visually confirmed that a
+// reCAPTCHA challenge is on screen.
+//
+// The token returned by AntiCaptcha is a Google-signed credential. It is
+// NEVER logged, NEVER persisted, and NEVER echoed in the response body.
+//
+// The ``ANTICAPTCHA_KEY`` must be set in agent-service's own ``.env``; it
+// is never accepted from the request body.
+app.post('/captcha/solve', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId, variant: variantRaw } = req.body;
+  const variant: 'v2_checkbox' | 'v2_invisible' =
+    variantRaw === 'v2_invisible' ? 'v2_invisible' : 'v2_checkbox';
+
+  const clientKey = process.env.ANTICAPTCHA_KEY;
+  if (!clientKey) {
+    return res.status(503).json({
+      error: 'anticaptcha_key_missing',
+      message: 'ANTICAPTCHA_KEY is not set in the agent-service environment.',
+    });
+  }
+
+  const t0 = Date.now();
+  let sitekey: string | null = null;
+  let taskId: number | null = null;
+
+  try {
+    const session = activeSessions.get(sessionId)!;
+    const page = session.agent.page;
+    const pageUrl: string = page.url();
+
+    sitekey = await page.evaluate(() => {
+      const decode = (raw: string | null): string | null => {
+        if (!raw) return null;
+        try { return decodeURIComponent(raw); } catch { return raw; }
+      };
+      const direct = document.querySelector('[data-sitekey]') as HTMLElement | null;
+      const directKey = direct?.getAttribute('data-sitekey');
+      if (directKey) return directKey;
+      const iframes = Array.from(document.querySelectorAll('iframe')) as HTMLIFrameElement[];
+      const probe = (substr: string): string | null => {
+        for (const f of iframes) {
+          const src = f.getAttribute('src') || '';
+          if (src.includes(substr)) {
+            try {
+              const u = new URL(src, window.location.href);
+              const k = u.searchParams.get('k');
+              if (k) return decode(k);
+            } catch { /* fall through */ }
+          }
+        }
+        return null;
+      };
+      return probe('recaptcha/api2/anchor') || probe('recaptcha/api2/bframe');
+    });
+
+    if (!sitekey) {
+      return res.status(400).json({
+        error: 'no_sitekey',
+        message: 'No reCAPTCHA sitekey was found on the current page.',
+      });
+    }
+
+    const createResp = await fetch('https://api.anti-captcha.com/createTask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clientKey,
+        task: {
+          type: 'RecaptchaV2TaskProxyless',
+          websiteURL: pageUrl,
+          websiteKey: sitekey,
+          isInvisible: variant === 'v2_invisible',
+        },
+      }),
+    });
+    const createBody: any = await createResp.json().catch(() => ({}));
+    if (!createResp.ok || typeof createBody?.errorId !== 'number' || createBody.errorId !== 0) {
+      console.error(
+        `[captcha/solve] createTask failed sitekey=${sitekey} variant=${variant} ` +
+        `httpStatus=${createResp.status} errorId=${createBody?.errorId} ` +
+        `errorCode=${createBody?.errorCode}`,
+      );
+      return res.status(502).json({
+        error: 'anticaptcha_api_error',
+        message: `createTask failed: ${createBody?.errorCode || 'unknown'} - ${createBody?.errorDescription || ''}`,
+        details: { errorId: createBody?.errorId, errorCode: createBody?.errorCode },
+      });
+    }
+    taskId = createBody.taskId;
+    console.log(`[captcha/solve] task_created task_id=${taskId} sitekey=${sitekey} variant=${variant}`);
+
+    // Poll every 3s for up to 60 attempts (~3 min) for the worker pool to
+    // return a token.  Anti-Captcha's docs recommend an initial 5s wait
+    // before the first poll, but a 3s cadence from t=3s is fine and gives
+    // us slightly faster turnaround on already-queued tasks.
+    let token: string | null = null;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      await sleep(3000);
+      const pollResp = await fetch('https://api.anti-captcha.com/getTaskResult', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientKey, taskId }),
+      });
+      const pollBody: any = await pollResp.json().catch(() => ({}));
+      if (!pollResp.ok || typeof pollBody?.errorId !== 'number' || pollBody.errorId !== 0) {
+        console.error(
+          `[captcha/solve] getTaskResult failed task_id=${taskId} ` +
+          `httpStatus=${pollResp.status} errorId=${pollBody?.errorId} ` +
+          `errorCode=${pollBody?.errorCode}`,
+        );
+        return res.status(502).json({
+          error: 'anticaptcha_api_error',
+          message: `getTaskResult failed: ${pollBody?.errorCode || 'unknown'} - ${pollBody?.errorDescription || ''}`,
+          details: { errorId: pollBody?.errorId, errorCode: pollBody?.errorCode, taskId },
+        });
+      }
+      if (pollBody.status === 'ready') {
+        token = pollBody.solution?.gRecaptchaResponse || null;
+        break;
+      }
+    }
+
+    if (!token) {
+      console.error(`[captcha/solve] solve_timeout task_id=${taskId} sitekey=${sitekey}`);
+      return res.status(504).json({
+        error: 'solve_timeout',
+        message: 'AntiCaptcha worker pool did not return a token within ~3 minutes.',
+      });
+    }
+
+    // Inject the token + invoke any registered callbacks, then poll the
+    // reCAPTCHA widget's own JS API until it acknowledges the token. All
+    // done inside a single ``page.evaluate`` so the token is passed in as
+    // a function argument (and lives only on the page side) rather than
+    // being serialised into the evaluation source string.
+    //
+    // The async polling loop turns the brittle "inject and pray" pattern
+    // into a deterministic widget-level handshake: we know the widget
+    // accepts the token when ``grecaptcha.getResponse()`` returns a
+    // non-empty string. This catches injection failures (token written
+    // but widget rejects it) AND eliminates the need for caller-side
+    // sleeps.
+    //
+    // Returns ``{ injected, widgetAcked }`` where ``injected`` means at
+    // least one textarea or callback received the token, and
+    // ``widgetAcked`` means the widget's own JS API confirms it has
+    // internalised the verification.
+    const injectionResult: { injected: boolean; widgetAcked: boolean } = await page.evaluate(
+      async (tkn: string) => {
+        let textareaSet = false;
+        let callbackCalled = false;
+
+        const textareas = Array.from(
+          document.querySelectorAll('textarea[id^="g-recaptcha-response"], textarea[name="g-recaptcha-response"]'),
+        ) as HTMLTextAreaElement[];
+        for (const ta of textareas) {
+          ta.value = tkn;
+          try { ta.dispatchEvent(new Event('input', { bubbles: true })); } catch { /* best-effort */ }
+          try { ta.dispatchEvent(new Event('change', { bubbles: true })); } catch { /* best-effort */ }
+          textareaSet = true;
+        }
+
+        // Strategy A: data-callback attribute names a window-scoped function.
+        const cbHosts = Array.from(document.querySelectorAll('[data-callback]')) as HTMLElement[];
+        for (const host of cbHosts) {
+          const name = host.getAttribute('data-callback');
+          if (!name) continue;
+          const fn = (window as any)[name];
+          if (typeof fn === 'function') {
+            try { fn(tkn); callbackCalled = true; } catch { /* best-effort */ }
+          }
+        }
+
+        // Strategy B: walk window.___grecaptcha_cfg.clients[*] for nested
+        // ``callback`` functions (this is how SPA-mounted widgets register).
+        try {
+          const cfg: any = (window as any).___grecaptcha_cfg;
+          const clients = cfg?.clients;
+          if (clients && typeof clients === 'object') {
+            const walk = (node: any, depth: number): void => {
+              if (!node || depth > 6) return;
+              if (typeof node === 'object') {
+                for (const k of Object.keys(node)) {
+                  const v = node[k];
+                  if (k === 'callback' && typeof v === 'function') {
+                    try { v(tkn); callbackCalled = true; } catch { /* best-effort */ }
+                  } else if (typeof v === 'object' && v !== null) {
+                    walk(v, depth + 1);
+                  }
+                }
+              }
+            };
+            for (const clientKey of Object.keys(clients)) {
+              walk(clients[clientKey], 0);
+            }
+          }
+        } catch { /* best-effort */ }
+
+        // Poll the widget's own ``grecaptcha.getResponse()`` until it
+        // returns the injected token (or any non-empty string — some
+        // Enterprise variants normalise the token). 5s ceiling.
+        const widgetDeadline = Date.now() + 5_000;
+        let widgetAcked = false;
+        while (Date.now() < widgetDeadline) {
+          try {
+            const widget = (window as any).grecaptcha;
+            const getResponse = widget && typeof widget.getResponse === 'function' ? widget.getResponse : null;
+            if (getResponse) {
+              const resp = getResponse();
+              if (typeof resp === 'string' && resp.length > 0) {
+                widgetAcked = true;
+                break;
+              }
+            }
+          } catch { /* best-effort */ }
+          await new Promise(r => setTimeout(r, 100));
+        }
+
+        return { injected: textareaSet || callbackCalled, widgetAcked };
+      },
+      token,
+    );
+
+    if (!injectionResult.injected) {
+      console.error(`[captcha/solve] injection_failed task_id=${taskId} sitekey=${sitekey}`);
+      return res.status(500).json({
+        error: 'injection_failed',
+        message: 'Token retrieved but no textarea or callback was found on the page to receive it.',
+      });
+    }
+
+    // Wait for the host page to actually progress past the captcha.
+    // Two race-able signals, both Playwright-native, both bounded so no
+    // misbehaved page can wedge the handler.  ``settled_via`` tells the
+    // caller which signal latched first (or that we timed out).
+    //
+    // - 'userverify' — reCAPTCHA's server-side verification round-trip
+    //   POSTs to ``recaptcha/api2/userverify`` (or the Enterprise
+    //   variant).  Observing that response means Google has accepted
+    //   the token; the host page can now act on it.
+    // - 'networkidle' — Playwright reports the network as idle (no
+    //   requests in flight for 500ms).  Catches the case where the
+    //   verification call already completed before we started
+    //   waiting, plus follow-up XHRs the host page fires after
+    //   verification (e.g. "now fetch the revealed email").
+    const SETTLE_TIMEOUT_MS = 15_000;
+    let settledVia: 'userverify' | 'networkidle' | 'timeout' = 'timeout';
+    try {
+      settledVia = await Promise.race([
+        page.waitForResponse(
+          (r) => /recaptcha\/(api2|enterprise)\/userverify/.test(r.url()),
+          { timeout: SETTLE_TIMEOUT_MS },
+        ).then(() => 'userverify' as const),
+        page.waitForLoadState('networkidle', { timeout: SETTLE_TIMEOUT_MS })
+          .then(() => 'networkidle' as const),
+      ]);
+    } catch {
+      // Both branches timed out — either the host page never went idle
+      // (long-poll SPA) and never triggered userverify (challenge was
+      // already pre-verified, or the page is wedged).  Return
+      // settled=false so the caller can decide; we don't fail the
+      // request because the token + injection are still valid.
+      settledVia = 'timeout';
+    }
+
+    const solveTimeMs = Date.now() - t0;
+    console.log(
+      `[captcha/solve] solved task_id=${taskId} sitekey=${sitekey} variant=${variant} ` +
+      `solve_time_ms=${solveTimeMs} widget_acked=${injectionResult.widgetAcked} ` +
+      `settled_via=${settledVia}`,
+    );
+    res.json({
+      status: 'solved',
+      solve_time_ms: solveTimeMs,
+      sitekey,
+      variant,
+      task_id: taskId,
+      widget_acked: injectionResult.widgetAcked,
+      settled: settledVia !== 'timeout',
+      settled_via: settledVia,
+    });
+  } catch (err) {
+    console.error(
+      `[captcha/solve] unexpected error task_id=${taskId} sitekey=${sitekey}: ${err instanceof Error ? err.message : err}`,
+    );
+    handleAgentError(err, res, 'captcha_solve_failed');
+  }
+});
+
 app.post('/stop', async (req: Request, res: Response) => {
   const { sessionId } = req.body;
   if (!sessionId) {
@@ -699,6 +2247,7 @@ app.post('/stop', async (req: Request, res: Response) => {
   try {
     await session.agent.stop();
     activeSessions.delete(sessionId);
+    broadcastSessionEvent(sessionId, 'stop');
     res.json({ status: 'stopped' });
     console.log(`BrowserAgent stopped for session ${sessionId}.`);
   } catch (err) {
@@ -717,7 +2266,1077 @@ app.post('/interrupt_action', isAgentReady, async (req: Request, res: Response) 
   }
 });
 
+app.post('/pause', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  try {
+    const session = activeSessions.get(sessionId)!;
+    session.agent.pause();
+    res.json({ status: 'paused', message: 'The agent has been paused.' });
+  } catch (err) {
+    handleAgentError(err, res, 'pause_failed');
+  }
+});
 
+app.post('/resume', isAgentReady, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  try {
+    const session = activeSessions.get(sessionId)!;
+    session.agent.resume();
+    res.json({ status: 'resumed', message: 'The agent has been resumed.' });
+  } catch (err) {
+    handleAgentError(err, res, 'resume_failed');
+  }
+});
+
+// --- Google Meet endpoints ---
+
+app.post('/googlemeet/join', auth, async (req: Request, res: Response) => {
+  const { meetUrl, displayName } = req.body;
+  if (!meetUrl) {
+    return res.status(400).json({ error: 'bad_request', message: 'meetUrl is required.' });
+  }
+
+  const name = displayName || 'Unity Assistant';
+  const sessionId = randomUUID();
+  const t0 = Date.now();
+  console.log(`[googlemeet/join] BEGIN sessionId=${sessionId} url=${meetUrl}`);
+
+  try {
+    const agent = await startGoogleMeetBrowser(meetUrl);
+
+    const result = await googleMeetJoinFlow(agent, name);
+    console.log(`[googlemeet/join] Join flow completed: status=${result.status}${result.status === 'error' ? ` reason="${result.reason}"` : ''} [${Date.now() - t0}ms]`);
+
+    if (result.status === 'error') {
+      await agent.stop().catch(() => {});
+      return res.status(400).json({
+        error: 'join_failed',
+        reason: result.reason,
+        message: `Could not join Google Meet: ${result.reason}`,
+      });
+    }
+
+    const sessionInfo: GoogleMeetSessionInfo = {
+      agent,
+      status: result.status,
+      meetUrl,
+      displayName: name,
+      createdAt: new Date(),
+      participants: [],
+      activeSpeaker: null,
+      pollIntervalId: null,
+      latestScreenshot: null,
+      presenting: false,
+      desktopTabPage: null,
+    };
+
+    // Start polling the DOM for meeting state and active speaker
+    sessionInfo.pollIntervalId = setInterval(() => {
+      googleMeetPollState(sessionId).then(() => {
+        const s = googleMeetSessions.get(sessionId);
+        if (s && (s.status === 'ended' || s.status === 'removed' || s.status === 'error')) {
+          if (s.pollIntervalId) clearInterval(s.pollIntervalId);
+          s.pollIntervalId = null;
+          console.log(`[googlemeet] Session ${sessionId} ended (status=${s.status}), polling stopped.`);
+        }
+      });
+    }, 1000);
+
+    googleMeetSessions.set(sessionId, sessionInfo);
+
+    console.log(`[googlemeet/join] DONE sessionId=${sessionId} status=${result.status} [${Date.now() - t0}ms]`);
+    res.json({ status: result.status, sessionId });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    console.error(`[googlemeet/join] EXCEPTION after ${Date.now() - t0}ms: ${message}`, stack ? `\n${stack}` : '');
+    res.status(500).json({ error: 'join_exception', message });
+  }
+});
+
+app.post('/googlemeet/leave', auth, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
+  }
+
+  const session = googleMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
+  }
+
+  try {
+    if (session.pollIntervalId) {
+      clearInterval(session.pollIntervalId);
+      session.pollIntervalId = null;
+    }
+
+    await clickLeaveButton(session, 'google_meet');
+
+    if (session.desktopTabPage) {
+      await session.desktopTabPage.close().catch(() => {});
+      session.desktopTabPage = null;
+    }
+    session.presenting = false;
+
+    await session.agent.stop();
+    session.status = 'ended';
+    googleMeetSessions.delete(sessionId);
+
+    console.log(`[googlemeet/leave] Session ${sessionId} stopped.`);
+    res.json({ status: 'left' });
+  } catch (err) {
+    console.error(`[googlemeet/leave] Error stopping session ${sessionId}:`, err);
+    googleMeetSessions.delete(sessionId);
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'leave_failed', message });
+  }
+});
+
+app.get('/googlemeet/sessions', auth, async (_req: Request, res: Response) => {
+  const sessions = Array.from(googleMeetSessions.entries()).map(([sessionId, session]) => ({
+    sessionId,
+    meetUrl: session.meetUrl,
+    status: session.status,
+    displayName: session.displayName,
+    createdAt: session.createdAt,
+  }));
+  res.json({ sessions });
+});
+
+app.get('/googlemeet/state', auth, async (req: Request, res: Response) => {
+  const sessionId = req.query.sessionId as string;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId query parameter is required.' });
+  }
+
+  const session = googleMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
+  }
+
+  res.json({
+    status: session.status,
+    meetUrl: session.meetUrl,
+    displayName: session.displayName,
+    createdAt: session.createdAt,
+    participants: session.participants,
+    activeSpeaker: session.activeSpeaker,
+  });
+});
+
+app.get('/googlemeet/screenshot/latest', auth, async (req: Request, res: Response) => {
+  const sessionId = req.query.sessionId as string;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId query parameter is required.' });
+  }
+
+  const session = googleMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
+  }
+
+  if (!session.latestScreenshot) {
+    return res.status(204).end();
+  }
+
+  res.json({ screenshot: session.latestScreenshot });
+});
+
+app.post('/googlemeet/present', auth, async (req: Request, res: Response) => {
+  const { sessionId, desktopUrl } = req.body;
+  if (!sessionId || !desktopUrl) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId and desktopUrl are required.' });
+  }
+
+  const session = googleMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
+  }
+  if (session.presenting) {
+    return res.json({ status: 'already_presenting' });
+  }
+
+  const t0 = Date.now();
+  console.log(`[googlemeet/present] BEGIN sessionId=${sessionId} desktopUrl=${desktopUrl}`);
+
+  try {
+    const context = session.agent.context;
+    const desktopTab = await context.newPage();
+    await desktopTab.goto(desktopUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    console.log(`[googlemeet/present] Desktop tab opened [${Date.now() - t0}ms]`);
+
+    // Switch back to the Meet tab for the LLM to click "Present now"
+    const meetPage = session.agent.page;
+    await meetPage.bringToFront();
+
+    await runMagnitudeLoop(session.agent, MEET_PRESENT_TAB_TASK, MEET_PRESENT_MAX_ITERATIONS, 'googlemeet/present');
+    console.log(`[googlemeet/present] Present flow completed [${Date.now() - t0}ms]`);
+
+    session.presenting = true;
+    session.desktopTabPage = desktopTab;
+
+    res.json({ status: 'presenting' });
+    console.log(`[googlemeet/present] DONE [${Date.now() - t0}ms]`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[googlemeet/present] EXCEPTION after ${Date.now() - t0}ms: ${message}`);
+    res.status(500).json({ error: 'present_failed', message });
+  }
+});
+
+app.post('/googlemeet/stop-present', auth, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
+  }
+
+  const session = googleMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
+  }
+  if (!session.presenting) {
+    return res.json({ status: 'not_presenting' });
+  }
+
+  const t0 = Date.now();
+  console.log(`[googlemeet/stop-present] BEGIN sessionId=${sessionId}`);
+
+  try {
+    // Ensure Meet tab is in front for the LLM
+    await session.agent.page.bringToFront();
+
+    await runMagnitudeLoop(session.agent, MEET_STOP_PRESENT_TASK, MEET_PRESENT_MAX_ITERATIONS, 'googlemeet/stop-present');
+    console.log(`[googlemeet/stop-present] Stop flow completed [${Date.now() - t0}ms]`);
+
+    if (session.desktopTabPage) {
+      await session.desktopTabPage.close().catch(() => {});
+    }
+
+    session.presenting = false;
+    session.desktopTabPage = null;
+
+    res.json({ status: 'stopped' });
+    console.log(`[googlemeet/stop-present] DONE [${Date.now() - t0}ms]`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[googlemeet/stop-present] EXCEPTION after ${Date.now() - t0}ms: ${message}`);
+    res.status(500).json({ error: 'stop_present_failed', message });
+  }
+});
+
+// =====================================================================
+// Microsoft Teams Meeting browser automation
+// ---------------------------------------------------------------------
+// Mirrors the Google Meet implementation above: a dedicated browser
+// session per meeting, configured with the same PulseAudio sinks/sources
+// used by the LiveKit audio bridge, with per-session DOM polling for
+// participants, active speaker, and meeting end detection.
+// =====================================================================
+
+const startTeamsMeetBrowser = async (meetUrl: string): Promise<BrowserAgent> => {
+  try {
+    const agent = await startBrowserAgent({
+      url: meetUrl,
+      browser: {
+        launchOptions: {
+          headless: false,
+          args: [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            '--auto-select-desktop-capture-source="Entire screen"',
+            '--auto-select-tab-capture-source-by-title=Desktop',
+          ],
+          env: {
+            ...process.env,
+            PULSE_SINK: "agent_sink",
+            PULSE_SOURCE: "meet_mic",
+          },
+          downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
+          tracesDir: defaultBrowserPaths.tracesDir || undefined,
+        },
+        contextOptions: {
+          viewport: null,
+          ignoreHTTPSErrors: true,
+          permissions: ['camera', 'microphone'],
+        },
+      },
+      narrate: true,
+      llm: getLlmConfig()
+    });
+    agent.context.setDefaultNavigationTimeout(90000);
+    console.log("✅ Teams Meet BrowserAgent started successfully.");
+    return agent;
+  } catch (err) {
+    console.error("❌ Failed to start Teams Meet BrowserAgent:", err);
+    throw err;
+  }
+};
+
+type TeamsMeetStatus = 'joining' | 'lobby' | 'active' | 'ended' | 'removed' | 'error';
+
+interface TeamsMeetParticipant {
+  name: string;
+  isSpeaking: boolean;
+}
+
+interface TeamsMeetSessionInfo {
+  agent: BrowserAgent;
+  status: TeamsMeetStatus;
+  meetUrl: string;
+  displayName: string;
+  createdAt: Date;
+  participants: TeamsMeetParticipant[];
+  activeSpeaker: string | null;
+  pollIntervalId: ReturnType<typeof setInterval> | null;
+  latestScreenshot: string | null;
+  presenting: boolean;
+  desktopTabPage: any | null;
+}
+
+const teamsMeetSessions = new Map<string, TeamsMeetSessionInfo>();
+
+type TeamsMeetJoinResult =
+  | { status: 'active' | 'lobby' }
+  | { status: 'error'; reason: string };
+
+// Teams pre-join UI varies across the consumer (teams.live.com) and business
+// (teams.microsoft.com) clients. The consumer UI exposes a name input, camera
+// preview + toggle, a "Computer audio" card with Microphone + Speaker dropdowns
+// and a mic mute toggle, and a "Join now" button — all on a single pre-join
+// dialog. Audio is therefore configured BEFORE clicking Join (matching the
+// Google Meet flow). The in-meeting device-settings path is kept as a fallback
+// for clients that skip the pre-join dialog entirely.
+
+const TEAMS_PREPARE_TASK =
+  `You are on a Microsoft Teams meeting entry flow, before the pre-join screen is fully ready.\n` +
+  `Teams may show either the consumer (teams.live.com) or business (teams.microsoft.com) UI.\n` +
+  `Complete these steps in order, skipping any that do not apply:\n` +
+  `1. If a "Continue on this browser" or "Join on the web instead" button is visible, click it.\n` +
+  `2. Dismiss any cookie banners, "Got it" buttons, or download-the-app prompts.\n` +
+  `3. Only if the page explicitly requires sign-in AND a "Join as a guest" / "Continue without an account" option exists, take that option. Otherwise ignore this step.\n` +
+  `4. Turn OFF the camera if its toggle is currently on. Leave the microphone toggle alone.\n` +
+  `Stop as soon as the pre-join screen (with a "Type your name" input and a "Join now" button) is visible and stable.\n` +
+  `Do NOT type into the name field — that is handled in a separate dedicated step.\n` +
+  `Do NOT click "Join now" or "Join meeting" — joining is handled in a separate later step.\n` +
+  `Do NOT open or touch the Microphone or Speaker dropdowns yet.\n` +
+  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
+  `If the page shows a fatal error like "this meeting has expired" or "invalid meeting link", do nothing — just stop.`;
+
+const TEAMS_FILL_NAME_TASK = (displayName: string) =>
+  `You are on the Microsoft Teams pre-join screen. There is a single-line text input labelled "Type your name" or "Enter name" — it is the ONLY thing you should interact with in this task.\n` +
+  `Important: if the input shows the words "Type your name" in grey/muted placeholder text and no real typed characters, the field is EMPTY and you MUST fill it. Do not assume it already contains a name just because those words are visible.\n` +
+  `Steps:\n` +
+  `1. Click inside the name input field to focus it.\n` +
+  `2. Press Control+A (the "keyboard:select_all" action) to select any existing content.\n` +
+  `3. Type exactly: ${displayName}\n` +
+  `Only mark the task done once the input visibly contains the typed text "${displayName}" in normal (non-placeholder) styling.\n` +
+  `Do NOT click "Join now" or "Join meeting".\n` +
+  `Do NOT toggle the camera, microphone, or any audio controls.\n` +
+  `Do NOT open the Microphone or Speaker dropdowns.`;
+
+const TEAMS_ENSURE_COMPUTER_AUDIO_TASK =
+  `You are on a Microsoft Teams pre-join screen. There is an audio selector with three options: "Computer audio", "Phone audio", and "Don't use audio".\n` +
+  `If the "Computer audio" radio is not already selected, click it.\n` +
+  `Do NOT click "Phone audio" or "Don't use audio".\n` +
+  `Do NOT click "Join now".`;
+
+const TEAMS_SELECT_MIC_TASK = (micLabel: string) =>
+  `You are on a Microsoft Teams pre-join screen, inside the "Computer audio" card.\n` +
+  `Click the Microphone dropdown (currently showing a device name like "Default" or similar).\n` +
+  `From the opened list, select the option whose name contains "${micLabel}".\n` +
+  `Once done, press the Escape key to dismiss it (do NOT click any other button).\n` +
+  `Do NOT toggle the mute switch.\n` +
+  `Do NOT click "Join now".`;
+
+const TEAMS_SELECT_SPEAKER_TASK = (speakerLabel: string) =>
+  `You are on a Microsoft Teams pre-join screen, inside the "Computer audio" card.\n` +
+  `Click the Speaker dropdown (currently showing a device name like "Default" or similar).\n` +
+  `From the opened list, select the option whose name contains "${speakerLabel}".\n` +
+  `Once done, press the Escape key to dismiss it (do NOT click any other button).\n` +
+  `Do NOT click "Join now".`;
+
+const TEAMS_ENSURE_MIC_UNMUTED_TASK =
+  `You are on a Microsoft Teams pre-join screen, inside the "Computer audio" card.\n` +
+  `Next to the selected Microphone there is a mute toggle switch.\n` +
+  `If the toggle is currently muted (off / grey / crossed-out icon), click it once to unmute.\n` +
+  `If the toggle is already unmuted (blue / on), do nothing.\n` +
+  `Do NOT click "Join now".`;
+
+const TEAMS_CLICK_JOIN_TASK = (displayName: string) =>
+  `You are on a Microsoft Teams meeting pre-join screen. The name and audio devices should already be configured.\n` +
+  `Click the "Join now" button (sometimes labelled "Join meeting") to enter the meeting.\n` +
+  `Safety net — only if, after clicking, the page surfaces a tooltip or inline error such as "Please enter a name before joining" (meaning the name field is still empty): click the "Type your name" input, press Control+A to select any existing content, type exactly "${displayName}", then click "Join now" again. Do NOT invent a different name such as "Guest" — always use "${displayName}".\n` +
+  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
+  `If the page shows a fatal error like "this meeting has expired" or "invalid meeting link", do nothing — just stop.`;
+
+const TEAMS_PRESENT_TAB_TASK =
+  `You are in an active Microsoft Teams meeting.\n` +
+  `Click the "Share" or "Share content" button (screen share icon in the meeting toolbar).\n` +
+  `Then select the "Browser tab" / "Microsoft Edge tab" / "Chrome tab" option from the share menu.\n` +
+  `A tab will be auto-selected — just confirm the selection if a dialog appears.\n` +
+  `Do NOT select "Screen", "Window", or "PowerPoint Live".`;
+
+const TEAMS_STOP_PRESENT_TASK =
+  `You are in an active Microsoft Teams meeting and currently sharing a tab.\n` +
+  `Click the "Stop sharing" or "Stop presenting" button to end the presentation.\n` +
+  `If there is no stop button visible, look for a "You are sharing" banner or bar and click stop there.`;
+
+const TEAMS_LEAVE_TASK =
+  `You are in an active Microsoft Teams meeting.\n` +
+  `Click the red "Leave" button (hangup / end-call icon) in the meeting controls bar.\n` +
+  `If a dropdown or confirmation appears with "Leave" and "End meeting" options, ` +
+  `click "Leave" — do NOT click "End meeting" for everyone.\n` +
+  `If the meeting has already ended (e.g. "You left the meeting" is visible), do nothing — just stop.`;
+
+// In-meeting fallback: only used when the pre-join audio configuration failed.
+// Consumer Teams typically exposes audio devices via a caret next to the mic
+// button; business Teams hides them behind "More (…) → Settings → Device settings".
+const TEAMS_AUDIO_SETTINGS_TASK =
+  `You are in an active Microsoft Teams meeting. The device settings panel is currently closed.\n` +
+  `Open it using whichever of these paths is available:\n` +
+  `  (a) Click the small caret/arrow next to the Microphone button in the meeting toolbar; a device menu should open.\n` +
+  `  (b) If (a) is not visible, click "More" / "..." in the meeting toolbar, then "Settings", then "Device settings".\n` +
+  `Once the device options are visible, stop. Do NOT close them.`;
+
+const TEAMS_PREPARE_MAX_ITERATIONS = 4;
+const TEAMS_FILL_NAME_MAX_ITERATIONS = 3;
+const TEAMS_JOIN_MAX_ITERATIONS = 3;
+const TEAMS_PRESENT_MAX_ITERATIONS = 3;
+// Single-click audio sub-steps run with a tight iteration cap.
+const TEAMS_AUDIO_STEP_MAX_ITERATIONS = 2;
+// The in-meeting settings-opener may need a couple of clicks to navigate menus.
+const TEAMS_AUDIO_OPEN_MAX_ITERATIONS = 3;
+
+async function teamsMeetJoinFlow(agent: BrowserAgent, displayName: string): Promise<TeamsMeetJoinResult> {
+  const page = agent.page;
+  await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+
+  const pageUrl = page.url?.() ?? 'unknown';
+  console.log(`[teamsmeet/join] Page loaded: url=${pageUrl}`);
+
+  // Phase 1: pre-join prep (continue-in-browser, popups, camera off). Name
+  // entry is handled as its own dedicated task below — keeping PREPARE narrow
+  // avoids the LLM silently skipping name entry inside a multi-step checklist.
+  console.log('[teamsmeet/join] Phase 1: prepare...');
+  await runMagnitudeLoop(agent, TEAMS_PREPARE_TASK, TEAMS_PREPARE_MAX_ITERATIONS, 'teamsmeet/prepare');
+
+  // Phase 1a: fill the display name. Isolated as a single-purpose task so the
+  // LLM cannot conflate the placeholder text "Type your name" with a pre-filled
+  // value.
+  console.log('[teamsmeet/join] Phase 1a: filling display name...');
+  await runMagnitudeLoop(agent, TEAMS_FILL_NAME_TASK(displayName), TEAMS_FILL_NAME_MAX_ITERATIONS, 'teamsmeet/fill-name');
+
+  // Phase 1b: pre-join audio device configuration. The consumer Teams UI exposes
+  // mic/speaker dropdowns on the pre-join dialog itself, so we configure the
+  // virtual devices here — mirroring the Google Meet flow. Failures fall through
+  // to an in-meeting fallback after join.
+  console.log('[teamsmeet/join] Phase 1b: configuring pre-join audio devices...');
+  let preJoinAudioOk = true;
+  try {
+    await runMagnitudeLoop(agent, TEAMS_ENSURE_COMPUTER_AUDIO_TASK, TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/audio-computer');
+    await runMagnitudeLoop(agent, TEAMS_SELECT_MIC_TASK('agent_sink'), TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/select-mic');
+    await runMagnitudeLoop(agent, TEAMS_SELECT_SPEAKER_TASK('meet_sink'), TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/select-speaker');
+    await runMagnitudeLoop(agent, TEAMS_ENSURE_MIC_UNMUTED_TASK, TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/mic-unmuted');
+  } catch (err) {
+    preJoinAudioOk = false;
+    console.log(`[teamsmeet/join] Phase 1b: pre-join audio setup failed — will retry in-meeting: ${err}`);
+  }
+
+  // Phase 2: click join
+  console.log('[teamsmeet/join] Phase 2: clicking join...');
+  await runMagnitudeLoop(agent, TEAMS_CLICK_JOIN_TASK(displayName), TEAMS_JOIN_MAX_ITERATIONS, 'teamsmeet/click-join');
+
+  // Phase 2b (fallback): only runs if pre-join audio config threw. Business
+  // Teams sometimes skips the pre-join dialog entirely — in that case the
+  // in-meeting Settings → Device settings panel is our only route.
+  if (!preJoinAudioOk) {
+    await sleep(2500);
+    console.log('[teamsmeet/join] Phase 2b: pre-join audio failed — configuring via in-meeting Settings...');
+    try {
+      await runMagnitudeLoop(agent, TEAMS_AUDIO_SETTINGS_TASK, TEAMS_AUDIO_OPEN_MAX_ITERATIONS, 'teamsmeet/audio-open');
+      await runMagnitudeLoop(agent, TEAMS_SELECT_MIC_TASK('agent_sink'), TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/select-mic-fallback');
+      await runMagnitudeLoop(agent, TEAMS_SELECT_SPEAKER_TASK('meet_sink'), TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/select-speaker-fallback');
+    } catch (err) {
+      console.log(`[teamsmeet/join] Phase 2b: in-meeting audio fallback also failed — using defaults: ${err}`);
+    }
+  }
+
+  // Determine outcome by checking the page state after the agent finished
+  await sleep(1500);
+
+  // Active in-meeting indicators (Teams uses these across consumer + business UIs)
+  const meetingActive = await page.locator(
+    '[data-tid="hangup-button"], [data-tid="call-end"], [aria-label*="Leave" i], [aria-label*="Hang up" i], [data-tid="toggle-mute"]'
+  ).first().isVisible({ timeout: 5000 }).catch(() => false);
+  if (meetingActive) return { status: 'active' };
+
+  const inLobby = await page.locator(
+    'text=/waiting for|someone will let you in|when the meeting starts|admit you/i'
+  ).first().isVisible({ timeout: 3000 }).catch(() => false);
+  if (inLobby) return { status: 'lobby' };
+
+  const hasError = await page.locator(
+    'text=/this meeting has expired|invalid meeting|meeting not found|sign in to join|cannot join/i'
+  ).first().isVisible({ timeout: 1000 }).catch(() => false);
+  if (hasError) {
+    const errorMsg = await page.locator(
+      'text=/this meeting has expired|invalid meeting|meeting not found|sign in to join|cannot join/i'
+    ).first().textContent().catch(() => 'unknown');
+    return { status: 'error', reason: `teams_page_error: "${errorMsg}" (url=${pageUrl})` };
+  }
+
+  const hasJoinBtn = await page.locator(
+    'button:has-text("Join now"), button:has-text("Join meeting")'
+  ).first().isVisible({ timeout: 1000 }).catch(() => false);
+  if (hasJoinBtn) {
+    return { status: 'error', reason: `join_button_still_visible: Agent completed but join button was not clicked (url=${pageUrl})` };
+  }
+
+  // No definitive signal — assume we're waiting for admission
+  return { status: 'lobby' };
+}
+
+async function teamsMeetPollState(sessionId: string): Promise<void> {
+  const session = teamsMeetSessions.get(sessionId);
+  if (!session || session.status === 'ended' || session.status === 'error') return;
+
+  try {
+    const page = session.agent.page;
+
+    // Detect if meeting has ended / was kicked
+    const meetingEnded = await page.locator(
+      'text=/the meeting has ended|you left the meeting|you have been removed|removed from the meeting/i'
+    ).first().isVisible({ timeout: 500 }).catch(() => false);
+
+    if (meetingEnded) {
+      session.status = 'ended';
+      return;
+    }
+
+    // If we were in the lobby, check if we're admitted now
+    if (session.status === 'lobby') {
+      const admitted = await page.locator(
+        '[data-tid="hangup-button"], [data-tid="call-end"], [aria-label*="Leave" i], [aria-label*="Hang up" i]'
+      ).first().isVisible({ timeout: 500 }).catch(() => false);
+      if (admitted) session.status = 'active';
+
+      const denied = await page.locator(
+        'text=/not admitted|denied|sorry, but you were not admitted|not let in/i'
+      ).first().isVisible({ timeout: 500 }).catch(() => false);
+      if (denied) {
+        session.status = 'removed';
+        return;
+      }
+    }
+
+    // Scrape participants and active speaker from the DOM.
+    // Teams renders participant tiles inside the meeting stage with various
+    // data-tid attributes; the speaking indicator is typically a class or
+    // aria attribute on the tile container.
+    const participants: TeamsMeetParticipant[] = [];
+    let activeSpeaker: string | null = null;
+
+    const tileElements = await page.locator(
+      '[data-tid="participant-tile"], [data-tid="stream-content"], [data-cid="calling-participant-stream"]'
+    ).all().catch(() => []);
+
+    for (const el of tileElements) {
+      const name = await el.getAttribute('aria-label').catch(() => null)
+        || await el.getAttribute('data-tid-displayname').catch(() => null)
+        || await el.innerText().catch(() => null);
+      if (!name) continue;
+
+      const containerClasses = await el.evaluate(
+        (node: Element) => node.closest('[class]')?.className || ''
+      ).catch(() => '');
+      const ariaLive = await el.getAttribute('aria-live').catch(() => '') || '';
+      const isSpeaking = /speaking/i.test(containerClasses) ||
+        /speaking/i.test(ariaLive) ||
+        (await el.locator('[class*="speaking" i], [aria-label*="speaking" i]').first().isVisible({ timeout: 100 }).catch(() => false));
+
+      const cleanName = name.split('\n')[0].trim();
+      if (!cleanName) continue;
+      participants.push({ name: cleanName, isSpeaking });
+      if (isSpeaking) activeSpeaker = cleanName;
+    }
+
+    session.participants = participants;
+    session.activeSpeaker = activeSpeaker;
+
+    // Cache a screenshot of the Teams tab for non-blocking reads
+    try {
+      const raw = await session.agent.page.screenshot({ type: 'jpeg', quality: 85 });
+      session.latestScreenshot = Buffer.from(raw).toString('base64');
+    } catch {
+      // Screenshot may fail transiently; keep the previous cached value
+    }
+  } catch {
+    // Browser may have disconnected
+    session.status = 'error';
+  }
+}
+
+app.post('/teamsmeet/join', auth, async (req: Request, res: Response) => {
+  const { meetUrl, displayName } = req.body;
+  if (!meetUrl) {
+    return res.status(400).json({ error: 'bad_request', message: 'meetUrl is required.' });
+  }
+
+  const name = displayName || 'Unity Assistant';
+  const sessionId = randomUUID();
+  const t0 = Date.now();
+  console.log(`[teamsmeet/join] BEGIN sessionId=${sessionId} url=${meetUrl}`);
+
+  try {
+    const agent = await startTeamsMeetBrowser(meetUrl);
+
+    const result = await teamsMeetJoinFlow(agent, name);
+    console.log(`[teamsmeet/join] Join flow completed: status=${result.status}${result.status === 'error' ? ` reason="${result.reason}"` : ''} [${Date.now() - t0}ms]`);
+
+    if (result.status === 'error') {
+      await agent.stop().catch(() => {});
+      return res.status(400).json({
+        error: 'join_failed',
+        reason: result.reason,
+        message: `Could not join Teams meeting: ${result.reason}`,
+      });
+    }
+
+    const sessionInfo: TeamsMeetSessionInfo = {
+      agent,
+      status: result.status,
+      meetUrl,
+      displayName: name,
+      createdAt: new Date(),
+      participants: [],
+      activeSpeaker: null,
+      pollIntervalId: null,
+      latestScreenshot: null,
+      presenting: false,
+      desktopTabPage: null,
+    };
+
+    sessionInfo.pollIntervalId = setInterval(() => {
+      teamsMeetPollState(sessionId).then(() => {
+        const s = teamsMeetSessions.get(sessionId);
+        if (s && (s.status === 'ended' || s.status === 'removed' || s.status === 'error')) {
+          if (s.pollIntervalId) clearInterval(s.pollIntervalId);
+          s.pollIntervalId = null;
+          console.log(`[teamsmeet] Session ${sessionId} ended (status=${s.status}), polling stopped.`);
+        }
+      });
+    }, 1000);
+
+    teamsMeetSessions.set(sessionId, sessionInfo);
+
+    console.log(`[teamsmeet/join] DONE sessionId=${sessionId} status=${result.status} [${Date.now() - t0}ms]`);
+    res.json({ status: result.status, sessionId });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    console.error(`[teamsmeet/join] EXCEPTION after ${Date.now() - t0}ms: ${message}`, stack ? `\n${stack}` : '');
+    res.status(500).json({ error: 'join_exception', message });
+  }
+});
+
+app.post('/teamsmeet/leave', auth, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
+  }
+
+  const session = teamsMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Teams meeting session ${sessionId} not found.` });
+  }
+
+  try {
+    if (session.pollIntervalId) {
+      clearInterval(session.pollIntervalId);
+      session.pollIntervalId = null;
+    }
+
+    await clickLeaveButton(session, 'teams_meet');
+
+    if (session.desktopTabPage) {
+      await session.desktopTabPage.close().catch(() => {});
+      session.desktopTabPage = null;
+    }
+    session.presenting = false;
+
+    await session.agent.stop();
+    session.status = 'ended';
+    teamsMeetSessions.delete(sessionId);
+
+    console.log(`[teamsmeet/leave] Session ${sessionId} stopped.`);
+    res.json({ status: 'left' });
+  } catch (err) {
+    console.error(`[teamsmeet/leave] Error stopping session ${sessionId}:`, err);
+    teamsMeetSessions.delete(sessionId);
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: 'leave_failed', message });
+  }
+});
+
+app.get('/teamsmeet/sessions', auth, async (_req: Request, res: Response) => {
+  const sessions = Array.from(teamsMeetSessions.entries()).map(([sessionId, session]) => ({
+    sessionId,
+    meetUrl: session.meetUrl,
+    status: session.status,
+    displayName: session.displayName,
+    createdAt: session.createdAt,
+  }));
+  res.json({ sessions });
+});
+
+app.get('/teamsmeet/state', auth, async (req: Request, res: Response) => {
+  const sessionId = req.query.sessionId as string;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId query parameter is required.' });
+  }
+
+  const session = teamsMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Teams meeting session ${sessionId} not found.` });
+  }
+
+  res.json({
+    status: session.status,
+    meetUrl: session.meetUrl,
+    displayName: session.displayName,
+    createdAt: session.createdAt,
+    participants: session.participants,
+    activeSpeaker: session.activeSpeaker,
+  });
+});
+
+app.get('/teamsmeet/screenshot/latest', auth, async (req: Request, res: Response) => {
+  const sessionId = req.query.sessionId as string;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId query parameter is required.' });
+  }
+
+  const session = teamsMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Teams meeting session ${sessionId} not found.` });
+  }
+
+  if (!session.latestScreenshot) {
+    return res.status(204).end();
+  }
+
+  res.json({ screenshot: session.latestScreenshot });
+});
+
+app.post('/teamsmeet/present', auth, async (req: Request, res: Response) => {
+  const { sessionId, desktopUrl } = req.body;
+  if (!sessionId || !desktopUrl) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId and desktopUrl are required.' });
+  }
+
+  const session = teamsMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Teams meeting session ${sessionId} not found.` });
+  }
+  if (session.presenting) {
+    return res.json({ status: 'already_presenting' });
+  }
+
+  const t0 = Date.now();
+  console.log(`[teamsmeet/present] BEGIN sessionId=${sessionId} desktopUrl=${desktopUrl}`);
+
+  try {
+    const context = session.agent.context;
+    const desktopTab = await context.newPage();
+    await desktopTab.goto(desktopUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    console.log(`[teamsmeet/present] Desktop tab opened [${Date.now() - t0}ms]`);
+
+    // Switch back to the Teams tab for the LLM to click "Share"
+    const meetPage = session.agent.page;
+    await meetPage.bringToFront();
+
+    await runMagnitudeLoop(session.agent, TEAMS_PRESENT_TAB_TASK, TEAMS_PRESENT_MAX_ITERATIONS, 'teamsmeet/present');
+    console.log(`[teamsmeet/present] Present flow completed [${Date.now() - t0}ms]`);
+
+    session.presenting = true;
+    session.desktopTabPage = desktopTab;
+
+    res.json({ status: 'presenting' });
+    console.log(`[teamsmeet/present] DONE [${Date.now() - t0}ms]`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[teamsmeet/present] EXCEPTION after ${Date.now() - t0}ms: ${message}`);
+    res.status(500).json({ error: 'present_failed', message });
+  }
+});
+
+app.post('/teamsmeet/stop-present', auth, async (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
+  }
+
+  const session = teamsMeetSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: `Teams meeting session ${sessionId} not found.` });
+  }
+  if (!session.presenting) {
+    return res.json({ status: 'not_presenting' });
+  }
+
+  const t0 = Date.now();
+  console.log(`[teamsmeet/stop-present] BEGIN sessionId=${sessionId}`);
+
+  try {
+    await session.agent.page.bringToFront();
+
+    await runMagnitudeLoop(session.agent, TEAMS_STOP_PRESENT_TASK, TEAMS_PRESENT_MAX_ITERATIONS, 'teamsmeet/stop-present');
+    console.log(`[teamsmeet/stop-present] Stop flow completed [${Date.now() - t0}ms]`);
+
+    if (session.desktopTabPage) {
+      await session.desktopTabPage.close().catch(() => {});
+    }
+
+    session.presenting = false;
+    session.desktopTabPage = null;
+
+    res.json({ status: 'stopped' });
+    console.log(`[teamsmeet/stop-present] DONE [${Date.now() - t0}ms]`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[teamsmeet/stop-present] EXCEPTION after ${Date.now() - t0}ms: ${message}`);
+    res.status(500).json({ error: 'stop_present_failed', message });
+  }
+});
+
+// --- /exec endpoint: Execute shell commands (use /files first to upload files) ---
+app.post('/exec', auth, async (req: Request, res: Response) => {
+  const { command, cwd, timeout, shell_mode } = req.body;
+  const execId = randomUUID().slice(0, 8);
+
+  if (!command || typeof command !== 'string') {
+    return res.status(400).json({ error: 'bad_request', message: 'command is required and must be a string.' });
+  }
+
+  const workDir = cwd || LOCAL_ROOT;
+  const execTimeout = typeof timeout === 'number' && timeout > 0 ? timeout : DEFAULT_EXEC_TIMEOUT;
+  const shellMode: ShellMode = shell_mode === 'cmd' ? 'cmd' : 'powershell';
+
+  try {
+    const resolvedWorkDir = path.resolve(workDir);
+    await ensureDir(resolvedWorkDir);
+
+    console.log(`[exec] Running command: ${command} (cwd: ${resolvedWorkDir}, timeout: ${execTimeout}ms, shell: ${shellMode}, execId: ${execId})`);
+    const result = await executeCommand(command, resolvedWorkDir, execTimeout, shellMode);
+
+    res.json({
+      status: result.exitCode === 0 ? 'success' : 'error',
+      exitCode: result.exitCode,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      duration: result.duration,
+      cwd: resolvedWorkDir,
+      execId,
+    });
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[exec] Error: ${errorMessage}`);
+    res.status(500).json({
+      error: 'exec_failed',
+      message: errorMessage,
+      execId,
+    });
+  }
+});
+
+// --- /files endpoint: Unified file management (JSON + Multipart) ---
+
+// Handler for JSON requests
+async function handleFilesJson(req: Request, res: Response) {
+  const { action, files, filenames, path: subPath, filename, encoding } = req.body;
+
+  if (!action || typeof action !== 'string') {
+    return res.status(400).json({ error: 'bad_request', message: 'action is required.' });
+  }
+
+  const baseDir = LOCAL_ROOT;
+
+  try {
+    switch (action) {
+      case 'save': {
+        if (!Array.isArray(files) || files.length === 0) {
+          return res.status(400).json({ error: 'bad_request', message: 'files array is required for save action.' });
+        }
+
+        const savedFiles: string[] = [];
+        for (const file of files) {
+          if (!file.filename || typeof file.filename !== 'string') {
+            return res.status(400).json({ error: 'bad_request', message: 'Each file must have a filename.' });
+          }
+          if (typeof file.content !== 'string') {
+            return res.status(400).json({ error: 'bad_request', message: 'Each file must have content.' });
+          }
+
+          const sanitizedPath = sanitizePath(file.filename, baseDir);
+          const fileEncoding = file.encoding === 'base64' ? 'base64' : 'text';
+          await writeFileWithEncoding(sanitizedPath, file.content, fileEncoding);
+          savedFiles.push(file.filename);
+          console.log(`[files] Saved: ${sanitizedPath}`);
+        }
+
+        return res.json({ status: 'saved', files: savedFiles });
+      }
+
+      case 'delete': {
+        if (!Array.isArray(filenames) || filenames.length === 0) {
+          return res.status(400).json({ error: 'bad_request', message: 'filenames array is required for delete action.' });
+        }
+
+        const deletedFiles: string[] = [];
+        for (const fname of filenames) {
+          if (typeof fname !== 'string') continue;
+          const sanitizedPath = sanitizePath(fname, baseDir);
+          try {
+            await fs.promises.unlink(sanitizedPath);
+            deletedFiles.push(fname);
+            console.log(`[files] Deleted: ${sanitizedPath}`);
+          } catch (err: any) {
+            if (err.code !== 'ENOENT') throw err;
+            // File doesn't exist, skip silently
+          }
+        }
+
+        return res.json({ status: 'deleted', files: deletedFiles });
+      }
+
+      case 'list': {
+        const listPath = subPath ? sanitizePath(subPath, baseDir) : baseDir;
+        await ensureDir(listPath);
+
+        const entries = await fs.promises.readdir(listPath, { withFileTypes: true });
+        const fileList = await Promise.all(
+          entries.map(async (entry) => {
+            const fullPath = path.join(listPath, entry.name);
+            const stats = await fs.promises.stat(fullPath);
+            return {
+              name: entry.name,
+              type: entry.isDirectory() ? 'directory' : 'file',
+              size: stats.size,
+              modified: stats.mtime.toISOString(),
+            };
+          })
+        );
+
+        return res.json({
+          path: subPath || '.',
+          files: fileList,
+        });
+      }
+
+      case 'read': {
+        if (!filename || typeof filename !== 'string') {
+          return res.status(400).json({ error: 'bad_request', message: 'filename is required for read action.' });
+        }
+
+        const sanitizedPath = sanitizePath(filename, baseDir);
+        const fileEncoding = encoding === 'base64' ? 'base64' : 'text';
+        const content = await readFileWithEncoding(sanitizedPath, fileEncoding);
+
+        return res.json({
+          filename,
+          content,
+          encoding: fileEncoding,
+        });
+      }
+
+      default:
+        return res.status(400).json({
+          error: 'bad_request',
+          message: `Unknown action: ${action}. Valid actions: save, delete, list, read.`,
+        });
+    }
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[files] Error: ${errorMessage}`);
+    res.status(500).json({
+      error: 'files_failed',
+      message: errorMessage,
+    });
+  }
+}
+
+// Handler for multipart requests (large file uploads)
+async function handleFilesMultipart(req: Request, res: Response) {
+  const targetDir = (req.body.target_dir as string) || '';
+  const uploadedFiles = req.files as Express.Multer.File[];
+
+  if (!uploadedFiles || uploadedFiles.length === 0) {
+    return res.status(400).json({ error: 'bad_request', message: 'No files uploaded.' });
+  }
+
+  const baseDir = LOCAL_ROOT;
+  const savedFiles: string[] = [];
+  const errors: string[] = [];
+
+  for (const file of uploadedFiles) {
+    try {
+      const originalName = file.originalname;
+      const destFilename = targetDir ? `${targetDir}/${originalName}` : originalName;
+
+      const destPath = sanitizePath(destFilename, baseDir);
+      await ensureDir(path.dirname(destPath));
+      await fs.promises.rename(file.path, destPath);
+
+      savedFiles.push(destFilename);
+      console.log(`[files] Saved (multipart): ${destPath}`);
+    } catch (err) {
+      // Clean up temp file on error
+      try {
+        await fs.promises.unlink(file.path);
+      } catch (_e) {
+        // ignore cleanup errors
+      }
+
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      errors.push(`${file.originalname}: ${errorMessage}`);
+      console.error(`[files] Error saving ${file.originalname}: ${errorMessage}`);
+    }
+  }
+
+  if (errors.length > 0 && savedFiles.length === 0) {
+    return res.status(500).json({
+      error: 'upload_failed',
+      message: 'All files failed to upload',
+      errors,
+    });
+  }
+
+  res.json({
+    status: errors.length > 0 ? 'partial' : 'saved',
+    files: savedFiles,
+    errors: errors.length > 0 ? errors : undefined,
+  });
+}
+
+// Route with content-type detection
+app.post('/files', (req: Request, res: Response) => {
+  const contentType = req.headers['content-type'] || '';
+
+  if (contentType.includes('multipart/form-data')) {
+    // Use multer middleware for multipart uploads
+    uploadMiddleware.array('files', 100)(req, res, (err) => {
+      if (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return res.status(400).json({ error: 'upload_error', message });
+      }
+      handleFilesMultipart(req, res);
+    });
+  } else {
+    // JSON request
+    handleFilesJson(req, res);
+  }
+});
 
 app.get('/sessions', auth, async (_req: Request, res: Response) => {
   const sessions = Array.from(activeSessions.entries()).map(([sessionId, session]) => ({
