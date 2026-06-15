@@ -1,0 +1,30 @@
+#!/bin/bash
+# preinstall - Pre-installation script for .pkg installer
+#
+# Handles upgrades: signal tray to exit, stop running services.
+# Mirrors: ubuntu/installer/DEBIAN/prerm (upgrade path)
+
+set -e
+
+APP_DIR="/opt/unify-desktop-assistant"
+SETUP_SCRIPT="$APP_DIR/tools/setup.sh"
+
+echo "[preinstall] Preparing installation..."
+
+# Signal tray app to shut down gracefully
+if [ -d "$APP_DIR" ]; then
+    touch "$APP_DIR/uninstall.signal" 2>/dev/null || true
+    sleep 2
+
+    # Fallback: kill tray app
+    pkill -f "unify-assistant.py" 2>/dev/null || true
+fi
+
+# Stop services on upgrade (keep tunnel/desktop registrations)
+if [ -x "$SETUP_SCRIPT" ]; then
+    echo "[preinstall] Stopping existing services..."
+    "$SETUP_SCRIPT" --stop 2>/dev/null || true
+fi
+
+echo "[preinstall] Done."
+exit 0

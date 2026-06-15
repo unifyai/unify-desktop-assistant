@@ -19,6 +19,11 @@ export function narrateAgent(agent: Agent) {
         totalCachedReadInputTokens += usage.cacheReadInputTokens ?? 0;
         totalInputTokenCost += usage.inputCost ?? 0.0;
         totalOutputTokenCost += usage.outputCost ?? 0.0;
+
+        const cacheInfo = (usage.cacheWriteInputTokens || usage.cacheReadInputTokens)
+            ? ` (cache write: ${usage.cacheWriteInputTokens ?? 0}, cache read: ${usage.cacheReadInputTokens ?? 0})`
+            : '';
+        console.log(`  [tokens] in=${usage.inputTokens}${cacheInfo} out=${usage.outputTokens} | cumulative in=${totalInputTokens} out=${totalOutputTokens}`);
     });
 
     agent.events.on('start', () => {

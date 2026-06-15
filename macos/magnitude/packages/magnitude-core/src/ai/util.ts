@@ -85,6 +85,7 @@ export async function convertToBamlClientOptions(client: LLMClient): Promise<Rec
             temperature: temp,
         };
     } else if (client.provider === 'openai-generic') {
+        const isClaudeModel = isClaude(client);
         options = {
             base_url: client.options.baseUrl,
             api_key: client.options.apiKey,
@@ -93,8 +94,10 @@ export async function convertToBamlClientOptions(client: LLMClient): Promise<Rec
             headers: {
                 "HTTP-Referer": "https://magnitude.run",
                 "X-Title": "Magnitude",
+                ...(isClaudeModel && client.options.promptCaching ? { 'anthropic-beta': 'prompt-caching-2024-07-31' } : {}),
                 ...client.options.headers
-            }
+            },
+            ...(isClaudeModel && client.options.promptCaching ? { allowed_role_metadata: "all" } : {}),
         };
     } else if (client.provider === 'azure-openai') {
         options = {
@@ -115,12 +118,7 @@ export function tryDeriveUIGroundedClient(): LLMClient | null {
         return {
             provider: 'anthropic',
             options: {
-                // TODO: do more testing on best claude model for visuals
-                // model: 'claude-3-5-sonnet-20240620', // <- definitely not, pre computer use
-                // model: 'claude-3-5-sonnet-20241022', // <- not great on rescaling res
-                //model: 'claude-3-7-sonnet-latest', // <- underplans
-                // model: 'claude-haiku-4-5-20251001', // <- fast, cost-effective, good performance
-                model: 'claude-sonnet-4-5-20250929', // <- switched from haiku to sonnet 4.5
+                model: 'claude-sonnet-4-6',
                 apiKey: process.env.ANTHROPIC_API_KEY
             }
         }
@@ -145,8 +143,8 @@ export function buildDefaultBrowserAgentOptions(
     { agentOptions, browserOptions }: { agentOptions: AgentOptions, browserOptions: BrowserConnectorOptions }
 ): { agentOptions: AgentOptions, browserOptions: BrowserConnectorOptions } {
     /**
-     * Given any provided options for agent or browser connector, fill out additional key fields using environment,
-     * or any model-specific constraints (e.g. Claude needing 1024x768 virtual screen space)
+     * Given any provided options for agent or browser connector, fill out additional key fields using environment.
+     * Screenshot scaling for large viewports is handled at runtime by the harness (aspect-ratio-aware).
      */
     const envLlm = tryDeriveUIGroundedClient();
 
@@ -156,22 +154,13 @@ export function buildDefaultBrowserAgentOptions(
         throw new Error("No LLM configured or available from environment. Set environment variable ANTHROPIC_API_KEY and try again. See https://docs.magnitude.run/customizing/llm-configuration for details");
     }
 
-    // Set reasonable temp if not provided
-    let virtualScreenDimensions = null;
     for (const llm of llms) {
         let llmOptions: LLMClient['options'] = { temperature: DEFAULT_BROWSER_AGENT_TEMP, ...(llm?.options ?? {}) };
-        //let modifiedLlm = {...llm, options: llmOptions as any }
         llm.options = llmOptions;
-
-        if (isClaude(llm)) {
-            // Claude only really works on 1024x768 screenshots
-            // if any model is claude, use virtual screen dimensions
-            virtualScreenDimensions = { width: 1024, height: 768 };
-        }
     }
 
     return {
         agentOptions: {...agentOptions, llm: llms },
-        browserOptions: {...browserOptions, virtualScreenDimensions: virtualScreenDimensions ?? undefined }
+        browserOptions: {...browserOptions }
     };
 }

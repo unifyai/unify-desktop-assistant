@@ -1,6 +1,7 @@
 import { Browser, BrowserContext, BrowserContextOptions, chromium, LaunchOptions, CDPSession } from "playwright";
 import objectHash from 'object-hash';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import logger from "@/logger";
 import { Logger } from 'pino';
 import * as fs from 'fs';
@@ -30,6 +31,7 @@ const DEFAULT_BROWSER_CONTEXT_OPTIONS: BrowserContextOptions = {
 export class BrowserProvider {
     private activeBrowsers: Record<string, ActiveBrowser> = {};
     private logger: Logger;
+    public events = new EventEmitter();
 
     private constructor() {
         this.logger = logger.child({ name: 'browser_provider' });
@@ -78,6 +80,7 @@ export class BrowserProvider {
 
             browser.on('disconnected', () => {
                 delete this.activeBrowsers[hash];
+                this.events.emit('browserDisconnected', { browser });
             });
 
             return activeBrowser;
@@ -95,15 +98,17 @@ export class BrowserProvider {
 
         const context = await browser.newContext(contextOptions);
 
-        // Get viewport dimensions from context options or use defaults
-        const viewport = contextOptions?.viewport || { width: 1024, height: 768 };
-        const deviceScaleFactor = contextOptions?.deviceScaleFactor || 1;
-
-        // Apply emulation settings to any new pages created
-        context.on('page', async (page) => {
-            const cdpSession = await page.context().newCDPSession(page);
-            await this._applyEmulationSettings(cdpSession, viewport.width, viewport.height, deviceScaleFactor);
-        });
+        // When viewport is explicitly null the page follows the browser
+        // window size dynamically (resizing the window reflows content).
+        // Only pin the viewport via CDP when a fixed size is requested.
+        const resolvedViewport = contextOptions?.viewport;
+        if (resolvedViewport) {
+            const deviceScaleFactor = contextOptions?.deviceScaleFactor || 1;
+            context.on('page', async (page) => {
+                const cdpSession = await page.context().newCDPSession(page);
+                await this._applyEmulationSettings(cdpSession, resolvedViewport.width, resolvedViewport.height, deviceScaleFactor);
+            });
+        }
 
         activeBrowserEntry.activeContextsCount++;
 
@@ -129,8 +134,12 @@ export class BrowserProvider {
         let contextOptions: BrowserContextOptions = {
             ...DEFAULT_BROWSER_CONTEXT_OPTIONS,
             deviceScaleFactor: dpr,
-            ...(options && 'contextOptions' in options && options.contextOptions ? options.contextOptions : {})//options.browser?.contextOptions
+            ...(options && 'contextOptions' in options && options.contextOptions ? options.contextOptions : {})
         };
+
+        if (contextOptions.viewport === null) {
+            delete contextOptions.deviceScaleFactor;
+        }
 
         // INJECT STORAGE STATE IF PROVIDED
         if (options && 'storageStateName' in options && options.storageStateName) {
