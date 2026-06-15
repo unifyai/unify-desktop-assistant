@@ -51,6 +51,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 
 APP_NAME = "Unify Desktop Assistant"
 APP_ID = "ai.unify.desktop-assistant"
+DEB_PACKAGE = "unify-desktop-assistant"
 
 INSTALL_DIR = Path(__file__).resolve().parent.parent
 TOOLS_DIR = INSTALL_DIR / "tools"
@@ -362,6 +363,11 @@ class UnifyTrayApp:
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
+        # Uninstall
+        uninstall_item = Gtk.MenuItem(label="Uninstall...")
+        uninstall_item.connect("activate", self._uninstall)
+        self.menu.append(uninstall_item)
+
         # Exit
         exit_item = Gtk.MenuItem(label="Exit")
         exit_item.connect("activate", self._quit)
@@ -535,6 +541,56 @@ class UnifyTrayApp:
             dialog.format_secondary_text(f"Log file not found: {log_file}")
             dialog.run()
             dialog.destroy()
+
+    def _uninstall(self, _widget):
+        """Uninstall the app via an elevated cleanup, then quit.
+
+        Uninstall needs root (stop services, unregister, remove system files).
+        When installed as a .deb we use `apt-get purge` so dpkg's postrm runs the
+        full cleanup (removes /opt, systemd units across /home/*, firewall rules).
+        Otherwise we fall back to `setup.sh --uninstall`. Either way pkexec
+        provides a graphical root prompt (polkit). Runs on a worker thread; the
+        tray quits once cleanup finishes.
+        """
+        dialog = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Uninstall Unify Desktop Assistant?",
+        )
+        dialog.format_secondary_text(
+            "This will stop all services, unregister this device, and remove "
+            "Unify Desktop Assistant from this computer.\n\nThis cannot be undone."
+        )
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        response = dialog.run()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+
+        self._notify("Uninstalling", "Removing Unify Desktop Assistant…")
+
+        def worker():
+            installed_via_apt = False
+            try:
+                installed_via_apt = subprocess.run(
+                    ["dpkg", "-s", DEB_PACKAGE],
+                    capture_output=True,
+                ).returncode == 0
+            except Exception:
+                pass
+
+            if installed_via_apt:
+                cmd = ["pkexec", "apt-get", "purge", "-y", DEB_PACKAGE]
+            else:
+                cmd = ["pkexec", "bash", str(SETUP_SCRIPT), "--uninstall"]
+
+            try:
+                subprocess.run(cmd, capture_output=True)
+            except Exception:
+                pass
+            GLib.idle_add(Gtk.main_quit)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _quit(self, _widget):
         """Quit the tray application."""

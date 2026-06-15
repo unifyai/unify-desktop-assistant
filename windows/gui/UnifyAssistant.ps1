@@ -302,6 +302,50 @@ function Invoke-Reconfigure {
     }
 }
 
+function Invoke-Uninstall {
+    $confirm = [System.Windows.Forms.MessageBox]::Show(
+        "This will stop all services, unregister this device, and remove Unify Desktop Assistant from this computer.`n`nThis cannot be undone.`n`nUninstall now?",
+        "Uninstall Unify Desktop Assistant?",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    # Prefer the Inno Setup uninstaller: it self-elevates, runs setup.ps1
+    # -Uninstall, and removes the install dir + the HKCU Run key. Fall back to an
+    # elevated setup.ps1 -Uninstall for dev installs without the uninstaller.
+    $uninst = $null
+    foreach ($name in @('unins000.exe', 'unins001.exe', 'unins002.exe')) {
+        $candidate = Join-Path $script:InstallDir $name
+        if (Test-Path $candidate) { $uninst = $candidate; break }
+    }
+
+    try {
+        if ($uninst) {
+            Start-Process -FilePath $uninst -ArgumentList "/SILENT"
+        } else {
+            Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList @(
+                "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", "`"$($script:SetupScript)`"", "-Uninstall"
+            )
+        }
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Uninstall could not be started (elevation was cancelled or failed).",
+            "Uninstall",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        return
+    }
+
+    # Quit the tray so it doesn't hold files open during removal.
+    $script:NotifyIcon.Visible = $false
+    $script:NotifyIcon.Dispose()
+    $appContext.ExitThread()
+    [System.Windows.Forms.Application]::Exit()
+}
+
 function Show-SettingsDialog {
     $script:OldUnifyKey = Get-EnvValue -Key "UNIFY_KEY"
     $form = New-Object System.Windows.Forms.Form
@@ -618,6 +662,12 @@ $contextMenu.Items.Add($logsItem) | Out-Null
 
 # Separator
 $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+# Uninstall
+$uninstallItem = New-Object System.Windows.Forms.ToolStripMenuItem
+$uninstallItem.Text = "Uninstall..."
+$uninstallItem.Add_Click({ Invoke-Uninstall })
+$contextMenu.Items.Add($uninstallItem) | Out-Null
 
 # Exit
 $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem
