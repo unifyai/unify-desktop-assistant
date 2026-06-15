@@ -80,15 +80,42 @@ ENVFILE
 
             echo "[$(date)] dpkg lock released, running deferred setup..."
 
-            # Install Node.js v22 if needed (nodesource)
+            # The deferred phase runs after dpkg released its lock, so apt is
+            # usable here. Clear the dpkg maintainer-script vars so setup.sh does
+            # not auto-enable SKIP_APT (it inherits them from this postinst) and
+            # can self-heal the Node install if the step below falls short.
+            unset DPKG_MAINTSCRIPT_PACKAGE DPKG_MAINTSCRIPT_NAME DPKG_MAINTSCRIPT_ARCH
+
+            # Install Node.js v22 if needed (nodesource). npx must be present —
+            # the distro `nodejs` package provides `node` but not `npm`/`npx`.
             NODE_MAJOR=$(node --version 2>/dev/null | sed 's/v\([0-9]*\).*/\1/')
-            if [ -z "$NODE_MAJOR" ] || [ "$NODE_MAJOR" -lt 22 ]; then
+            if [ -z "$NODE_MAJOR" ] || [ "$NODE_MAJOR" -lt 22 ] || ! command -v npx >/dev/null 2>&1; then
                 echo "[$(date)] Installing Node.js v22 via nodesource..."
-                curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-                apt-get install -y nodejs
-                echo "[$(date)] Node.js installed: $(node --version)"
+                # `curl ... | bash -` silently swallows curl failures (empty
+                # stdin → bash exits 0), leaving distro Node without npm/npx.
+                # Download first, abort on a bad fetch, then run.
+                NS_SCRIPT="/tmp/nodesource_setup_22.sh"
+                if curl -fsSL https://deb.nodesource.com/setup_22.x -o "$NS_SCRIPT"; then
+                    bash "$NS_SCRIPT"
+                    apt-get install -y nodejs
+                    rm -f "$NS_SCRIPT"
+                else
+                    echo "[$(date)] WARNING: Failed to fetch NodeSource setup script." >&2
+                fi
+
+                # Fall back to distro npm if npx is still missing.
+                if ! command -v npx >/dev/null 2>&1; then
+                    echo "[$(date)] npx missing after Node install; installing distro npm as fallback..." >&2
+                    apt-get install -y npm || true
+                fi
+
+                if command -v npx >/dev/null 2>&1; then
+                    echo "[$(date)] Node.js installed: $(node --version), npx: $(npx --version 2>/dev/null || echo '?')"
+                else
+                    echo "[$(date)] WARNING: npx still unavailable; setup.sh will retry the Node install." >&2
+                fi
             else
-                echo "[$(date)] Node.js $(node --version) already >= v22"
+                echo "[$(date)] Node.js $(node --version) already >= v22 (npx present)"
             fi
 
             # Full setup: install deps, configure systemd/autostart/firewall, don't start yet

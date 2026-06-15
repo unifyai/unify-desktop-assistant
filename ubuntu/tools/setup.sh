@@ -415,14 +415,16 @@ install_system_deps() {
 }
 
 install_nodejs() {
-    if command -v node &>/dev/null; then
+    if command -v node &>/dev/null && command -v npx &>/dev/null; then
         local node_major
         node_major=$(node --version | sed 's/v\([0-9]*\).*/\1/')
         if [[ "$node_major" -ge 22 ]]; then
-            echo "  Node.js already installed ($(node --version))"
+            echo "  Node.js already installed ($(node --version), npx present)"
             return
         fi
         echo "  Node.js $(node --version) found, but v22+ required. Upgrading..."
+    elif command -v node &>/dev/null; then
+        echo "  Node.js $(node --version) found, but npx is missing. Reinstalling..."
     fi
 
     echo ""
@@ -434,10 +436,31 @@ install_nodejs() {
         return
     fi
 
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y nodejs
+    # NOTE: `curl ... | bash -` silently swallows curl failures (empty stdin →
+    # bash exits 0), which leaves the distro Node (no npm/npx). Download first,
+    # abort on a bad fetch, then run.
+    local ns_script="/tmp/nodesource_setup_22.sh"
+    if curl -fsSL https://deb.nodesource.com/setup_22.x -o "$ns_script"; then
+        bash "$ns_script"
+        apt-get install -y nodejs
+        rm -f "$ns_script"
+    else
+        echo "  WARNING: Failed to fetch NodeSource setup script." >&2
+    fi
 
-    echo "  Node.js installed ($(node --version))"
+    # Verify npm/npx actually exist — distro Node ships them in a separate `npm`
+    # package, so fall back to it if NodeSource didn't provide them.
+    if ! command -v npx &>/dev/null; then
+        echo "  npx still missing after Node install; installing distro npm as fallback..." >&2
+        apt-get install -y npm || true
+    fi
+
+    if ! command -v npx &>/dev/null; then
+        echo "  ERROR: Node.js installed but npx is unavailable. Cannot continue." >&2
+        return 1
+    fi
+
+    echo "  Node.js installed ($(node --version), npx $(npx --version 2>/dev/null || echo '?'))"
 }
 
 install_bun() {
