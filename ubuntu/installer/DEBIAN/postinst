@@ -160,8 +160,17 @@ ENVFILE
         disown
 
         echo ""
-        echo "Installation complete!"
-        echo "Node.js, dependencies, and services are being set up in the background."
+        echo "=================================================="
+        echo "  Unify Desktop Assistant is installed"
+        echo "=================================================="
+        echo ""
+        echo "Dependencies and services are being set up in the background"
+        echo "(this can take a few minutes on first install)."
+        echo ""
+        echo "The Unify icon will appear in your system tray and turn green"
+        echo "once services are running. You can change your API key anytime"
+        echo "from the tray icon's Settings."
+        echo ""
         echo "Progress: tail -f $LOG_DIR/postinst-deferred.log"
         echo ""
         ;;

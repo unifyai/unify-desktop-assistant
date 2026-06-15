@@ -66,6 +66,13 @@ DisableWelcomePage=no
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Messages]
+; Welcome / finish wording tailored to Unify (mirrors the macOS installer panes)
+WelcomeLabel2=This will install [name] on your computer.%n%nUnify Desktop Assistant lets the Unify platform securely view and control this machine. You'll enter your Unify API key on a later screen.%n%nClick Next to continue.
+FinishedHeadingLabel=Unify Desktop Assistant is installed
+FinishedLabel=Setup has finished installing Unify Desktop Assistant.%n%nThe Unify icon appears in your system tray (near the clock) and turns green once services are running. On first install this can take a few minutes while dependencies download.%n%nYou can change your API key anytime from the tray icon's Settings.
+FinishedLabelNoIcons=Setup has finished installing Unify Desktop Assistant.%n%nThe Unify icon appears in your system tray (near the clock) and turns green once services are running. On first install this can take a few minutes while dependencies download.%n%nYou can change your API key anytime from the tray icon's Settings.
+
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
