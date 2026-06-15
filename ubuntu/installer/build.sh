@@ -180,6 +180,13 @@ if [[ -f "$PROJECT_DIR/gui/unify-assistant.py" ]]; then
     chmod +x "$APP_ROOT/gui/unify-assistant.py"
 fi
 
+# --- assets/ (tray icon / logo) ---
+echo "  Copying assets..."
+if [[ -d "$PROJECT_DIR/assets" ]]; then
+    mkdir -p "$APP_ROOT/assets"
+    cp "$PROJECT_DIR/assets/"* "$APP_ROOT/assets/" 2>/dev/null || true
+fi
+
 # --- systemd/ ---
 echo "  Copying systemd units..."
 mkdir -p "$APP_ROOT/systemd"

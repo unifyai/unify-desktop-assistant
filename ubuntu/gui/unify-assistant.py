@@ -17,6 +17,7 @@ Mirrors: windows/gui/UnifyAssistant.ps1
 
 import os
 import sys
+import math
 import signal
 import subprocess
 import socket
@@ -54,11 +55,20 @@ APP_ID = "ai.unify.desktop-assistant"
 INSTALL_DIR = Path(__file__).resolve().parent.parent
 TOOLS_DIR = INSTALL_DIR / "tools"
 AGENT_SERVICE_DIR = INSTALL_DIR / "agent-service"
+ASSETS_DIR = INSTALL_DIR / "assets"
+LOGO_PATH = ASSETS_DIR / "unify_logo_only.png"
 SETUP_SCRIPT = TOOLS_DIR / "setup.sh"
 ENV_FILE = AGENT_SERVICE_DIR / ".env"
 SETTINGS_FILE = INSTALL_DIR / "settings.json"
 SIGNAL_FILE = INSTALL_DIR / "uninstall.signal"
 LOG_DIR = INSTALL_DIR / "logs"
+
+# Status dot colors (RGB), matching the macOS tray palette.
+STATUS_COLORS = {
+    "running": (76, 175, 80),    # Green
+    "partial": (255, 193, 7),    # Yellow/Amber
+    "stopped": (244, 67, 54),    # Red
+}
 
 VNC_PORT = 5900
 NOVNC_PORT = 6080
@@ -232,17 +242,19 @@ class UnifyTrayApp:
             self._start_services(None)
 
     def _create_icon_files(self):
-        """Create temporary icon files for AppIndicator (requires file paths)."""
+        """Create temporary icon files for AppIndicator (requires file paths).
+
+        Composites the Unify logo with a colored status dot at the lower-right
+        (matching the macOS/Windows trays). Falls back to a plain colored circle
+        if the logo asset is missing or compositing fails.
+        """
         import tempfile
         import cairo
 
         icon_dir = Path(tempfile.mkdtemp(prefix="unify-tray-"))
+        have_logo = LOGO_PATH.exists()
 
-        for status, (r, g, b) in [
-            ("running", (76, 175, 80)),
-            ("partial", (255, 193, 7)),
-            ("stopped", (244, 67, 54)),
-        ]:
+        for status, (r, g, b) in STATUS_COLORS.items():
             size = 22
             surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
             ctx = cairo.Context(surface)
@@ -250,14 +262,46 @@ class UnifyTrayApp:
             ctx.set_source_rgba(0, 0, 0, 0)
             ctx.paint()
 
-            cx, cy = size / 2, size / 2
-            radius = size / 2 - 2
-            ctx.arc(cx, cy, radius, 0, 2 * 3.14159)
-            ctx.set_source_rgb(r / 255, g / 255, b / 255)
-            ctx.fill_preserve()
-            ctx.set_source_rgb(0.12, 0.12, 0.12)
-            ctx.set_line_width(1)
-            ctx.stroke()
+            drew_logo = False
+            if have_logo:
+                try:
+                    logo = GdkPixbuf.Pixbuf.new_from_file_at_size(
+                        str(LOGO_PATH), size, size
+                    )
+                    # Center the (aspect-fit) logo on the canvas.
+                    lx = (size - logo.get_width()) / 2.0
+                    ly = (size - logo.get_height()) / 2.0
+                    Gdk.cairo_set_source_pixbuf(ctx, logo, lx, ly)
+                    ctx.paint()
+
+                    # Status dot at the lower-right, with a white ring for
+                    # contrast against the logo / panel background.
+                    diam = size * 0.46
+                    margin = size * 0.02
+                    ring = size * 0.07
+                    dcx = size - diam / 2.0 - margin
+                    dcy = size - diam / 2.0 - margin
+
+                    ctx.set_source_rgb(1, 1, 1)
+                    ctx.arc(dcx, dcy, diam / 2.0 + ring, 0, 2 * math.pi)
+                    ctx.fill()
+
+                    ctx.set_source_rgb(r / 255, g / 255, b / 255)
+                    ctx.arc(dcx, dcy, diam / 2.0, 0, 2 * math.pi)
+                    ctx.fill()
+                    drew_logo = True
+                except Exception:
+                    drew_logo = False
+
+            if not drew_logo:
+                cx, cy = size / 2, size / 2
+                radius = size / 2 - 2
+                ctx.arc(cx, cy, radius, 0, 2 * math.pi)
+                ctx.set_source_rgb(r / 255, g / 255, b / 255)
+                ctx.fill_preserve()
+                ctx.set_source_rgb(0.12, 0.12, 0.12)
+                ctx.set_line_width(1)
+                ctx.stroke()
 
             icon_path = icon_dir / f"unify-{status}.png"
             surface.write_to_png(str(icon_path))
