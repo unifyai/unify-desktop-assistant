@@ -29,6 +29,7 @@ param(
     [switch]$Start,
     [switch]$Stop,
     [switch]$Uninstall,
+    [switch]$Reconfigure,
     [switch]$Force
 )
 
@@ -449,6 +450,83 @@ function Install-TightVNC {
     } else {
         Write-Host "  TightVNC already installed" -ForegroundColor Green
     }
+}
+
+# Encrypt a plaintext VNC password into TightVNC's on-disk format.
+# VNC stores the password DES-encrypted with a well-known fixed key, using the
+# d3des variant that reverses the bit order of each key byte relative to FIPS
+# DES. We reproduce that here so .NET's standard DES yields the same bytes
+# TightVNC expects. The password is capped at 8 bytes (VNC auth limit) and
+# zero-padded, matching how noVNC truncates the key it sends.
+function ConvertTo-VncPassword {
+    param([string]$Plain)
+
+    $fixed = [byte[]](0x17, 0x52, 0x6B, 0x06, 0x23, 0x4E, 0x58, 0x07)
+    $key = New-Object byte[] 8
+    for ($i = 0; $i -lt 8; $i++) {
+        $b = $fixed[$i]
+        $r = 0
+        for ($j = 0; $j -lt 8; $j++) {
+            $r = (($r -shl 1) -bor ($b -band 1)) -band 0xFF
+            $b = $b -shr 1
+        }
+        $key[$i] = [byte]$r
+    }
+
+    $pwBytes = New-Object byte[] 8
+    $src = [System.Text.Encoding]::ASCII.GetBytes($Plain)
+    $n = [Math]::Min(8, $src.Length)
+    for ($i = 0; $i -lt $n; $i++) { $pwBytes[$i] = $src[$i] }
+
+    $des = [System.Security.Cryptography.DES]::Create()
+    $des.Mode = [System.Security.Cryptography.CipherMode]::ECB
+    $des.Padding = [System.Security.Cryptography.PaddingMode]::None
+    $des.Key = $key
+    $encryptor = $des.CreateEncryptor()
+    $out = $encryptor.TransformFinalBlock($pwBytes, 0, 8)
+    $encryptor.Dispose()
+    $des.Dispose()
+    return ,$out
+}
+
+# Re-derive the TightVNC password from the API key and write it to every
+# registry path. Used on key change (reconfigure): the install-time path copies
+# the MSI-written blob, which does NOT track a later key change, so without this
+# the noVNC viewer (which sends the new key) would fail VNC auth.
+function Set-TightVNCPassword {
+    param([string]$Plain)
+
+    Write-Host ""
+    Write-Host "=== Updating TightVNC password ===" -ForegroundColor Cyan
+
+    if (-not $Plain) {
+        Write-Host "  No key provided; skipping VNC password update" -ForegroundColor Yellow
+        return
+    }
+
+    $enc = ConvertTo-VncPassword -Plain $Plain
+
+    $regPaths = @(
+        'HKLM:\SOFTWARE\TightVNC\Server',
+        'HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server',
+        'HKCU:\SOFTWARE\TightVNC\Server',
+        'HKCU:\SOFTWARE\WOW6432Node\TightVNC\Server'
+    )
+
+    foreach ($regPath in $regPaths) {
+        try {
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+            Set-ItemProperty -Path $regPath -Name 'UseVncAuthentication' -Value 1 -Type DWord -Force
+            Set-ItemProperty -Path $regPath -Name 'Password' -Value ([byte[]]$enc) -Type Binary -Force
+            Set-ItemProperty -Path $regPath -Name 'ControlPassword' -Value ([byte[]]$enc) -Type Binary -Force
+        } catch {
+            Write-Host "  WARNING: could not write $regPath ($_)" -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "  VNC password updated to match the API key" -ForegroundColor Green
 }
 
 function Configure-TightVNC {
@@ -1410,6 +1488,50 @@ if ($Uninstall) {
     exit 0
 }
 
+# Handle reconfigure (lightweight key update: re-apply key + VNC password +
+# re-register + restart services). Used by the tray when the API key changes.
+# It deliberately skips dependency installs and Setup-*Startup (the scheduled
+# tasks already exist). Requires admin: it writes the TightVNC password to HKLM
+# and restarts the per-service processes.
+if ($Reconfigure) {
+    Write-Host ""
+    Write-Host "Reconfigure mode" -ForegroundColor Yellow
+
+    if (-not $UnifyKey) {
+        Write-Host "ERROR: -Reconfigure requires -UnifyKey" -ForegroundColor Red
+        exit 1
+    }
+
+    # Settings only changes the API key — preserve the URLs baked at install,
+    # otherwise Setup-AgentServiceEnv would reset them to the script defaults
+    # and break a staging/custom install.
+    $existingOrch = Get-EnvValue -Key "ORCHESTRA_URL"
+    $existingComms = Get-EnvValue -Key "UNITY_COMMS_URL"
+    if ($existingOrch) { $OrchestraUrl = $existingOrch }
+    if ($existingComms) { $UnityCommsUrl = $existingComms }
+
+    # Rewrite .env (preserves TUNNEL_*/DEVICE_ID) and re-apply the VNC password
+    # so the TightVNC server matches the new key (noVNC sends the key as the
+    # VNC password). Without this the viewer would fail after a key change.
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
+    Set-TightVNCPassword -Plain $UnifyKey
+
+    # Restart services so the agent picks up the new key (it reads UNIFY_KEY at
+    # process start).
+    Stop-AllServices
+
+    # Re-register tunnel + desktop with the new key (Register-Tunnel no-ops when
+    # a tunnel is already registered; Register-Desktop PATCHes the existing URL).
+    Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl -LocalPort 3000 -TunnelName $DeviceName
+    $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
+    if ($tunnelUrl) {
+        Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $tunnelUrl
+    }
+
+    Start-AllServices
+    exit 0
+}
+
 # Validate required parameters
 if (-not $UnifyKey) {
     Write-Host "ERROR: -UnifyKey is required" -ForegroundColor Red
@@ -1419,6 +1541,7 @@ if (-not $UnifyKey) {
     Write-Host "  .\setup.ps1 -Start"
     Write-Host "  .\setup.ps1 -Stop"
     Write-Host "  .\setup.ps1 -Uninstall"
+    Write-Host "  .\setup.ps1 -Reconfigure -UnifyKey 'your-key'"
     Write-Host ""
     exit 1
 }

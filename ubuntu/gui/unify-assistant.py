@@ -478,11 +478,48 @@ class UnifyTrayApp:
 
     def _show_settings(self, _widget):
         """Show the settings dialog."""
+        old_key = get_env_value("UNIFY_KEY")
         dialog = SettingsDialog()
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
+            new_key = dialog.txt_key.get_text().strip()
             dialog.save()
+            # If the API key actually changed, re-run setup so services restart
+            # and pick up the new key (x11vnc password + agent both read it at
+            # process start). Writing .env alone would leave the old key live.
+            if new_key and new_key != old_key:
+                self._apply_key_and_setup(new_key)
         dialog.destroy()
+
+    def _apply_key_and_setup(self, key: str):
+        """Re-apply the API key via setup.sh --reconfigure in the background.
+
+        --reconfigure rewrites .env (preserving baked URLs + tunnel/device IDs),
+        stops services, re-registers the tunnel/desktop, and restarts services
+        with the new key. It runs in the user session (no root) and never touches
+        autostart, so it won't kill this tray app. Kicked off on a worker thread
+        so the menu stays responsive.
+        """
+        self._notify("Updating", "Applying new API key and restarting services…")
+
+        def worker():
+            subprocess.run(
+                [str(SETUP_SCRIPT), "--reconfigure", "--unify-key", key],
+                capture_output=True,
+            )
+            self._notify("Ready", "Unify Desktop Assistant is configured.")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _notify(self, title: str, body: str):
+        """Best-effort desktop notification via notify-send (no hard dependency)."""
+        try:
+            subprocess.Popen(
+                ["notify-send", f"{APP_NAME}: {title}", body],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
 
     def _view_logs(self, _widget):
         """Open the agent log file in the default text editor."""

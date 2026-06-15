@@ -41,6 +41,7 @@ UNITY_COMMS_URL="https://unity-comms-app-000000000000.us-central1.run.app"
 DO_START=false
 DO_STOP=false
 DO_UNINSTALL=false
+RECONFIGURE=false
 FORCE=false
 SKIP_APT=false
 NO_START=false
@@ -61,6 +62,7 @@ Options:
   --start               Start services only (no install/config, no root needed)
   --stop                Stop all services
   --uninstall           Stop services, remove systemd units & firewall rules
+  --reconfigure         Re-apply key + re-register + restart services (no deps, no root)
   --skip-apt            Skip apt-get operations (used by .deb postinst)
   --no-start            Skip starting services at end (used by .deb postinst)
   --device-name NAME    Friendly device name for registration (default: short hostname)
@@ -90,6 +92,8 @@ while [[ $# -gt 0 ]]; do
             DO_STOP=true; shift ;;
         --uninstall)
             DO_UNINSTALL=true; shift ;;
+        --reconfigure)
+            RECONFIGURE=true; shift ;;
         --skip-apt)
             SKIP_APT=true; shift ;;
         --no-start)
@@ -1312,6 +1316,54 @@ fi
 # Handle uninstall command
 if $DO_UNINSTALL; then
     uninstall_all
+    exit 0
+fi
+
+# Handle reconfigure (lightweight key update: re-apply key + re-register +
+# restart services). Used by the tray when the API key changes. It deliberately
+# skips dependency installs AND setup_autostart: services run in the user
+# session, .env is user-owned, and the tray itself has no port, so a plain
+# user-context stop/start is safe and never kills the menu-bar app.
+if $RECONFIGURE; then
+    echo ""
+    echo "Reconfigure mode"
+
+    if [[ -z "$UNIFY_KEY" ]]; then
+        echo "ERROR: --reconfigure requires --unify-key" >&2
+        exit 1
+    fi
+
+    # Run as the regular user (registration writes the user-owned .env; matches --start).
+    if [[ "$EUID" -eq 0 ]]; then
+        echo "ERROR: Do not run --reconfigure as root." >&2
+        exit 1
+    fi
+
+    # Settings only changes the API key — preserve the URLs baked at install.
+    # Otherwise setup_agent_service_env would overwrite them with setup.sh's
+    # hardcoded production defaults, breaking a staging/custom install.
+    existing_orch="$(get_env_value "ORCHESTRA_URL")"
+    existing_comms="$(get_env_value "UNITY_COMMS_URL")"
+    [[ -n "$existing_orch" ]]  && ORCHESTRA_URL="$existing_orch"
+    [[ -n "$existing_comms" ]] && UNITY_COMMS_URL="$existing_comms"
+
+    # Rewrite .env with the new key (preserves TUNNEL_*/DEVICE_ID and URLs).
+    setup_agent_service_env
+
+    # Stop running services so they restart with the new key (x11vnc password +
+    # agent both read UNIFY_KEY at process start).
+    stop_all_services
+
+    mkdir -p "$LOG_DIR"
+
+    # Re-register tunnel + desktop with the new key.
+    register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" 3000 "$DEVICE_NAME" || true
+    tunnel_url=$(get_env_value "TUNNEL_URL")
+    if [[ -n "$tunnel_url" ]]; then
+        register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
+    fi
+
+    start_all_services
     exit 0
 fi
 
