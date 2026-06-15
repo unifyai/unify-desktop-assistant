@@ -766,6 +766,18 @@ function Install-AgentService {
         Write-Host "  Installing Patchright + Chromium (this may take a few minutes)..."
         [System.Environment]::SetEnvironmentVariable('PLAYWRIGHT_BROWSERS_PATH', 'C:\ms-playwright', 'Machine')
         $env:PLAYWRIGHT_BROWSERS_PATH = 'C:\ms-playwright'
+
+        # Defender real-time scanning of the extracted Chromium (thousands of
+        # binaries) throttles extraction to a crawl and makes the install appear
+        # hung. Exclude the browsers path before extracting.
+        Write-Host "  Adding Windows Defender exclusion for browsers directory..."
+        try {
+            Add-MpPreference -ExclusionPath 'C:\ms-playwright' -ErrorAction Stop
+            Write-Host "  Defender exclusion added" -ForegroundColor Green
+        } catch {
+            Write-Host "  WARNING: Could not add Defender exclusion: $_" -ForegroundColor Yellow
+        }
+
         Push-Location (Join-Path $script:MagnitudeDir 'packages\magnitude-core')
         Invoke-NativeCommand { npx --yes patchright install chromium }
         Pop-Location
