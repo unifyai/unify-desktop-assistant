@@ -72,6 +72,37 @@ function Invoke-NativeCommand {
     }
 }
 
+function Disable-QuickEditMode {
+    # Console QuickEdit Mode pauses the running process the moment the window is
+    # clicked/selected, which makes the install appear to hang at random spots.
+    # Clear ENABLE_QUICK_EDIT_MODE on the current console so child processes
+    # (bun/npm/node/patchright), which inherit this console, can't be stalled.
+    # Best-effort: no-op when there is no console (hidden/-Reconfigure/-Uninstall).
+    try {
+        if (-not ('Win32.ConsoleMode' -as [type])) {
+            Add-Type -Namespace Win32 -Name ConsoleMode -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+'@
+        }
+        $STD_INPUT_HANDLE       = -10
+        $ENABLE_QUICK_EDIT_MODE = 0x0040
+        $ENABLE_EXTENDED_FLAGS  = 0x0080
+        $handle = [Win32.ConsoleMode]::GetStdHandle($STD_INPUT_HANDLE)
+        $mode = 0
+        if ([Win32.ConsoleMode]::GetConsoleMode($handle, [ref]$mode)) {
+            $newMode = ($mode -band (-bnot $ENABLE_QUICK_EDIT_MODE)) -bor $ENABLE_EXTENDED_FLAGS
+            [void][Win32.ConsoleMode]::SetConsoleMode($handle, $newMode)
+        }
+    } catch {
+        # No usable console (hidden window) — nothing to do.
+    }
+}
+
 function Add-DefenderExclusions {
     # Exclude the dirs that get thousands of files written during install
     # (bun/npm node_modules, extracted Chromium). Defender real-time scanning of
@@ -1566,6 +1597,9 @@ if (-not $UnifyKey) {
 }
 
 try {
+    # Stop the console from pausing the install when clicked (QuickEdit Mode).
+    Disable-QuickEditMode
+
     # Detect fast mode
     $fastMode = (Test-FastMode) -and -not $Force
 
