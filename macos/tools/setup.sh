@@ -398,6 +398,29 @@ apply_compose_self_host_mode() {
     LINK_COORDINATOR=true
 }
 
+explain_orchestra_connect_failure() {
+    local action_description=$1
+    local orchestra_url=$2
+    local http_code=$3
+
+    if [[ -n "$http_code" && "$http_code" != "000" ]]; then
+        return 1
+    fi
+
+    echo "  ERROR: Could not connect to Orchestra at ${orchestra_url} while trying to ${action_description}." >&2
+    if compose_self_host_present || [[ "$orchestra_url" == *127.0.0.1* || "$orchestra_url" == *localhost* ]]; then
+        echo "  Orchestra is not reachable on this machine — the Unity Docker stack is probably stopped." >&2
+        echo "  Start it first:" >&2
+        echo "    unity stack up" >&2
+        echo "  Wait until Orchestra responds on port 8000, then register again from tray Settings" >&2
+        echo "  (paste your API key) or run:" >&2
+        echo "    $TOOLS_DIR/setup.sh --reconfigure --unify-key YOUR_KEY" >&2
+    else
+        echo "  Check that Orchestra is reachable from this machine and your network is connected." >&2
+    fi
+    return 0
+}
+
 # =============================================================================
 # Fast Mode Detection
 # =============================================================================
@@ -1263,7 +1286,11 @@ register_desktop() {
             if [[ "$http_code" == "200" ]]; then
                 echo "  URL updated"
             else
-                echo "  WARNING: Could not update desktop URL (HTTP ${http_code})"
+                if explain_orchestra_connect_failure "update the desktop URL" "$orchestra_url" "$http_code"; then
+                    echo "  WARNING: Could not update desktop URL (Orchestra unreachable)" >&2
+                else
+                    echo "  WARNING: Could not update desktop URL (HTTP ${http_code})" >&2
+                fi
             fi
         fi
         return
@@ -1289,6 +1316,10 @@ register_desktop() {
         "${orchestra_url}/desktop" || true)
 
     if [[ "$http_code" != "200" ]]; then
+        if explain_orchestra_connect_failure "register this Mac" "$orchestra_url" "$http_code"; then
+            rm -f "$resp_file"
+            return 1
+        fi
         echo "  ERROR: Desktop registration failed (HTTP ${http_code})" >&2
         [[ -f "$resp_file" ]] && cat "$resp_file" >&2
         rm -f "$resp_file"
@@ -1418,6 +1449,9 @@ PY
         "${orchestra_url%/}/desktop/link" || true)
 
     if [[ "$http_code" != "200" ]]; then
+        if explain_orchestra_connect_failure "link this Mac to the Coordinator" "$orchestra_url" "$http_code"; then
+            return 1
+        fi
         echo "  ERROR: Desktop link failed (HTTP ${http_code})" >&2
         return 1
     fi
