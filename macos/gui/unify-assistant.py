@@ -49,7 +49,14 @@ LOGO_PATH = ASSETS_DIR / "unify_logo_only.png"
 
 VNC_PORT = 5900
 NOVNC_PORT = 6080
-AGENT_PORT = 3000
+
+
+def agent_port() -> int:
+    """Agent-service listen port (13000 in compose self-host, 3000 otherwise)."""
+    raw = get_env_value("PORT")
+    if raw.isdigit():
+        return int(raw)
+    return 13000 if (Path.home() / ".unity" / "docker-compose.yml").exists() else 3000
 
 STATUS_INTERVAL = 5  # seconds
 
@@ -99,7 +106,7 @@ def get_service_status() -> dict:
     """Get status of all services by checking ports."""
     vnc = test_port_listening(VNC_PORT)
     novnc = test_port_listening(NOVNC_PORT)
-    agent = test_port_listening(AGENT_PORT)
+    agent = test_port_listening(agent_port())
     tunnel = is_tunnel_running()
     return {
         "vnc": vnc,
@@ -441,7 +448,12 @@ class UnifyTrayApp(rumps.App):
             return
 
         set_env_value("UNIFY_KEY", key)
-        set_env_value("PORT", "3000")
+        self_host = (Path.home() / ".unity" / "docker-compose.yml").exists()
+        if self_host:
+            set_env_value("PORT", "13000")
+            set_env_value("SELF_HOST", "1")
+        else:
+            set_env_value("PORT", "3000")
 
         rumps.notification(
             APP_NAME, "Setting up",
@@ -449,14 +461,10 @@ class UnifyTrayApp(rumps.App):
         )
 
         def worker():
-            # --reconfigure does its own stop + restart with the new key, so the
-            # agent picks up the new key instead of keeping the old one in memory.
-            subprocess.run(
-                ["bash", str(SETUP_SCRIPT), "--reconfigure", "--unify-key", key],
-                capture_output=True,
-            )
-            # Screen Sharing uses the macOS account (ARD), not a key-derived VNC
-            # password, so it does not need re-enabling when the key changes.
+            cmd = ["bash", str(SETUP_SCRIPT), "--reconfigure", "--unify-key", key]
+            if self_host:
+                cmd.extend(["--self-host", "--link-coordinator"])
+            subprocess.run(cmd, capture_output=True)
             rumps.notification(
                 APP_NAME, "Ready", "Unify Desktop Assistant is set up.",
             )
@@ -473,7 +481,7 @@ class UnifyTrayApp(rumps.App):
 
     def _open_api(self, _sender):
         """Open the Agent API in the default browser."""
-        webbrowser.open(f"http://localhost:{AGENT_PORT}")
+        webbrowser.open(f"http://localhost:{agent_port()}")
 
     def _copy_public_url(self, _sender):
         """Copy the tunnel public URL to the clipboard."""
