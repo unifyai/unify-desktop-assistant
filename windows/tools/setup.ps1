@@ -805,6 +805,87 @@ function Install-Magnitude {
     }
 }
 
+function Install-Chromium {
+    # patchright/Playwright's own (node) archive extractor hangs on some Windows
+    # VMs right at "extracting archive" (download succeeds, extraction never
+    # writes a byte; not Defender/disk — native Expand-Archive of the same zip is
+    # instant). Provision Chromium ourselves: download the zip and extract it with
+    # Expand-Archive into the exact dir Playwright expects, then drop the
+    # INSTALLATION_COMPLETE marker so patchright treats it as already installed
+    # and never runs its broken extractor. Falls back to `patchright install` if
+    # anything here fails, so we're never worse off than before.
+    $browsersRoot = 'C:\ms-playwright'
+    $coreDir = Join-Path $script:MagnitudeDir 'packages\magnitude-core'
+
+    $rev = $null
+    try {
+        $browsersJson = Get-ChildItem -Path $script:MagnitudeDir -Recurse -Filter 'browsers.json' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'patchright-core' } | Select-Object -First 1
+        if (-not $browsersJson) {
+            $browsersJson = Get-ChildItem -Path $script:MagnitudeDir -Recurse -Filter 'browsers.json' -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match 'playwright-core' } | Select-Object -First 1
+        }
+        if ($browsersJson) {
+            $data = Get-Content $browsersJson.FullName -Raw | ConvertFrom-Json
+            $chromium = $data.browsers | Where-Object { $_.name -eq 'chromium' } | Select-Object -First 1
+            if ($chromium) { $rev = $chromium.revision }
+        }
+    } catch {
+        Write-Host "  WARNING: Could not read Chromium revision: $_" -ForegroundColor Yellow
+    }
+
+    if (-not $rev) {
+        Write-Host "  Could not determine Chromium revision; falling back to patchright install..." -ForegroundColor Yellow
+        Push-Location $coreDir
+        Invoke-NativeCommand { npx --yes patchright install chromium }
+        Pop-Location
+        return
+    }
+
+    $browserDir = Join-Path $browsersRoot "chromium-$rev"
+    $chromeExe = Join-Path $browserDir 'chrome-win\chrome.exe'
+    $marker = Join-Path $browserDir 'INSTALLATION_COMPLETE'
+
+    if ((Test-Path $chromeExe) -and (Test-Path $marker)) {
+        Write-Host "  Chromium already installed (revision $rev)" -ForegroundColor Green
+        return
+    }
+
+    $url = "https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/$rev/chromium-win64.zip"
+    $zip = Join-Path $env:TEMP "chromium-$rev.zip"
+    $ok = $false
+    $prevProgress = $ProgressPreference
+    try {
+        Write-Host "  Downloading Chromium (revision $rev)..."
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
+
+        Write-Host "  Extracting Chromium (native unzip)..."
+        New-Item -ItemType Directory -Force -Path $browserDir | Out-Null
+        Expand-Archive -Path $zip -DestinationPath $browserDir -Force -ErrorAction Stop
+
+        if (Test-Path $chromeExe) {
+            New-Item -ItemType File -Force -Path $marker | Out-Null
+            $ok = $true
+            Write-Host "  Chromium installed (revision $rev)" -ForegroundColor Green
+        } else {
+            Write-Host "  WARNING: chrome.exe not found after extraction." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  WARNING: Manual Chromium provisioning failed: $_" -ForegroundColor Yellow
+    } finally {
+        $ProgressPreference = $prevProgress
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    }
+
+    if (-not $ok) {
+        Write-Host "  Falling back to patchright install..." -ForegroundColor Yellow
+        Push-Location $coreDir
+        Invoke-NativeCommand { npx --yes patchright install chromium }
+        Pop-Location
+    }
+}
+
 function Install-AgentService {
     param([switch]$Force)
     
@@ -833,10 +914,8 @@ function Install-AgentService {
         Write-Host "  Installing Patchright + Chromium (this may take a few minutes)..."
         [System.Environment]::SetEnvironmentVariable('PLAYWRIGHT_BROWSERS_PATH', 'C:\ms-playwright', 'Machine')
         $env:PLAYWRIGHT_BROWSERS_PATH = 'C:\ms-playwright'
-        Push-Location (Join-Path $script:MagnitudeDir 'packages\magnitude-core')
-        Invoke-NativeCommand { npx --yes patchright install chromium }
-        Pop-Location
-        
+        Install-Chromium
+
         Write-Host "  Dependencies installed" -ForegroundColor Green
     }
 }
