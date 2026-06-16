@@ -166,25 +166,48 @@ done
 # -----------------------------------------------------------------------------
 PYTHON_BIN_FILE="$TOOLS_DIR/.python-bin"
 
+python_has_websockify() {
+    local p="$1"
+    [[ -n "$p" && -x "$p" ]] && "$p" -c 'import websockify' 2>/dev/null
+}
+
+python_pip_works() {
+    local p="$1"
+    [[ -n "$p" && -x "$p" ]] && "$p" -m pip --version &>/dev/null 2>&1
+}
+
 resolve_python_bin() {
-    # 1. Honor a previously persisted interpreter (recorded at install time).
+    # 1. Honor a previously persisted interpreter when it is still usable.
     if [[ -f "$PYTHON_BIN_FILE" ]]; then
         local saved
         saved="$(head -n1 "$PYTHON_BIN_FILE" 2>/dev/null || true)"
-        if [[ -n "$saved" && -x "$saved" ]]; then
-            echo "$saved"; return 0
+        if python_has_websockify "$saved" || python_pip_works "$saved"; then
+            echo "$saved"
+            return 0
         fi
     fi
     # 2. Prefer an interpreter that already has websockify importable.
     local p
-    for p in "$(command -v python3 2>/dev/null || true)" \
-             /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
-        if [[ -n "$p" && -x "$p" ]] && "$p" -c 'import websockify' 2>/dev/null; then
-            echo "$p"; return 0
+    for p in /usr/bin/python3 /opt/homebrew/opt/python@3.12/bin/python3 \
+             /opt/homebrew/opt/python@3.11/bin/python3 \
+             "$(command -v python3 2>/dev/null || true)" \
+             /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+        if python_has_websockify "$p"; then
+            echo "$p"
+            return 0
         fi
     done
-    # 3. Fall back to the first python3 on PATH (install will add websockify).
-    command -v python3 2>/dev/null || echo /usr/bin/python3
+    # 3. Fall back to any Python with a working pip (skip broken Homebrew 3.14).
+    for p in /usr/bin/python3 /opt/homebrew/opt/python@3.12/bin/python3 \
+             /opt/homebrew/opt/python@3.11/bin/python3 \
+             "$(command -v python3 2>/dev/null || true)" \
+             /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+        if python_pip_works "$p"; then
+            echo "$p"
+            return 0
+        fi
+    done
+    echo /usr/bin/python3
 }
 
 PYTHON_BIN="$(resolve_python_bin)"
@@ -389,7 +412,7 @@ test_fast_mode() {
         all_ok=false
     fi
 
-    if "$PYTHON_BIN" -m websockify --help &>/dev/null 2>&1 || command -v websockify &>/dev/null; then
+    if python_has_websockify "$PYTHON_BIN" || command -v websockify &>/dev/null; then
         echo "  [OK] websockify" >&2
     else
         echo "  [--] websockify (will install)" >&2
@@ -777,6 +800,19 @@ install_websockify() {
     echo ""
     echo "=== Installing websockify ==="
 
+    if python_has_websockify "$PYTHON_BIN"; then
+        echo "  websockify already installed ($PYTHON_BIN)"
+        echo "$PYTHON_BIN" > "$PYTHON_BIN_FILE" 2>/dev/null || true
+        return 0
+    fi
+
+    if ! python_pip_works "$PYTHON_BIN"; then
+        echo "ERROR: pip is not usable for $PYTHON_BIN — cannot install websockify." >&2
+        echo "  Try: /usr/bin/python3 -m pip install --user websockify" >&2
+        echo "  Then: echo /usr/bin/python3 > $PYTHON_BIN_FILE" >&2
+        return 1
+    fi
+
     "$PYTHON_BIN" -m pip install --break-system-packages websockify 2>/dev/null \
         || "$PYTHON_BIN" -m pip install websockify
 
@@ -794,6 +830,11 @@ install_rumps() {
     if "$PYTHON_BIN" -c "import rumps" &>/dev/null 2>&1; then
         echo "  rumps already installed"
         return
+    fi
+
+    if ! python_pip_works "$PYTHON_BIN"; then
+        echo "ERROR: pip is not usable for $PYTHON_BIN — cannot install rumps." >&2
+        return 1
     fi
 
     "$PYTHON_BIN" -m pip install --break-system-packages rumps 2>/dev/null \
