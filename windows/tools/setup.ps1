@@ -105,11 +105,16 @@ public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
 
 function Add-DefenderExclusions {
     # Exclude the dirs that get thousands of files written during install
-    # (bun/npm node_modules, extracted Chromium). Defender real-time scanning of
-    # these throttles the install badly and makes it appear hung. Best-effort.
+    # (bun/npm node_modules + caches, extracted Chromium). Defender real-time
+    # scanning of these throttles the install to a crawl and makes it appear hung
+    # at random spots (the bun global cache at ~/.bun is the worst offender).
+    # Best-effort; install runs elevated as the launching user, so their profile
+    # env vars resolve correctly.
     $paths = @(
         $script:InstallDir,
-        'C:\ms-playwright'
+        'C:\ms-playwright',
+        "$env:USERPROFILE\.bun",
+        "$env:LOCALAPPDATA\npm-cache"
     )
     foreach ($p in $paths) {
         if (-not $p) { continue }
@@ -118,6 +123,18 @@ function Add-DefenderExclusions {
             Write-Host "  Defender exclusion added: $p" -ForegroundColor Green
         } catch {
             Write-Host "  WARNING: Could not add Defender exclusion for ${p}: $_" -ForegroundColor Yellow
+        }
+    }
+
+    # Process exclusions skip scanning of any file these touch, regardless of
+    # location — the most robust guard for the bun/npm install phases.
+    $procs = @('bun.exe', 'node.exe')
+    foreach ($proc in $procs) {
+        try {
+            Add-MpPreference -ExclusionProcess $proc -ErrorAction Stop
+            Write-Host "  Defender process exclusion added: $proc" -ForegroundColor Green
+        } catch {
+            Write-Host "  WARNING: Could not add Defender process exclusion for ${proc}: $_" -ForegroundColor Yellow
         }
     }
 }
