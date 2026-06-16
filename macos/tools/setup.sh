@@ -51,6 +51,10 @@ PREREQS_ONLY=false
 DEVICE_NAME=""
 ENABLE_SS=false
 RECONFIGURE=false
+SELF_HOST_MODE=false
+LINK_COORDINATOR=false
+COORDINATOR_AGENT_ID=""
+SELF_HOST_AGENT_PORT=13000
 
 # =============================================================================
 # Argument Parsing
@@ -71,6 +75,9 @@ Options:
   --no-start            Skip starting services at end (used by .pkg postinstall)
   --prereqs-only        Install prerequisites only (no key required, no config/registration)
   --reconfigure         Re-apply key + re-register + restart services (no deps, no autostart)
+  --self-host           Unity Docker self-host mode (local Orchestra, no tunnel, port ${SELF_HOST_AGENT_PORT})
+  --link-coordinator    Link registered desktop to the Coordinator assistant (self-host)
+  --coordinator-agent-id ID  Coordinator agent id for --link-coordinator (optional)
   --enable-screen-sharing (root) Enable Apple Screen Sharing (ARD account auth)
   --device-name NAME    Friendly device name for registration (default: short hostname)
   --force               Force reinstall all components
@@ -107,6 +114,12 @@ while [[ $# -gt 0 ]]; do
             PREREQS_ONLY=true; shift ;;
         --reconfigure)
             RECONFIGURE=true; shift ;;
+        --self-host)
+            SELF_HOST_MODE=true; shift ;;
+        --link-coordinator)
+            LINK_COORDINATOR=true; shift ;;
+        --coordinator-agent-id)
+            COORDINATOR_AGENT_ID="$2"; shift 2 ;;
         --enable-screen-sharing)
             ENABLE_SS=true; shift ;;
         --device-name)
@@ -183,7 +196,9 @@ PYTHON_BIN="$(resolve_python_bin)"
 test_port_listening() {
     local port=$1
     lsof -iTCP:"$port" -sTCP:LISTEN -P >/dev/null 2>&1 && return 0
-    return 1
+    # Apple Screen Sharing accepts TCP on 5900 without a user-visible LISTEN
+    # socket in lsof. Fall back to a connect probe (same as unify-assistant.py).
+    nc -z 127.0.0.1 "$port" >/dev/null 2>&1
 }
 
 get_package_json_hash() {
@@ -423,6 +438,12 @@ stop_all_services() {
     # Stop tunnel first
     stop_tunnel
 
+    # Stop launchd host service agents (tray is intentionally left loaded).
+    local domain="gui/$(id -u)"
+    for label in com.unify.websockify com.unify.agent; do
+        launchctl bootout "$domain/$label" 2>/dev/null || true
+    done
+
     # Stop Agent Service. It runs as `npm exec ts-node src/index.ts`, whose child
     # (the port-3000 listener) is `node …/agent-service/node_modules/.bin/ts-node
     # src/index.ts`. Match on the trailing `ts-node src/index.ts` so BOTH the npm
@@ -451,8 +472,10 @@ stop_all_services() {
 
     # Final sweep: kill processes on target ports. SIGTERM first, then escalate
     # to SIGKILL for anything still listening — the Node agent handles SIGTERM
-    # (graceful shutdown / keep-alive sockets) and otherwise lingers on 3000.
-    for port in 6080 3000; do
+    # (graceful shutdown / keep-alive sockets) and otherwise lingers.
+    local agent_port
+    agent_port="$(agent_service_port)"
+    for port in 6080 "$agent_port"; do
         pids=$(lsof -ti TCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
         if [[ -n "$pids" ]]; then
             echo "$pids" | xargs kill -TERM 2>/dev/null || true
@@ -460,7 +483,7 @@ stop_all_services() {
         fi
     done
     sleep 2
-    for port in 6080 3000; do
+    for port in 6080 "$agent_port"; do
         pids=$(lsof -ti TCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
         if [[ -n "$pids" ]]; then
             echo "$pids" | xargs kill -KILL 2>/dev/null || true
@@ -595,7 +618,7 @@ uninstall_all() {
     # 4. Remove launchd agents (tgt_user/tgt_home/tgt_uid resolved at top)
     echo ""
     echo "Removing launchd agents..."
-    for agent in com.unify.tray com.unify.tunnel; do
+    for agent in com.unify.tray com.unify.tunnel com.unify.websockify com.unify.agent; do
         local plist="$tgt_home/Library/LaunchAgents/${agent}.plist"
         if [[ -f "$plist" ]]; then
             if [[ -n "$tgt_uid" ]]; then
@@ -1222,6 +1245,180 @@ register_desktop() {
     echo "  URL: $tunnel_url"
 }
 
+agent_service_port() {
+    local env_file="$AGENT_SERVICE_DIR/.env"
+    if [[ -f "$env_file" ]]; then
+        local port
+        port="$(grep -E '^PORT=' "$env_file" 2>/dev/null | sed 's/^PORT=//' || true)"
+        if [[ -n "$port" ]]; then
+            echo "$port"
+            return 0
+        fi
+    fi
+    if $SELF_HOST_MODE; then
+        echo "$SELF_HOST_AGENT_PORT"
+    else
+        echo "3000"
+    fi
+}
+
+self_host_registration_url() {
+    echo "http://host.docker.internal:$(agent_service_port)"
+}
+
+resolve_coordinator_agent_id() {
+    local unify_key=$1
+    local orchestra_url=$2
+
+    if [[ -n "$COORDINATOR_AGENT_ID" ]]; then
+        echo "$COORDINATOR_AGENT_ID"
+        return 0
+    fi
+
+    local runtime_file="$HOME/.unity/coordinator-runtime.json"
+    if [[ -f "$runtime_file" ]]; then
+        local from_file
+        from_file="$(python3 - "$runtime_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+print(
+    data.get("coordinatorAgentId")
+    or data.get("coordinator_agent_id")
+    or ""
+)
+PY
+)"
+        if [[ -n "$from_file" ]]; then
+            echo "$from_file"
+            return 0
+        fi
+    fi
+
+    local resp_file="/tmp/unify_coordinator_lookup.json"
+    local http_code
+    http_code=$(curl -sS -o "$resp_file" -w "%{http_code}" \
+        -H "Authorization: Bearer ${unify_key}" \
+        "${orchestra_url%/}/assistant" || true)
+    if [[ "$http_code" != "200" ]]; then
+        rm -f "$resp_file"
+        return 1
+    fi
+    python3 - "$resp_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    raw = json.load(fh)
+items = raw.get("info") if isinstance(raw, dict) else raw
+if not isinstance(items, list):
+    raise SystemExit(1)
+for item in items:
+    if item.get("is_coordinator"):
+        print(item.get("agent_id") or item.get("agentId") or "")
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    rm -f "$resp_file"
+}
+
+link_desktop_to_coordinator() {
+    local unify_key=$1
+    local orchestra_url=$2
+    local desktop_id=$3
+    local coordinator_id=$4
+
+    echo ""
+    echo "=== Linking Desktop to Coordinator ==="
+
+    local http_code
+    http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer ${unify_key}" \
+        -H "Content-Type: application/json" \
+        -d "$(python3 - "$coordinator_id" "$desktop_id" <<'PY'
+import json
+import sys
+
+assistant_id, desktop_id = sys.argv[1], sys.argv[2]
+print(
+    json.dumps(
+        {
+            "assistant_id": int(assistant_id),
+            "desktop_id": int(desktop_id),
+            "filesys_sync": False,
+        },
+    ),
+)
+PY
+)" \
+        "${orchestra_url%/}/desktop/link" || true)
+
+    if [[ "$http_code" != "200" ]]; then
+        echo "  ERROR: Desktop link failed (HTTP ${http_code})" >&2
+        return 1
+    fi
+    echo "  Linked desktop ${desktop_id} to Coordinator assistant ${coordinator_id}"
+}
+
+register_self_host_desktop() {
+    local unify_key=$1
+    local orchestra_url=$2
+    local device_name=$3
+    local reg_url
+    reg_url="$(self_host_registration_url)"
+
+    echo ""
+    echo "=== Self-Host Desktop Registration ==="
+    echo "  Orchestra: ${orchestra_url}"
+    echo "  Agent URL for Unity CM: ${reg_url}"
+
+    register_desktop "$unify_key" "$orchestra_url" "$device_name" "$reg_url" || return 1
+
+    if $LINK_COORDINATOR; then
+        local desktop_id coordinator_id
+        desktop_id="$(get_env_value "DEVICE_ID")"
+        coordinator_id="$(resolve_coordinator_agent_id "$unify_key" "$orchestra_url" || true)"
+        if [[ -z "$desktop_id" || -z "$coordinator_id" ]]; then
+            echo "  WARNING: Could not link desktop — missing device or coordinator id" >&2
+            return 0
+        fi
+        link_desktop_to_coordinator "$unify_key" "$orchestra_url" "$desktop_id" "$coordinator_id" || true
+        echo ""
+        echo "  Restart the Unity stack so CM reloads linked desktops:"
+        echo "    unity restart"
+    fi
+}
+
+bootstrap_launch_agent() {
+    local label=$1
+    local plist=$2
+    local domain="gui/$(id -u)"
+
+    launchctl bootout "$domain/$label" 2>/dev/null || true
+    if launchctl bootstrap "$domain" "$plist" 2>/dev/null; then
+        launchctl kickstart -k "$domain/$label" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+start_launchd_host_services() {
+    local domain="gui/$(id -u)"
+    local target_dir="$HOME/Library/LaunchAgents"
+    local started=false
+
+    for label in com.unify.websockify com.unify.agent; do
+        local plist="$target_dir/${label}.plist"
+        if [[ -f "$plist" ]]; then
+            bootstrap_launch_agent "$label" "$plist" && started=true
+        fi
+    done
+    $started
+}
+
 unregister_desktop() {
     local unify_key=$1
     local orchestra_url=$2
@@ -1256,6 +1453,8 @@ setup_agent_service_env() {
     echo "=== Configuring Agent Service ==="
 
     local env_file="$AGENT_SERVICE_DIR/.env"
+    local agent_port
+    agent_port="$(agent_service_port)"
 
     local existing_tunnel_id existing_tunnel_url existing_tunnel_token existing_device_id
     existing_tunnel_id=$(get_env_value "TUNNEL_ID")
@@ -1267,10 +1466,11 @@ setup_agent_service_env() {
 # Agent Service Environment Configuration
 # Generated: $(date)
 
-PORT=3000
+PORT=$agent_port
 UNIFY_KEY=$UNIFY_KEY
 ORCHESTRA_URL=$ORCHESTRA_URL
 UNITY_COMMS_URL=$UNITY_COMMS_URL
+SELF_HOST=$($SELF_HOST_MODE && echo 1 || echo 0)
 PLAYWRIGHT_BROWSERS_PATH=$INSTALL_DIR/browsers
 
 # Tunnel & Device (managed by setup/registration)
@@ -1351,6 +1551,21 @@ setup_autostart() {
                 echo "  Tunnel agent will load at next login"
             fi
         fi
+
+        for svc_label in com.unify.websockify com.unify.agent; do
+            local svc_template="$INSTALL_DIR/launchd/${svc_label}.plist"
+            local svc_plist="$target_dir/${svc_label}.plist"
+            if [[ -f "$svc_template" ]]; then
+                sed \
+                    -e "s|%INSTALL_DIR%|$INSTALL_DIR|g" \
+                    -e "s|%LOG_DIR%|$LOG_DIR|g" \
+                    "$svc_template" > "$svc_plist"
+                chmod +x "$INSTALL_DIR/tools/run-websockify.sh" "$INSTALL_DIR/tools/run-agent-service.sh" 2>/dev/null || true
+                bootstrap_launch_agent "$svc_label" "$svc_plist" && \
+                    echo "  ${svc_label} agent loaded (will restart on crash and at login)" || \
+                    echo "  ${svc_label} agent will load at next login"
+            fi
+        done
     else
         echo "  Skipping launchctl load (running as root) — agents load at next user login"
     fi
@@ -1394,10 +1609,12 @@ start_all_services() {
         echo "  Screen Sharing already running on port 5900"
     fi
 
+    # Prefer launchd for websockify + agent when plists are installed.
+    if start_launchd_host_services; then
+        echo "  Host service agents started via launchd"
+    fi
+
     # Start websockify (only if not already running on 6080).
-    # Use the pinned interpreter ($PYTHON_BIN) — a bare `python3` here can resolve
-    # to a different interpreter than the one websockify was installed into. If the
-    # pinned one is somehow missing the module, self-heal by installing it.
     if ! test_port_listening 6080; then
         if ! "$PYTHON_BIN" -c 'import websockify' 2>/dev/null; then
             echo "  websockify module missing for $PYTHON_BIN — installing..."
@@ -1412,16 +1629,18 @@ start_all_services() {
         echo "  websockify already running on port 6080"
     fi
 
-    # Start Agent Service (only if not already running on 3000)
-    if ! test_port_listening 3000; then
-        echo "  Starting Agent Service..."
+    # Start Agent Service (only if not already running on configured PORT).
+    local agent_port
+    agent_port="$(agent_service_port)"
+    if ! test_port_listening "$agent_port"; then
+        echo "  Starting Agent Service on port ${agent_port}..."
         (
             cd "$AGENT_SERVICE_DIR"
             export PLAYWRIGHT_BROWSERS_PATH="$INSTALL_DIR/browsers"
             nohup npx -y ts-node src/index.ts > "$LOG_DIR/agent.log" 2>&1 &
         )
     else
-        echo "  Agent Service already running on port 3000"
+        echo "  Agent Service already running on port ${agent_port}"
     fi
 
     # Poll for services to come up (up to 20 seconds)
@@ -1437,7 +1656,7 @@ start_all_services() {
         local vnc_up=false ws_up=false agent_up=false
         test_port_listening 5900 && vnc_up=true
         test_port_listening 6080 && ws_up=true
-        test_port_listening 3000 && agent_up=true
+        test_port_listening "$agent_port" && agent_up=true
 
         if $vnc_up && $ws_up && $agent_up; then break; fi
 
@@ -1472,10 +1691,10 @@ start_all_services() {
         fi
     fi
 
-    if test_port_listening 3000; then
-        echo "  [OK] Agent Service (port 3000)"
+    if test_port_listening "$agent_port"; then
+        echo "  [OK] Agent Service (port ${agent_port})"
     else
-        echo "  [FAIL] Agent Service (port 3000)"
+        echo "  [FAIL] Agent Service (port ${agent_port})"
         all_ok=false
         if [[ -f "$LOG_DIR/agent.log" ]]; then
             echo "  Log ($LOG_DIR/agent.log):"
@@ -1488,10 +1707,10 @@ start_all_services() {
         echo "  Some services failed to start. Check the log files above for details."
     fi
 
-    # The tunnel is independent of the local services (it just forwards port
-    # 3000 to the agent). launchd owns its lifecycle, so we start it
-    # unconditionally rather than gating on VNC/websockify/agent being up.
-    start_tunnel
+    # The tunnel forwards the agent port to the cloud; skip it in self-host mode.
+    if ! $SELF_HOST_MODE && [[ "$(get_env_value "SELF_HOST")" != "1" ]]; then
+        start_tunnel
+    fi
 }
 
 # =============================================================================
@@ -1510,20 +1729,33 @@ show_summary() {
     echo ""
     echo "Local URLs:"
 
-    local vnc_url="http://localhost:6080/custom.html"
-    if [[ -n "$UNIFY_KEY" ]]; then
-        vnc_url="${vnc_url}?password=${UNIFY_KEY:0:8}"
+    local agent_port
+    agent_port="$(agent_service_port)"
+
+    local vnc_url="http://localhost:6080/"
+    if $SELF_HOST_MODE || [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+        vnc_url="${vnc_url}vnc.html"
+        if [[ -n "$UNIFY_KEY" ]]; then
+            vnc_url="${vnc_url}?password=${UNIFY_KEY:0:8}&autoconnect=1&resize=scale"
+        else
+            vnc_url="${vnc_url}?autoconnect=1&resize=scale"
+        fi
+    else
+        vnc_url="${vnc_url}custom.html"
+        if [[ -n "$UNIFY_KEY" ]]; then
+            vnc_url="${vnc_url}?password=${UNIFY_KEY:0:8}"
+        fi
     fi
 
     echo "  Desktop:       $vnc_url"
-    echo "  Agent Service: http://localhost:3000"
+    echo "  Agent Service: http://localhost:${agent_port}"
 
     local tunnel_url tunnel_id device_id
     tunnel_url=$(get_env_value "TUNNEL_URL")
     tunnel_id=$(get_env_value "TUNNEL_ID")
     device_id=$(get_env_value "DEVICE_ID")
 
-    if [[ -n "$tunnel_url" ]]; then
+    if [[ -n "$tunnel_url" ]] && ! $SELF_HOST_MODE && [[ "$(get_env_value "SELF_HOST")" != "1" ]]; then
         echo ""
         echo "Public Access:"
         echo "  Tunnel URL:  $tunnel_url"
@@ -1579,6 +1811,13 @@ if $RECONFIGURE; then
     existing_comms="$(get_env_value "UNITY_COMMS_URL")"
     [[ -n "$existing_orch" ]]  && ORCHESTRA_URL="$existing_orch"
     [[ -n "$existing_comms" ]] && UNITY_COMMS_URL="$existing_comms"
+    if [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+        SELF_HOST_MODE=true
+    fi
+    if $SELF_HOST_MODE; then
+        ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
+        LINK_COORDINATOR=true
+    fi
 
     # Rewrite .env with the new key (preserves TUNNEL_*/DEVICE_ID and URLs).
     setup_agent_service_env
@@ -1589,10 +1828,15 @@ if $RECONFIGURE; then
     mkdir -p "$LOG_DIR"
 
     # Re-register tunnel + desktop with the new key.
-    register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" 3000 "$DEVICE_NAME" || true
-    tunnel_url=$(get_env_value "TUNNEL_URL")
-    if [[ -n "$tunnel_url" ]]; then
-        register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
+    if $SELF_HOST_MODE; then
+        ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
+        register_self_host_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" || true
+    else
+        register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" 3000 "$DEVICE_NAME" || true
+        tunnel_url=$(get_env_value "TUNNEL_URL")
+        if [[ -n "$tunnel_url" ]]; then
+            register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
+        fi
     fi
 
     start_all_services
@@ -1696,18 +1940,25 @@ else
 fi
 
 # Always run configuration
+if $SELF_HOST_MODE; then
+    ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
+    LINK_COORDINATOR=true
+fi
 setup_agent_service_env
 setup_autostart
 
 # Create log directory
 mkdir -p "$LOG_DIR"
 
-# Register tunnel and desktop (always, so config is ready for --start)
-register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" 3000 "$DEVICE_NAME" || true
-
-tunnel_url=$(get_env_value "TUNNEL_URL")
-if [[ -n "$tunnel_url" ]]; then
-    register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
+# Register desktop for Unity control.
+if $SELF_HOST_MODE; then
+    register_self_host_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" || true
+else
+    register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" 3000 "$DEVICE_NAME" || true
+    tunnel_url=$(get_env_value "TUNNEL_URL")
+    if [[ -n "$tunnel_url" ]]; then
+        register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
+    fi
 fi
 
 # Start services (unless --no-start, e.g. when called from .pkg postinstall)
