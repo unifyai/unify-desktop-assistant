@@ -51,12 +51,17 @@ VNC_PORT = 5900
 NOVNC_PORT = 6080
 
 
+def compose_self_host_present() -> bool:
+    """True when a Unity Docker compose self-host install exists."""
+    return (Path.home() / ".unity" / "docker-compose.yml").exists()
+
+
 def agent_port() -> int:
-    """Agent-service listen port (13000 in compose self-host, 3000 otherwise)."""
+    """Agent-service listen port from .env (13000 self-host, 3000 cloud SaaS)."""
     raw = get_env_value("PORT")
     if raw.isdigit():
         return int(raw)
-    return 13000 if (Path.home() / ".unity" / "docker-compose.yml").exists() else 3000
+    return 13000 if compose_self_host_present() else 3000
 
 STATUS_INTERVAL = 5  # seconds
 
@@ -448,12 +453,6 @@ class UnifyTrayApp(rumps.App):
             return
 
         set_env_value("UNIFY_KEY", key)
-        self_host = (Path.home() / ".unity" / "docker-compose.yml").exists()
-        if self_host:
-            set_env_value("PORT", "13000")
-            set_env_value("SELF_HOST", "1")
-        else:
-            set_env_value("PORT", "3000")
 
         rumps.notification(
             APP_NAME, "Setting up",
@@ -461,10 +460,11 @@ class UnifyTrayApp(rumps.App):
         )
 
         def worker():
-            cmd = ["bash", str(SETUP_SCRIPT), "--reconfigure", "--unify-key", key]
-            if self_host:
-                cmd.extend(["--self-host", "--link-coordinator"])
-            subprocess.run(cmd, capture_output=True)
+            # setup.sh auto-detects ~/.unity compose self-host on --reconfigure.
+            subprocess.run(
+                ["bash", str(SETUP_SCRIPT), "--reconfigure", "--unify-key", key],
+                capture_output=True,
+            )
             rumps.notification(
                 APP_NAME, "Ready", "Unify Desktop Assistant is set up.",
             )
