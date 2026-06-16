@@ -1427,7 +1427,15 @@ function Configure-Firewall {
 function Start-AllServices {
     Write-Host ""
     Write-Host "=== Starting Services ===" -ForegroundColor Cyan
-    
+
+    # Refresh PATH from the registry so Node/npx resolve here. When this runs
+    # from a long-lived process with a stale PATH (e.g. the tray app invoking
+    # -Reconfigure/-Start before its environment knew about Node), the agent's
+    # `cmd /c ... npx ...` child would otherwise fail with "npx is not
+    # recognized". Full installs refresh PATH during Install-NodeJS/Bun; the
+    # reconfigure/start paths skip that, so do it here for all entry points.
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+
     # Start TightVNC (only if not already running)
     $tvnExe = 'C:\Program Files\TightVNC\tvnserver.exe'
     if ((Test-Path $tvnExe) -and -not (Test-PortListening -Port 5900)) {
