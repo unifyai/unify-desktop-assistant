@@ -1816,6 +1816,7 @@ if $RECONFIGURE; then
     fi
     if $SELF_HOST_MODE; then
         ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
+        UNITY_COMMS_URL="${UNITY_COMMS_URL:-http://127.0.0.1:8001}"
         LINK_COORDINATOR=true
     fi
 
@@ -1942,6 +1943,7 @@ fi
 # Always run configuration
 if $SELF_HOST_MODE; then
     ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
+    UNITY_COMMS_URL="${UNITY_COMMS_URL:-http://127.0.0.1:8001}"
     LINK_COORDINATOR=true
 fi
 setup_agent_service_env
