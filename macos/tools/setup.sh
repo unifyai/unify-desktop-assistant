@@ -15,11 +15,11 @@
 # Services started:
 #   - Apple Screen Sharing / VNC (port 5900)
 #   - websockify + noVNC (port 6080)
-#   - Agent Service (port 3000)
+#   - Agent Service (port 3000 cloud SaaS, 13000 when ~/.unity compose self-host)
 #
 # Access URLs:
 #   - Desktop: http://localhost:6080/custom.html (sign in with macOS account)
-#   - Agent API: http://localhost:3000
+#   - Agent API: http://localhost:3000 (or :13000 for Unity Docker self-host)
 
 set -euo pipefail
 
@@ -55,6 +55,8 @@ SELF_HOST_MODE=false
 LINK_COORDINATOR=false
 COORDINATOR_AGENT_ID=""
 SELF_HOST_AGENT_PORT=13000
+COMPOSE_SELF_HOST_ORCHESTRA_URL="http://127.0.0.1:8000/v0"
+COMPOSE_SELF_HOST_COMMS_URL="http://127.0.0.1:8001"
 
 # =============================================================================
 # Argument Parsing
@@ -376,6 +378,24 @@ set_env_value() {
     else
         echo "${key}=${value}" >> "$env_file"
     fi
+}
+
+# =============================================================================
+# Unity Docker Compose self-host (local ~/.unity stack)
+# =============================================================================
+
+compose_self_host_present() {
+    [[ -f "${HOME}/.unity/docker-compose.yml" ]]
+}
+
+apply_compose_self_host_mode() {
+    if ! compose_self_host_present; then
+        return 0
+    fi
+    SELF_HOST_MODE=true
+    ORCHESTRA_URL="$COMPOSE_SELF_HOST_ORCHESTRA_URL"
+    UNITY_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
+    LINK_COORDINATOR=true
 }
 
 # =============================================================================
@@ -1296,7 +1316,7 @@ agent_service_port() {
             return 0
         fi
     fi
-    if $SELF_HOST_MODE; then
+    if $SELF_HOST_MODE || [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
         echo "$SELF_HOST_AGENT_PORT"
     else
         echo "3000"
@@ -1845,20 +1865,20 @@ if $RECONFIGURE; then
         exit 1
     fi
 
-    # Settings only changes the API key — preserve the URLs baked at install.
-    # Otherwise setup_agent_service_env would overwrite them with setup.sh's
-    # hardcoded production defaults, breaking a staging/custom install.
-    existing_orch="$(get_env_value "ORCHESTRA_URL")"
-    existing_comms="$(get_env_value "UNITY_COMMS_URL")"
-    [[ -n "$existing_orch" ]]  && ORCHESTRA_URL="$existing_orch"
-    [[ -n "$existing_comms" ]] && UNITY_COMMS_URL="$existing_comms"
-    if [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
-        SELF_HOST_MODE=true
-    fi
-    if $SELF_HOST_MODE; then
-        ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
-        UNITY_COMMS_URL="${UNITY_COMMS_URL:-http://127.0.0.1:8001}"
-        LINK_COORDINATOR=true
+    # Settings changes the API key. For cloud installs, preserve URLs baked at
+    # install so staging/custom Orchestra/Comms endpoints are not overwritten.
+    apply_compose_self_host_mode
+    if ! compose_self_host_present; then
+        existing_orch="$(get_env_value "ORCHESTRA_URL")"
+        existing_comms="$(get_env_value "UNITY_COMMS_URL")"
+        [[ -n "$existing_orch" ]]  && ORCHESTRA_URL="$existing_orch"
+        [[ -n "$existing_comms" ]] && UNITY_COMMS_URL="$existing_comms"
+        if [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+            SELF_HOST_MODE=true
+            ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
+            UNITY_COMMS_URL="${UNITY_COMMS_URL:-http://127.0.0.1:8001}"
+            LINK_COORDINATOR=true
+        fi
     fi
 
     # Rewrite .env with the new key (preserves TUNNEL_*/DEVICE_ID and URLs).
@@ -1982,6 +2002,7 @@ else
 fi
 
 # Always run configuration
+apply_compose_self_host_mode
 if $SELF_HOST_MODE; then
     ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
     UNITY_COMMS_URL="${UNITY_COMMS_URL:-http://127.0.0.1:8001}"
