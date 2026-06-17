@@ -73,7 +73,20 @@ STATUS_COLORS = {
 
 VNC_PORT = 5900
 NOVNC_PORT = 6080
-AGENT_PORT = 3000
+
+
+def compose_self_host_present() -> bool:
+    """True when a Unity Docker compose self-host install exists."""
+    return (Path.home() / ".unity" / "docker-compose.yml").exists()
+
+
+def agent_port() -> int:
+    """Agent-service listen port from .env (13000 self-host, 3000 cloud SaaS)."""
+    raw = get_env_value("PORT")
+    if raw.isdigit():
+        return int(raw)
+    return 13000 if compose_self_host_present() else 3000
+
 
 STATUS_INTERVAL_MS = 5000  # 5 seconds
 
@@ -109,7 +122,7 @@ def get_service_status() -> dict:
     """Get status of all services by checking ports."""
     vnc = test_port_listening(VNC_PORT)
     novnc = test_port_listening(NOVNC_PORT)
-    agent = test_port_listening(AGENT_PORT)
+    agent = test_port_listening(agent_port())
     tunnel = is_tunnel_running()
     return {
         "vnc": vnc,
@@ -461,7 +474,7 @@ class UnifyTrayApp:
 
     def _open_api(self, _widget):
         """Open the Agent API in the default browser."""
-        webbrowser.open(f"http://localhost:{AGENT_PORT}")
+        webbrowser.open(f"http://localhost:{agent_port()}")
 
     def _copy_public_url(self, _widget):
         """Copy the tunnel public URL to the clipboard."""
@@ -722,7 +735,6 @@ class SettingsDialog(Gtk.Dialog):
         set_env_value("UNIFY_KEY", self.txt_key.get_text())
         set_env_value("ORCHESTRA_URL", self.txt_url.get_text())
         set_env_value("UNITY_COMMS_URL", self.txt_comms.get_text())
-        set_env_value("PORT", "3000")
 
 
 # =============================================================================
