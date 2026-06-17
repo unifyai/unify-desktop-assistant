@@ -129,7 +129,7 @@ var
   UpgradeNote: TNewStaticText;
   ConfigPagePrefilled: Boolean;
 
-function Test-ComposeSelfHostPresent: Boolean;
+function TestComposeSelfHostPresent: Boolean;
 begin
   Result := FileExists(ExpandConstant('{userprofile}\.unity\docker-compose.yml'));
 end;
@@ -137,7 +137,7 @@ end;
 function GetSetupRunParams(Param: String): String;
 begin
   Result := '-UnifyKey "' + GetUnifyKey('') + '" -Force';
-  if Test-ComposeSelfHostPresent then
+  if TestComposeSelfHostPresent then
     Result := Result + ' -SelfHost -LinkCoordinator'
   else
     Result := Result + ' -OrchestraUrl "{#OrchestraUrl}" -UnityCommsUrl "{#CommsUrl}"';
@@ -331,7 +331,7 @@ begin
     ExistingTunnelToken := ReadEnvValue(EnvFile, 'TUNNEL_TOKEN');
     ExistingDeviceId := ReadEnvValue(EnvFile, 'DEVICE_ID');
 
-    if Test-ComposeSelfHostPresent then
+    if TestComposeSelfHostPresent then
     begin
       AgentPort := '13000';
       OrchestraUrl := 'http://127.0.0.1:8000/v0';
