@@ -45,6 +45,7 @@ RECONFIGURE=false
 FORCE=false
 SKIP_APT=false
 NO_START=false
+PREREQS_ONLY=false
 DEVICE_NAME=""
 SELF_HOST_MODE=false
 LINK_COORDINATOR=false
@@ -68,6 +69,7 @@ Options:
   --start               Start services only (no install/config, no root needed)
   --stop                Stop all services
   --uninstall           Stop services, remove systemd units & firewall rules
+  --prereqs-only        Install prerequisites only (no key required, no config/registration)
   --reconfigure         Re-apply key + re-register + restart services (no deps, no root)
   --self-host           Unity Docker self-host mode (local Orchestra, no tunnel, port ${SELF_HOST_AGENT_PORT})
   --link-coordinator    Link registered desktop to the Coordinator assistant (self-host)
@@ -109,6 +111,8 @@ while [[ $# -gt 0 ]]; do
             LINK_COORDINATOR=true; shift ;;
         --coordinator-agent-id)
             COORDINATOR_AGENT_ID="$2"; shift 2 ;;
+        --prereqs-only)
+            PREREQS_ONLY=true; shift ;;
         --skip-apt)
             SKIP_APT=true; shift ;;
         --no-start)
@@ -1615,6 +1619,42 @@ if $RECONFIGURE; then
     fi
 
     start_all_services
+    exit 0
+fi
+
+# Handle prereqs-only (install dependencies without requiring a key).
+# Used by the .deb postinst deferred phase so the tray launches and the user
+# can enter their key via the tray Settings dialog on first run.
+if $PREREQS_ONLY; then
+    echo ""
+    echo "Prerequisites-only mode"
+
+    if [[ "$EUID" -ne 0 ]]; then
+        echo "ERROR: Prerequisites install requires root. Run with sudo." >&2
+        exit 1
+    fi
+
+    install_system_deps
+    install_nodejs
+    install_bun
+    install_websockify
+    install_novnc
+    install_magnitude
+    install_agent_service
+    install_rathole
+
+    setup_systemd_services
+    setup_autostart
+    configure_firewall
+
+    # Fix ownership
+    target_user="${SUDO_USER:-$(logname 2>/dev/null || echo "")}"
+    if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+        chown -R "$target_user":"$(id -gn "$target_user")" "$INSTALL_DIR" 2>/dev/null || true
+    fi
+
+    echo ""
+    echo "Prerequisites installed. Open the tray icon to enter your API key and start services."
     exit 0
 fi
 

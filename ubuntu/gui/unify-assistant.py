@@ -250,10 +250,12 @@ class UnifyTrayApp:
         # Initial status
         self._update_status()
 
-        # Auto-start services if key is configured
+        # Auto-start services if key is configured; otherwise prompt on first run.
         key = get_env_value("UNIFY_KEY")
         if key:
             self._start_services(None)
+        else:
+            GLib.timeout_add(800, self._show_first_run_dialog)
 
     def _create_icon_files(self):
         """Create temporary icon files for AppIndicator (requires file paths).
@@ -529,6 +531,30 @@ class UnifyTrayApp:
             self._notify("Ready", "Unify Desktop Assistant is configured.")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_first_run_dialog(self) -> bool:
+        """Shown once on first launch when no API key is configured.
+
+        Explains where to get the key and opens the Settings dialog so the
+        user can paste it in immediately. Returns False so GLib does not
+        reschedule the timeout.
+        """
+        dialog = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="Welcome to Unify Desktop Assistant",
+        )
+        dialog.format_secondary_text(
+            "To get started, enter your Unify API key in Settings.\n\n"
+            "• Cloud users: find your key in the Unify Console under Settings → API Keys.\n"
+            "• Self-hosted users: register on your local Console (http://localhost:3000) "
+            "then copy your key from Settings → API Keys.\n\n"
+            "Click OK to open Settings now."
+        )
+        dialog.run()
+        dialog.destroy()
+        self._show_settings(None)
+        return False
 
     def _notify(self, title: str, body: str):
         """Best-effort desktop notification via notify-send (no hard dependency)."""
