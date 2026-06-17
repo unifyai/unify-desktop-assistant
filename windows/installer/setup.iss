@@ -136,7 +136,7 @@ end;
 
 function GetSetupRunParams(Param: String): String;
 begin
-  Result := '-UnifyKey "' + GetUnifyKey('') + '" -Force';
+  Result := '-UnifyKey "' + UnifyKeyEdit.Text + '" -Force';
   if TestComposeSelfHostPresent then
     Result := Result + ' -SelfHost -LinkCoordinator'
   else
