@@ -103,7 +103,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 ; Install all dependencies during setup (runs after .env is written by CurStepChanged)
-Filename: "cmd.exe"; Parameters: "/c powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" -UnifyKey ""{code:GetUnifyKey}"" -OrchestraUrl ""{#OrchestraUrl}"" -UnityCommsUrl ""{#CommsUrl}"" -Force"; StatusMsg: "Installing dependencies (this may take several minutes)..."; Flags: waituntilterminated
+Filename: "cmd.exe"; Parameters: "/c powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\setup.ps1"" {code:GetSetupRunParams}"; StatusMsg: "Installing dependencies (this may take several minutes)..."; Flags: waituntilterminated
 ; Launch tray app after install
 Filename: "wscript.exe"; Parameters: """{app}\{#AppExeName}"""; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runhidden
 
@@ -128,6 +128,20 @@ var
   UnifyKeyEdit: TNewEdit;
   UpgradeNote: TNewStaticText;
   ConfigPagePrefilled: Boolean;
+
+function Test-ComposeSelfHostPresent: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{userprofile}\.unity\docker-compose.yml'));
+end;
+
+function GetSetupRunParams(Param: String): String;
+begin
+  Result := '-UnifyKey "' + GetUnifyKey('') + '" -Force';
+  if Test-ComposeSelfHostPresent then
+    Result := Result + ' -SelfHost -LinkCoordinator'
+  else
+    Result := Result + ' -OrchestraUrl "{#OrchestraUrl}" -UnityCommsUrl "{#CommsUrl}"';
+end;
 
 // =========================================================================
 // Helper: Read a value from existing .env file
@@ -301,6 +315,10 @@ var
   ExistingTunnelUrl: String;
   ExistingTunnelToken: String;
   ExistingDeviceId: String;
+  AgentPort: String;
+  OrchestraUrl: String;
+  CommsUrl: String;
+  SelfHostFlag: String;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -313,12 +331,28 @@ begin
     ExistingTunnelToken := ReadEnvValue(EnvFile, 'TUNNEL_TOKEN');
     ExistingDeviceId := ReadEnvValue(EnvFile, 'DEVICE_ID');
 
+    if Test-ComposeSelfHostPresent then
+    begin
+      AgentPort := '13000';
+      OrchestraUrl := 'http://127.0.0.1:8000/v0';
+      CommsUrl := 'http://127.0.0.1:8001';
+      SelfHostFlag := '1';
+    end
+    else
+    begin
+      AgentPort := '3000';
+      OrchestraUrl := '{#OrchestraUrl}';
+      CommsUrl := '{#CommsUrl}';
+      SelfHostFlag := '0';
+    end;
+
     // Always write .env (fresh install or upgrade)
-    // URLs are baked in at build time via preprocessor defines
-    EnvContent := 'PORT=3000' + Chr(13) + Chr(10) +
+    EnvContent := 'PORT=' + AgentPort + Chr(13) + Chr(10) +
                   'UNIFY_KEY=' + UnifyKeyEdit.Text + Chr(13) + Chr(10) +
-                  'ORCHESTRA_URL={#OrchestraUrl}' + Chr(13) + Chr(10) +
-                  'UNITY_COMMS_URL={#CommsUrl}' + Chr(13) + Chr(10) +
+                  'ORCHESTRA_URL=' + OrchestraUrl + Chr(13) + Chr(10) +
+                  'UNITY_COMMS_URL=' + CommsUrl + Chr(13) + Chr(10) +
+                  'SELF_HOST=' + SelfHostFlag + Chr(13) + Chr(10) +
+                  'PLAYWRIGHT_BROWSERS_PATH=C:\ms-playwright' + Chr(13) + Chr(10) +
                   Chr(13) + Chr(10) +
                   'TUNNEL_ID=' + ExistingTunnelId + Chr(13) + Chr(10) +
                   'TUNNEL_URL=' + ExistingTunnelUrl + Chr(13) + Chr(10) +
