@@ -12,11 +12,11 @@
 # Services started:
 #   - TightVNC Server (port 5900)
 #   - websockify + noVNC (port 6080)
-#   - Agent Service (port 3000)
+#   - Agent Service (port 3000 cloud SaaS, 13000 when ~/.unity compose self-host)
 #
 # Access URLs:
 #   - Desktop: http://localhost:6080/custom.html?password=<vnc-password>
-#   - Agent API: http://localhost:3000
+#   - Agent API: http://localhost:3000 (or :13000 for Unity Docker self-host)
 
 param(
     [Parameter(Position = 0)]
@@ -30,11 +30,21 @@ param(
     [switch]$Stop,
     [switch]$Uninstall,
     [switch]$Reconfigure,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$SelfHost,
+    [switch]$LinkCoordinator,
+    [string]$CoordinatorAgentId
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$script:SelfHostMode = [bool]$SelfHost
+$script:LinkCoordinator = [bool]$LinkCoordinator
+$script:CoordinatorAgentId = $CoordinatorAgentId
+$script:SelfHostAgentPort = 13000
+$script:ComposeSelfHostOrchestraUrl = 'http://127.0.0.1:8000/v0'
+$script:ComposeSelfHostCommsUrl = 'http://127.0.0.1:8001'
 
 $script:StartTime = Get-Date
 $script:ToolsDir = $PSScriptRoot
@@ -276,7 +286,8 @@ function Stop-AllServices {
     }
     
     # Final sweep: kill any remaining processes by port (catches anything the above missed)
-    foreach ($port in @(5900, 6080, 3000)) {
+    $agentPort = Get-AgentServicePort
+    foreach ($port in @(5900, 6080, $agentPort)) {
         $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
         foreach ($conn in $conns) {
             Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
@@ -980,6 +991,165 @@ function Set-EnvValue {
     $newLines | Out-File -FilePath $envFile -Encoding UTF8
 }
 
+function Test-ComposeSelfHostPresent {
+    return Test-Path (Join-Path $env:USERPROFILE '.unity\docker-compose.yml')
+}
+
+function Apply-ComposeSelfHostMode {
+    if (-not (Test-ComposeSelfHostPresent)) {
+        return
+    }
+    $script:SelfHostMode = $true
+    Set-Variable -Name OrchestraUrl -Value $script:ComposeSelfHostOrchestraUrl -Scope Script
+    Set-Variable -Name UnityCommsUrl -Value $script:ComposeSelfHostCommsUrl -Scope Script
+    $script:LinkCoordinator = $true
+}
+
+function Explain-OrchestraConnectFailure {
+    param(
+        [string]$ActionDescription,
+        [string]$OrchestraUrl,
+        [string]$HttpCode = '000'
+    )
+
+    if ($HttpCode -and $HttpCode -ne '000') {
+        return $false
+    }
+
+    Write-Host "  ERROR: Could not connect to Orchestra at ${OrchestraUrl} while trying to ${ActionDescription}." -ForegroundColor Red
+    if ((Test-ComposeSelfHostPresent) -or ($OrchestraUrl -match '127\.0\.0\.1|localhost')) {
+        Write-Host "  Orchestra is not reachable on this machine — the Unity Docker stack is probably stopped." -ForegroundColor Yellow
+        Write-Host "  Start it first:" -ForegroundColor Yellow
+        Write-Host "    unity stack up" -ForegroundColor Yellow
+        Write-Host "  Wait until Orchestra responds on port 8000, then register again from tray Settings" -ForegroundColor Yellow
+        Write-Host "  (paste your API key) or run:" -ForegroundColor Yellow
+        Write-Host "    $($script:ToolsDir)\setup.ps1 -Reconfigure -UnifyKey YOUR_KEY" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Check that Orchestra is reachable from this machine and your network is connected." -ForegroundColor Yellow
+    }
+    return $true
+}
+
+function Get-AgentServicePort {
+    $port = Get-EnvValue -Key 'PORT'
+    if ($port -match '^\d+$') {
+        return [int]$port
+    }
+    if ($script:SelfHostMode -or (Get-EnvValue -Key 'SELF_HOST') -eq '1') {
+        return $script:SelfHostAgentPort
+    }
+    return 3000
+}
+
+function Get-SelfHostRegistrationUrl {
+    return "http://host.docker.internal:$(Get-AgentServicePort)"
+}
+
+function Resolve-CoordinatorAgentId {
+    param(
+        [string]$UnifyKey,
+        [string]$OrchestraUrl
+    )
+
+    if ($script:CoordinatorAgentId) {
+        return $script:CoordinatorAgentId
+    }
+
+    $runtimeFile = Join-Path $env:USERPROFILE '.unity\coordinator-runtime.json'
+    if (Test-Path $runtimeFile) {
+        try {
+            $runtime = Get-Content $runtimeFile -Raw | ConvertFrom-Json
+            $fromFile = $runtime.coordinatorAgentId
+            if (-not $fromFile) { $fromFile = $runtime.coordinator_agent_id }
+            if ($fromFile) { return "$fromFile" }
+        } catch {}
+    }
+
+    $headers = @{ Authorization = "Bearer $UnifyKey" }
+    try {
+        $resp = Invoke-RestMethod -Method GET `
+            -Uri "$($OrchestraUrl.TrimEnd('/'))/assistant" `
+            -Headers $headers `
+            -ErrorAction Stop
+        $items = if ($resp.info) { $resp.info } else { $resp }
+        foreach ($item in $items) {
+            if ($item.is_coordinator) {
+                return "$($item.agent_id)"
+            }
+        }
+    } catch {}
+    return $null
+}
+
+function Link-DesktopToCoordinator {
+    param(
+        [string]$UnifyKey,
+        [string]$OrchestraUrl,
+        [string]$DesktopId,
+        [string]$CoordinatorId
+    )
+
+    Write-Host ""
+    Write-Host "=== Linking Desktop to Coordinator ===" -ForegroundColor Cyan
+
+    $headers = @{
+        Authorization = "Bearer $UnifyKey"
+        'Content-Type' = 'application/json'
+    }
+    $body = @{
+        assistant_id = [int]$CoordinatorId
+        desktop_id = [int]$DesktopId
+        filesys_sync = $false
+    } | ConvertTo-Json -Compress
+
+    try {
+        Invoke-RestMethod -Method POST `
+            -Uri "$($OrchestraUrl.TrimEnd('/'))/desktop/link" `
+            -Headers $headers `
+            -Body $body `
+            -ErrorAction Stop | Out-Null
+    } catch {
+        if (Explain-OrchestraConnectFailure -ActionDescription 'link this desktop to the Coordinator' -OrchestraUrl $OrchestraUrl) {
+            return
+        }
+        Write-Host "  ERROR: Desktop link failed: $_" -ForegroundColor Red
+        return
+    }
+
+    Write-Host "  Linked desktop ${DesktopId} to Coordinator assistant ${CoordinatorId}" -ForegroundColor Green
+}
+
+function Register-SelfHostDesktop {
+    param(
+        [string]$UnifyKey,
+        [string]$OrchestraUrl,
+        [string]$DeviceName
+    )
+
+    $regUrl = Get-SelfHostRegistrationUrl
+
+    Write-Host ""
+    Write-Host "=== Self-Host Desktop Registration ===" -ForegroundColor Cyan
+    Write-Host "  Orchestra: $OrchestraUrl" -ForegroundColor Gray
+    Write-Host "  Agent URL for Unity CM: $regUrl" -ForegroundColor Gray
+
+    Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $regUrl
+
+    if ($script:LinkCoordinator) {
+        $desktopId = Get-EnvValue -Key 'DEVICE_ID'
+        $coordinatorId = Resolve-CoordinatorAgentId -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl
+        if (-not $desktopId -or -not $coordinatorId) {
+            Write-Host "  WARNING: Could not link desktop — missing device or coordinator id" -ForegroundColor Yellow
+            return
+        }
+        Link-DesktopToCoordinator -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl `
+            -DesktopId $desktopId -CoordinatorId $coordinatorId
+        Write-Host ""
+        Write-Host "  Restart the Unity stack so CM reloads linked desktops:" -ForegroundColor Yellow
+        Write-Host "    unity restart" -ForegroundColor Yellow
+    }
+}
+
 function Register-Tunnel {
     param(
         [string]$UnifyKey,
@@ -1166,14 +1336,18 @@ function Register-Desktop {
                     -ErrorAction Stop | Out-Null
                 Write-Host "  URL updated" -ForegroundColor Green
             } catch {
-                Write-Host "  WARNING: Could not update desktop URL: $_" -ForegroundColor Yellow
+                if (Explain-OrchestraConnectFailure -ActionDescription 'update the desktop URL' -OrchestraUrl $OrchestraUrl) {
+                    Write-Host "  WARNING: Could not update desktop URL (Orchestra unreachable)" -ForegroundColor Yellow
+                } else {
+                    Write-Host "  WARNING: Could not update desktop URL: $_" -ForegroundColor Yellow
+                }
             }
         }
         return
     }
     
     if (-not $TunnelUrl) {
-        Write-Host "  ERROR: No tunnel URL available for desktop registration" -ForegroundColor Red
+        Write-Host "  ERROR: No desktop URL available for registration" -ForegroundColor Red
         return
     }
     
@@ -1198,6 +1372,9 @@ function Register-Desktop {
             -Body $body `
             -ErrorAction Stop
     } catch {
+        if (Explain-OrchestraConnectFailure -ActionDescription 'register this desktop' -OrchestraUrl $OrchestraUrl) {
+            return
+        }
         Write-Host "  ERROR: Desktop registration failed: $_" -ForegroundColor Red
         return
     }
@@ -1256,15 +1433,18 @@ function Setup-AgentServiceEnv {
     $existingTunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
     $existingTunnelToken = Get-EnvValue -Key "TUNNEL_TOKEN"
     $existingDeviceId = Get-EnvValue -Key "DEVICE_ID"
+    $agentPort = Get-AgentServicePort
+    $selfHostFlag = if ($script:SelfHostMode) { '1' } else { '0' }
     
     $envContent = @"
 # Agent Service Environment Configuration
 # Generated: $(Get-Date)
 
-PORT=3000
+PORT=$agentPort
 UNIFY_KEY=$UnifyKey
 ORCHESTRA_URL=$OrchestraUrl
 UNITY_COMMS_URL=$UnityCommsUrl
+SELF_HOST=$selfHostFlag
 PLAYWRIGHT_BROWSERS_PATH=C:\ms-playwright
 
 # Tunnel & Device (managed by setup/registration)
@@ -1404,9 +1584,10 @@ function Configure-Firewall {
     Write-Host ""
     Write-Host "=== Configuring Firewall ===" -ForegroundColor Cyan
     
+    $agentPort = Get-AgentServicePort
     $rules = @(
         @{ Name = 'Unify-noVNC'; Port = 6080; Description = 'noVNC WebSocket' },
-        @{ Name = 'Unify-AgentService'; Port = 3000; Description = 'Agent Service API' }
+        @{ Name = 'Unify-AgentService'; Port = $agentPort; Description = 'Agent Service API' }
     )
     
     foreach ($rule in $rules) {
@@ -1427,6 +1608,8 @@ function Configure-Firewall {
 function Start-AllServices {
     Write-Host ""
     Write-Host "=== Starting Services ===" -ForegroundColor Cyan
+
+    $agentPort = Get-AgentServicePort
 
     # Refresh PATH from the registry so Node/npx resolve here. When this runs
     # from a long-lived process with a stale PATH (e.g. the tray app invoking
@@ -1467,8 +1650,8 @@ function Start-AllServices {
     
     # Start Agent Service directly via cmd.exe with log redirection
     $agentLog = Join-Path $script:AgentServiceDir 'agent.log'
-    if (-not (Test-PortListening -Port 3000)) {
-        Write-Host "  Starting Agent Service..." -ForegroundColor Gray
+    if (-not (Test-PortListening -Port $agentPort)) {
+        Write-Host "  Starting Agent Service on port ${agentPort}..." -ForegroundColor Gray
         Start-Process cmd.exe -ArgumentList "/c cd /d `"$($script:AgentServiceDir)`" & npx -y ts-node src/index.ts > `"$agentLog`" 2>&1" -WindowStyle Hidden
     }
     
@@ -1484,7 +1667,7 @@ function Start-AllServices {
         
         $vncUp = Test-PortListening -Port 5900
         $wsUp = Test-PortListening -Port 6080
-        $agentUp = Test-PortListening -Port 3000
+        $agentUp = Test-PortListening -Port $agentPort
         
         if ($vncUp -and $wsUp -and $agentUp) { break }
         
@@ -1520,10 +1703,10 @@ function Start-AllServices {
         }
     }
     
-    if (Test-PortListening -Port 3000) {
-        Write-Host "  [OK] Agent Service (port 3000)" -ForegroundColor Green
+    if (Test-PortListening -Port $agentPort) {
+        Write-Host "  [OK] Agent Service (port ${agentPort})" -ForegroundColor Green
     } else {
-        Write-Host "  [FAIL] Agent Service (port 3000)" -ForegroundColor Red
+        Write-Host "  [FAIL] Agent Service (port ${agentPort})" -ForegroundColor Red
         $allOk = $false
         if (Test-Path $agentLog) {
             Write-Host "  Log ($agentLog):" -ForegroundColor Gray
@@ -1536,8 +1719,8 @@ function Start-AllServices {
         Write-Host "  Some services failed to start. Check the log files above for details." -ForegroundColor Yellow
     }
     
-    # Start tunnel after local services are confirmed up
-    if ($allOk) {
+    # The tunnel forwards the agent port to the cloud; skip it in self-host mode.
+    if ($allOk -and -not $script:SelfHostMode -and (Get-EnvValue -Key 'SELF_HOST') -ne '1') {
         Start-Tunnel
     }
 }
@@ -1558,20 +1741,21 @@ function Show-Summary {
     Write-Host ""
     Write-Host "Local URLs:" -ForegroundColor Cyan
     
+    $agentPort = Get-AgentServicePort
     $vncUrl = "http://localhost:6080/custom.html"
     if ($UnifyKey) {
         $vncUrl += "?password=$UnifyKey"
     }
     
     Write-Host "  Desktop:       $vncUrl" -ForegroundColor Green
-    Write-Host "  Agent Service: http://localhost:3000" -ForegroundColor Green
+    Write-Host "  Agent Service: http://localhost:${agentPort}" -ForegroundColor Green
     
     # Tunnel & Device info
     $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
     $tunnelId = Get-EnvValue -Key "TUNNEL_ID"
     $deviceId = Get-EnvValue -Key "DEVICE_ID"
     
-    if ($tunnelUrl) {
+    if ($tunnelUrl -and -not $script:SelfHostMode -and (Get-EnvValue -Key 'SELF_HOST') -ne '1') {
         Write-Host ""
         Write-Host "Public Access:" -ForegroundColor Cyan
         Write-Host "  Tunnel URL:  $tunnelUrl" -ForegroundColor Green
@@ -1628,10 +1812,19 @@ if ($Reconfigure) {
     # Settings only changes the API key — preserve the URLs baked at install,
     # otherwise Setup-AgentServiceEnv would reset them to the script defaults
     # and break a staging/custom install.
-    $existingOrch = Get-EnvValue -Key "ORCHESTRA_URL"
-    $existingComms = Get-EnvValue -Key "UNITY_COMMS_URL"
-    if ($existingOrch) { $OrchestraUrl = $existingOrch }
-    if ($existingComms) { $UnityCommsUrl = $existingComms }
+    Apply-ComposeSelfHostMode
+    if (-not (Test-ComposeSelfHostPresent)) {
+        $existingOrch = Get-EnvValue -Key "ORCHESTRA_URL"
+        $existingComms = Get-EnvValue -Key "UNITY_COMMS_URL"
+        if ($existingOrch) { $OrchestraUrl = $existingOrch }
+        if ($existingComms) { $UnityCommsUrl = $existingComms }
+        if ((Get-EnvValue -Key 'SELF_HOST') -eq '1') {
+            $script:SelfHostMode = $true
+            if (-not $existingOrch) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
+            if (-not $existingComms) { $UnityCommsUrl = $script:ComposeSelfHostCommsUrl }
+            $script:LinkCoordinator = $true
+        }
+    }
 
     # Rewrite .env (preserves TUNNEL_*/DEVICE_ID) and re-apply the VNC password
     # so the TightVNC server matches the new key (noVNC sends the key as the
@@ -1643,12 +1836,15 @@ if ($Reconfigure) {
     # process start).
     Stop-AllServices
 
-    # Re-register tunnel + desktop with the new key (Register-Tunnel no-ops when
-    # a tunnel is already registered; Register-Desktop PATCHes the existing URL).
-    Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl -LocalPort 3000 -TunnelName $DeviceName
-    $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
-    if ($tunnelUrl) {
-        Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $tunnelUrl
+    if ($script:SelfHostMode) {
+        if (-not $OrchestraUrl) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
+        Register-SelfHostDesktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName
+    } else {
+        Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
+        $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
+        if ($tunnelUrl) {
+            Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $tunnelUrl
+        }
     }
 
     Start-AllServices
@@ -1702,6 +1898,12 @@ try {
     }
 
     # Always run configuration
+    Apply-ComposeSelfHostMode
+    if ($script:SelfHostMode) {
+        if (-not $OrchestraUrl) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
+        if (-not $UnityCommsUrl) { $UnityCommsUrl = $script:ComposeSelfHostCommsUrl }
+        $script:LinkCoordinator = $true
+    }
     Configure-TightVNC -Password $UnifyKey
     Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
     Setup-TightVNCStartup
@@ -1712,14 +1914,17 @@ try {
     # Start services (includes tunnel start after local services are up)
     Start-AllServices
 
-    # Register tunnel and desktop (final step after everything is running)
-    Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl -LocalPort 3000 -TunnelName $DeviceName
-    
-    $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
-    if ($tunnelUrl) {
-        # Ensure tunnel is running with the freshly-written config
-        Start-Tunnel
-        Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $tunnelUrl
+    if ($script:SelfHostMode) {
+        Register-SelfHostDesktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName
+    } else {
+        Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
+        
+        $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
+        if ($tunnelUrl) {
+            # Ensure tunnel is running with the freshly-written config
+            Start-Tunnel
+            Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $tunnelUrl
+        }
     }
 
     # Show summary
