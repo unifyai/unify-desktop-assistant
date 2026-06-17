@@ -28,7 +28,6 @@ $script:IconPath = Join-Path $script:InstallDir 'assets\icon.ico'
 # Service ports
 $script:VncPort = 5900
 $script:NoVncPort = 6080
-$script:AgentPort = 3000
 
 # Status check interval (ms)
 $script:StatusInterval = 5000
@@ -48,7 +47,7 @@ function Get-ServiceStatus {
 
     $vnc = $listeningPorts -contains $script:VncPort
     $novnc = $listeningPorts -contains $script:NoVncPort
-    $agent = $listeningPorts -contains $script:AgentPort
+    $agent = $listeningPorts -contains (Get-AgentPort)
     
     # Check if rathole tunnel is running
     $tunnel = $false
@@ -94,6 +93,21 @@ function Get-EnvValue {
         }
     }
     return ""
+}
+
+function Test-ComposeSelfHostPresent {
+    return Test-Path (Join-Path $env:USERPROFILE '.unity\docker-compose.yml')
+}
+
+function Get-AgentPort {
+    $raw = Get-EnvValue -Key 'PORT'
+    if ($raw -match '^\d+$') {
+        return [int]$raw
+    }
+    if (Test-ComposeSelfHostPresent) {
+        return 13000
+    }
+    return 3000
 }
 
 function Set-EnvValue {
