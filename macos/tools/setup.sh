@@ -1116,6 +1116,72 @@ install_rathole() {
     fi
 }
 
+# Check whether a previously-registered backend resource still exists, so a
+# resource deleted outside the app (e.g. in the console) can be safely
+# re-created. Echo one of: present | missing | unknown.
+#   present  -> still exists; keep the local id
+#   missing  -> backend definitively reports it gone; safe to re-register
+#   unknown  -> could not verify (offline / 5xx / bad key); KEEP the id so a
+#               transient failure never wipes a good registration
+#
+# Desktop: GET /desktop lists this key's desktops; 200 + id absent = missing.
+desktop_exists() {
+    local unify_key=$1
+    local orchestra_url=$2
+    local device_id=$3
+
+    command -v python3 >/dev/null 2>&1 || { echo "unknown"; return; }
+
+    local resp_file="/tmp/unify_desktop_list.json"
+    local http_code
+    http_code=$(curl -sS --connect-timeout 5 --max-time 15 -o "$resp_file" -w "%{http_code}" \
+        -H "Authorization: Bearer ${unify_key}" \
+        "${orchestra_url%/}/desktop" 2>/dev/null || true)
+
+    if [[ "$http_code" != "200" ]]; then
+        rm -f "$resp_file"
+        echo "unknown"
+        return
+    fi
+
+    local result
+    result=$(DEVICE_ID="$device_id" python3 - "$resp_file" <<'PY' 2>/dev/null || true
+import json, os, sys
+device_id = str(os.environ.get("DEVICE_ID", ""))
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+    items = data.get("info", []) if isinstance(data, dict) else []
+    print("present" if any(str(d.get("id")) == device_id for d in items) else "missing")
+except Exception:
+    print("unknown")
+PY
+)
+    rm -f "$resp_file"
+    case "$result" in
+        present|missing) echo "$result" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+# Tunnel: GET /infra/tunnel/{id}; 200 = present, 404 = missing, else unknown.
+tunnel_exists() {
+    local unify_key=$1
+    local comms_url=$2
+    local tunnel_id=$3
+
+    local http_code
+    http_code=$(curl -sS --connect-timeout 5 --max-time 15 -o /dev/null -w "%{http_code}" \
+        -H "Authorization: Bearer ${unify_key}" \
+        "${comms_url%/}/infra/tunnel/${tunnel_id}" 2>/dev/null || true)
+
+    case "$http_code" in
+        200) echo "present" ;;
+        404) echo "missing" ;;
+        *)   echo "unknown" ;;
+    esac
+}
+
 register_tunnel() {
     local unify_key=$1
     local comms_url=$2
@@ -1128,11 +1194,23 @@ register_tunnel() {
     local existing_id
     existing_id=$(get_env_value "TUNNEL_ID")
     if [[ -n "$existing_id" ]]; then
-        echo "  Tunnel already registered: $existing_id"
-        local existing_url
-        existing_url=$(get_env_value "TUNNEL_URL")
-        [[ -n "$existing_url" ]] && echo "  URL: $existing_url"
-        return
+        local status
+        status=$(tunnel_exists "$unify_key" "$comms_url" "$existing_id")
+        if [[ "$status" == "missing" ]]; then
+            echo "  Tunnel $existing_id no longer exists on server — re-registering"
+            set_env_value "TUNNEL_ID" ""
+            set_env_value "TUNNEL_URL" ""
+            set_env_value "TUNNEL_TOKEN" ""
+            rm -f "$RATHOLE_CONFIG"
+            # fall through to fresh registration below
+        else
+            echo "  Tunnel already registered: $existing_id"
+            [[ "$status" == "unknown" ]] && echo "  (could not verify with server; keeping existing registration)"
+            local existing_url
+            existing_url=$(get_env_value "TUNNEL_URL")
+            [[ -n "$existing_url" ]] && echo "  URL: $existing_url"
+            return
+        fi
     fi
 
     local body="{\"local_port\": ${local_port}}"
@@ -1273,27 +1351,36 @@ register_desktop() {
     local existing_id
     existing_id=$(get_env_value "DEVICE_ID")
     if [[ -n "$existing_id" ]]; then
-        echo "  Desktop already registered: ID=$existing_id"
-        if [[ -n "$tunnel_url" ]]; then
-            echo "  Updating URL to: $tunnel_url"
-            local http_code
-            http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
-                -X PATCH \
-                -H "Authorization: Bearer ${unify_key}" \
-                -H "Content-Type: application/json" \
-                -d "{\"url\": \"${tunnel_url}\"}" \
-                "${orchestra_url}/desktop/${existing_id}" || true)
-            if [[ "$http_code" == "200" ]]; then
-                echo "  URL updated"
-            else
-                if explain_orchestra_connect_failure "update the desktop URL" "$orchestra_url" "$http_code"; then
-                    echo "  WARNING: Could not update desktop URL (Orchestra unreachable)" >&2
+        local status
+        status=$(desktop_exists "$unify_key" "$orchestra_url" "$existing_id")
+        if [[ "$status" == "missing" ]]; then
+            echo "  Desktop $existing_id no longer exists on server — re-registering"
+            set_env_value "DEVICE_ID" ""
+            # fall through to fresh registration below
+        else
+            echo "  Desktop already registered: ID=$existing_id"
+            [[ "$status" == "unknown" ]] && echo "  (could not verify with server; keeping existing registration)"
+            if [[ -n "$tunnel_url" ]]; then
+                echo "  Updating URL to: $tunnel_url"
+                local http_code
+                http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+                    -X PATCH \
+                    -H "Authorization: Bearer ${unify_key}" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"url\": \"${tunnel_url}\"}" \
+                    "${orchestra_url}/desktop/${existing_id}" || true)
+                if [[ "$http_code" == "200" ]]; then
+                    echo "  URL updated"
                 else
-                    echo "  WARNING: Could not update desktop URL (HTTP ${http_code})" >&2
+                    if explain_orchestra_connect_failure "update the desktop URL" "$orchestra_url" "$http_code"; then
+                        echo "  WARNING: Could not update desktop URL (Orchestra unreachable)" >&2
+                    else
+                        echo "  WARNING: Could not update desktop URL (HTTP ${http_code})" >&2
+                    fi
                 fi
             fi
+            return
         fi
-        return
     fi
 
     if [[ -z "$tunnel_url" ]]; then
@@ -1485,6 +1572,42 @@ register_self_host_desktop() {
         echo "  Restart the Unity stack so CM reloads linked desktops:"
         echo "    unity restart"
     fi
+}
+
+# Best-effort recovery run on --start (login/boot): if the tunnel or desktop was
+# deleted on the backend while local ids persisted, re-register it. Safe by
+# construction — register_tunnel/register_desktop only re-create on a definitive
+# server "missing", never on a transient/auth failure. Gated on a configured key
+# and guarded by a lock dir so it can't race a concurrent --reconfigure.
+ensure_registration() {
+    local unify_key orchestra_url comms_url tunnel_url lock_dir
+
+    unify_key=$(get_env_value "UNIFY_KEY")
+    orchestra_url=$(get_env_value "ORCHESTRA_URL")
+    comms_url=$(get_env_value "UNITY_COMMS_URL")
+    [[ -z "$unify_key" || -z "$orchestra_url" ]] && return 0
+
+    lock_dir="$AGENT_SERVICE_DIR/.recover.lock"
+    mkdir -p "$AGENT_SERVICE_DIR" 2>/dev/null || true
+    # Clear a stale lock (>10 min) left behind by a crashed run.
+    if [[ -d "$lock_dir" && -n "$(find "$lock_dir" -maxdepth 0 -mmin +10 2>/dev/null)" ]]; then
+        rmdir "$lock_dir" 2>/dev/null || true
+    fi
+    mkdir "$lock_dir" 2>/dev/null || return 0
+
+    echo ""
+    echo "=== Verifying registration ==="
+    if [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+        register_desktop "$unify_key" "$orchestra_url" "$DEVICE_NAME" "$(self_host_registration_url)" || true
+    elif [[ -n "$comms_url" ]]; then
+        register_tunnel "$unify_key" "$comms_url" 3000 "$DEVICE_NAME" || true
+        tunnel_url=$(get_env_value "TUNNEL_URL")
+        if [[ -n "$tunnel_url" ]]; then
+            register_desktop "$unify_key" "$orchestra_url" "$DEVICE_NAME" "$tunnel_url" || true
+        fi
+    fi
+
+    rmdir "$lock_dir" 2>/dev/null || true
 }
 
 bootstrap_launch_agent() {
@@ -1941,6 +2064,9 @@ fi
 
 # Handle start command (just start services, no install/config - no root needed)
 if $DO_START; then
+    # Self-heal: re-register tunnel/desktop if they were deleted on the backend
+    # while local ids persisted. Best-effort and offline-safe (never blocks start).
+    ensure_registration || true
     start_all_services
     exit 0
 fi

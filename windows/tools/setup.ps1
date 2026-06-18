@@ -1150,6 +1150,65 @@ function Register-SelfHostDesktop {
     }
 }
 
+# Check whether a previously-registered backend resource still exists, so a
+# resource deleted outside the app (e.g. in the console) can be safely
+# re-created. Returns one of: 'present' | 'missing' | 'unknown'.
+#   present  -> still exists; keep the local id
+#   missing  -> backend definitively reports it gone; safe to re-register
+#   unknown  -> could not verify (offline / 5xx / bad key); KEEP the id so a
+#               transient failure never wipes a good registration
+function Test-DesktopExists {
+    param(
+        [string]$UnifyKey,
+        [string]$OrchestraUrl,
+        [string]$DeviceId
+    )
+
+    $headers = @{ Authorization = "Bearer $UnifyKey" }
+    try {
+        $resp = Invoke-RestMethod -Method GET `
+            -Uri "$OrchestraUrl/desktop" `
+            -Headers $headers `
+            -TimeoutSec 15 `
+            -ErrorAction Stop
+    } catch {
+        return 'unknown'
+    }
+
+    $items = @()
+    if ($resp -and ($resp.PSObject.Properties.Name -contains 'info') -and $resp.info) {
+        $items = @($resp.info)
+    }
+    foreach ($d in $items) {
+        if ("$($d.id)" -eq "$DeviceId") { return 'present' }
+    }
+    return 'missing'
+}
+
+# Tunnel: GET /infra/tunnel/{id}; 200 = present, 404 = missing, else unknown.
+function Test-TunnelExists {
+    param(
+        [string]$UnifyKey,
+        [string]$CommsUrl,
+        [string]$TunnelId
+    )
+
+    $headers = @{ Authorization = "Bearer $UnifyKey" }
+    try {
+        Invoke-RestMethod -Method GET `
+            -Uri "$CommsUrl/infra/tunnel/$TunnelId" `
+            -Headers $headers `
+            -TimeoutSec 15 `
+            -ErrorAction Stop | Out-Null
+        return 'present'
+    } catch {
+        $code = 0
+        try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = 0 }
+        if ($code -eq 404) { return 'missing' }
+        return 'unknown'
+    }
+}
+
 function Register-Tunnel {
     param(
         [string]$UnifyKey,
@@ -1164,12 +1223,27 @@ function Register-Tunnel {
     # Check for existing tunnel
     $existingTunnelId = Get-EnvValue -Key "TUNNEL_ID"
     if ($existingTunnelId) {
-        Write-Host "  Tunnel already registered: $existingTunnelId" -ForegroundColor Green
-        $existingUrl = Get-EnvValue -Key "TUNNEL_URL"
-        if ($existingUrl) {
-            Write-Host "  URL: $existingUrl" -ForegroundColor Green
+        $status = Test-TunnelExists -UnifyKey $UnifyKey -CommsUrl $CommsUrl -TunnelId $existingTunnelId
+        if ($status -eq 'missing') {
+            Write-Host "  Tunnel $existingTunnelId no longer exists on server - re-registering" -ForegroundColor Yellow
+            Set-EnvValue -Key "TUNNEL_ID" -Value ""
+            Set-EnvValue -Key "TUNNEL_URL" -Value ""
+            Set-EnvValue -Key "TUNNEL_TOKEN" -Value ""
+            if (Test-Path $script:RatholeConfig) {
+                Remove-Item $script:RatholeConfig -Force -ErrorAction SilentlyContinue
+            }
+            # fall through to fresh registration below
+        } else {
+            Write-Host "  Tunnel already registered: $existingTunnelId" -ForegroundColor Green
+            if ($status -eq 'unknown') {
+                Write-Host "  (could not verify with server; keeping existing registration)" -ForegroundColor Gray
+            }
+            $existingUrl = Get-EnvValue -Key "TUNNEL_URL"
+            if ($existingUrl) {
+                Write-Host "  URL: $existingUrl" -ForegroundColor Green
+            }
+            return
         }
-        return
     }
     
     $body = @{ local_port = $LocalPort }
@@ -1319,31 +1393,41 @@ function Register-Desktop {
     # Check for existing device
     $existingId = Get-EnvValue -Key "DEVICE_ID"
     if ($existingId) {
-        Write-Host "  Desktop already registered: ID=$existingId" -ForegroundColor Green
-        # Update URL if it changed
-        if ($TunnelUrl) {
-            Write-Host "  Updating URL to: $TunnelUrl" -ForegroundColor Gray
-            $headers = @{
-                Authorization = "Bearer $UnifyKey"
-                'Content-Type' = 'application/json'
+        $status = Test-DesktopExists -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceId $existingId
+        if ($status -eq 'missing') {
+            Write-Host "  Desktop $existingId no longer exists on server - re-registering" -ForegroundColor Yellow
+            Set-EnvValue -Key "DEVICE_ID" -Value ""
+            # fall through to fresh registration below
+        } else {
+            Write-Host "  Desktop already registered: ID=$existingId" -ForegroundColor Green
+            if ($status -eq 'unknown') {
+                Write-Host "  (could not verify with server; keeping existing registration)" -ForegroundColor Gray
             }
-            $body = @{ url = $TunnelUrl } | ConvertTo-Json -Compress
-            try {
-                Invoke-RestMethod -Method PATCH `
-                    -Uri "$OrchestraUrl/desktop/$existingId" `
-                    -Headers $headers `
-                    -Body $body `
-                    -ErrorAction Stop | Out-Null
-                Write-Host "  URL updated" -ForegroundColor Green
-            } catch {
-                if (Explain-OrchestraConnectFailure -ActionDescription 'update the desktop URL' -OrchestraUrl $OrchestraUrl) {
-                    Write-Host "  WARNING: Could not update desktop URL (Orchestra unreachable)" -ForegroundColor Yellow
-                } else {
-                    Write-Host "  WARNING: Could not update desktop URL: $_" -ForegroundColor Yellow
+            # Update URL if it changed
+            if ($TunnelUrl) {
+                Write-Host "  Updating URL to: $TunnelUrl" -ForegroundColor Gray
+                $headers = @{
+                    Authorization = "Bearer $UnifyKey"
+                    'Content-Type' = 'application/json'
+                }
+                $body = @{ url = $TunnelUrl } | ConvertTo-Json -Compress
+                try {
+                    Invoke-RestMethod -Method PATCH `
+                        -Uri "$OrchestraUrl/desktop/$existingId" `
+                        -Headers $headers `
+                        -Body $body `
+                        -ErrorAction Stop | Out-Null
+                    Write-Host "  URL updated" -ForegroundColor Green
+                } catch {
+                    if (Explain-OrchestraConnectFailure -ActionDescription 'update the desktop URL' -OrchestraUrl $OrchestraUrl) {
+                        Write-Host "  WARNING: Could not update desktop URL (Orchestra unreachable)" -ForegroundColor Yellow
+                    } else {
+                        Write-Host "  WARNING: Could not update desktop URL: $_" -ForegroundColor Yellow
+                    }
                 }
             }
+            return
         }
-        return
     }
     
     if (-not $TunnelUrl) {
@@ -1385,6 +1469,51 @@ function Register-Desktop {
     Write-Host "  Desktop registered: ID=$deviceId" -ForegroundColor Green
     Write-Host "  Name: $DeviceName" -ForegroundColor Gray
     Write-Host "  URL: $TunnelUrl" -ForegroundColor Gray
+}
+
+# Best-effort recovery run on -Start (login/boot): if the tunnel or desktop was
+# deleted on the backend while local ids persisted, re-register it. Safe by
+# construction - Register-Tunnel/Register-Desktop only re-create on a definitive
+# server "missing", never on a transient/auth failure. Gated on a configured key
+# and guarded by a lock dir so it can't race a concurrent -Reconfigure.
+function Ensure-Registration {
+    $unifyKey = Get-EnvValue -Key "UNIFY_KEY"
+    $orchestraUrl = Get-EnvValue -Key "ORCHESTRA_URL"
+    $commsUrl = Get-EnvValue -Key "UNITY_COMMS_URL"
+    if (-not $unifyKey -or -not $orchestraUrl) { return }
+
+    if (-not (Test-Path $script:AgentServiceDir)) {
+        New-Item -ItemType Directory -Force -Path $script:AgentServiceDir | Out-Null
+    }
+    $lockDir = Join-Path $script:AgentServiceDir '.recover.lock'
+    # Clear a stale lock (>10 min) left behind by a crashed run.
+    if (Test-Path $lockDir) {
+        $age = (Get-Date) - (Get-Item $lockDir).LastWriteTime
+        if ($age.TotalMinutes -gt 10) {
+            Remove-Item $lockDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    try {
+        New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null
+    } catch {
+        return  # another setup run is already reconciling
+    }
+
+    try {
+        Write-Host ""
+        Write-Host "=== Verifying registration ===" -ForegroundColor Cyan
+        if ((Get-EnvValue -Key 'SELF_HOST') -eq '1') {
+            Register-Desktop -UnifyKey $unifyKey -OrchestraUrl $orchestraUrl -DeviceName $DeviceName -TunnelUrl (Get-SelfHostRegistrationUrl)
+        } elseif ($commsUrl) {
+            Register-Tunnel -UnifyKey $unifyKey -CommsUrl $commsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
+            $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
+            if ($tunnelUrl) {
+                Register-Desktop -UnifyKey $unifyKey -OrchestraUrl $orchestraUrl -DeviceName $DeviceName -TunnelUrl $tunnelUrl
+            }
+        }
+    } finally {
+        Remove-Item $lockDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Unregister-Desktop {
@@ -1779,6 +1908,9 @@ function Show-Summary {
 
 # Handle start command (just start services, no install/config - no admin needed)
 if ($Start) {
+    # Self-heal: re-register tunnel/desktop if they were deleted on the backend
+    # while local ids persisted. Best-effort and offline-safe (never blocks start).
+    try { Ensure-Registration } catch { }
     Start-AllServices
     exit 0
 }
