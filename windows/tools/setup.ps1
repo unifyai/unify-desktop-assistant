@@ -114,7 +114,7 @@ function Add-DefenderExclusions {
     }
 
     # Process exclusions skip scanning of any file these touch, regardless of
-    # location — the most robust guard for the bun/npm install phases.
+    # location - the most robust guard for the bun/npm install phases.
     $procs = @('bun.exe', 'node.exe')
     foreach ($proc in $procs) {
         try {
@@ -815,7 +815,7 @@ function Install-Magnitude {
 function Install-Chromium {
     # patchright/Playwright's own (node) archive extractor hangs on some Windows
     # VMs right at "extracting archive" (download succeeds, extraction never
-    # writes a byte; not Defender/disk — native Expand-Archive of the same zip is
+    # writes a byte; not Defender/disk - native Expand-Archive of the same zip is
     # instant). Provision Chromium ourselves: download the zip and extract it with
     # Expand-Archive into the exact dir Playwright expects, then drop the
     # INSTALLATION_COMPLETE marker so patchright treats it as already installed
@@ -1335,7 +1335,7 @@ function Explain-OrchestraConnectFailure {
 
     Write-Host "  ERROR: Could not connect to Orchestra at ${OrchestraUrl} while trying to ${ActionDescription}." -ForegroundColor Red
     if ((Test-ComposeSelfHostPresent) -or ($OrchestraUrl -match '127\.0\.0\.1|localhost')) {
-        Write-Host "  Orchestra is not reachable on this machine — the Unity Docker stack is probably stopped." -ForegroundColor Yellow
+        Write-Host "  Orchestra is not reachable on this machine - the Unity Docker stack is probably stopped." -ForegroundColor Yellow
         Write-Host "  Start it first:" -ForegroundColor Yellow
         Write-Host "    unity stack up" -ForegroundColor Yellow
         Write-Host "  Wait until Orchestra responds on port 8000, then register again from tray Settings" -ForegroundColor Yellow
@@ -1456,7 +1456,7 @@ function Register-SelfHostDesktop {
         $desktopId = Get-EnvValue -Key 'DEVICE_ID'
         $coordinatorId = Resolve-CoordinatorAgentId -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl
         if (-not $desktopId -or -not $coordinatorId) {
-            Write-Host "  WARNING: Could not link desktop — missing device or coordinator id" -ForegroundColor Yellow
+            Write-Host "  WARNING: Could not link desktop - missing device or coordinator id" -ForegroundColor Yellow
             return
         }
         Link-DesktopToCoordinator -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl `
@@ -1618,7 +1618,7 @@ function Start-Tunnel {
     }
     
     # Check if rathole is already running (match the main client.toml only, so the
-    # SFTP tunnel's rathole.exe — sftp-tunnel.toml — is not mistaken for it).
+    # SFTP tunnel's rathole.exe - sftp-tunnel.toml - is not mistaken for it).
     $existing = Get-CimInstance Win32_Process -Filter "Name = 'rathole.exe' AND CommandLine LIKE '%client.toml%'" -ErrorAction SilentlyContinue
     if ($existing) {
         Write-Host "  Tunnel already running (PID $($existing.ProcessId))" -ForegroundColor Green
@@ -2318,7 +2318,7 @@ if ($Reconfigure) {
         exit 1
     }
 
-    # Settings only changes the API key — preserve the URLs baked at install,
+    # Settings only changes the API key - preserve the URLs baked at install,
     # otherwise Setup-AgentServiceEnv would reset them to the script defaults
     # and break a staging/custom install.
     Apply-ComposeSelfHostMode
