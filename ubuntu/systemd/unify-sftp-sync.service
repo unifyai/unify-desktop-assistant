@@ -1,0 +1,14 @@
+[Unit]
+Description=Unify Desktop Assistant - SFTP key sync (reconcile)
+Documentation=https://unify.ai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Reconcile authorized_keys + report SFTP tunnel coordinates so links enabled
+# later in the console are picked up without a reinstall. Driven by the paired
+# unify-sftp-sync.timer.
+Type=oneshot
+ExecStart=/bin/bash %INSTALL_DIR%/tools/setup.sh --sync-keys
+StandardOutput=append:%LOG_DIR%/sftp-sync.log
+StandardError=append:%LOG_DIR%/sftp-sync.log

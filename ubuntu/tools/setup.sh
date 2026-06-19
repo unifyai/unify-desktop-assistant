@@ -33,6 +33,13 @@ LOG_DIR="$INSTALL_DIR/logs"
 RATHOLE_DIR="$INSTALL_DIR/rathole"
 RATHOLE_BIN="$RATHOLE_DIR/rathole"
 RATHOLE_CONFIG="$RATHOLE_DIR/client.toml"
+RCLONE_DIR="$INSTALL_DIR/rclone"
+RCLONE_BIN="$RCLONE_DIR/rclone"
+SSH_DIR="$INSTALL_DIR/ssh"
+SSH_HOST_KEY="$SSH_DIR/host_ed25519"
+SSH_AUTH_KEYS="$SSH_DIR/authorized_keys"
+SFTP_LOCAL_PORT=2222
+SFTP_RATHOLE_CONFIG="$RATHOLE_DIR/sftp-tunnel.toml"
 
 # Default configuration
 UNIFY_KEY=""
@@ -41,6 +48,7 @@ UNITY_COMMS_URL="https://unity-comms-app-000000000000.us-central1.run.app"
 DO_START=false
 DO_STOP=false
 DO_UNINSTALL=false
+DO_SYNC_KEYS=false
 RECONFIGURE=false
 FORCE=false
 SKIP_APT=false
@@ -69,6 +77,7 @@ Options:
   --start               Start services only (no install/config, no root needed)
   --stop                Stop all services
   --uninstall           Stop services, remove systemd units & firewall rules
+  --sync-keys           Reconcile SFTP authorized_keys + report tunnel coords, then exit
   --prereqs-only        Install prerequisites only (no key required, no config/registration)
   --reconfigure         Re-apply key + re-register + restart services (no deps, no root)
   --self-host           Unity Docker self-host mode (local Orchestra, no tunnel, port ${SELF_HOST_AGENT_PORT})
@@ -103,6 +112,8 @@ while [[ $# -gt 0 ]]; do
             DO_STOP=true; shift ;;
         --uninstall)
             DO_UNINSTALL=true; shift ;;
+        --sync-keys)
+            DO_SYNC_KEYS=true; shift ;;
         --reconfigure)
             RECONFIGURE=true; shift ;;
         --self-host)
@@ -477,6 +488,13 @@ test_fast_mode() {
         all_ok=false
     fi
 
+    if [[ -x "$RCLONE_BIN" ]]; then
+        echo "  [OK] rclone" >&2
+    else
+        echo "  [--] rclone (will install)" >&2
+        all_ok=false
+    fi
+
     $all_ok
 }
 
@@ -506,6 +524,18 @@ stop_all_services() {
         echo "  Stopped websockify"
     fi
 
+    # Stop SFTP tunnel (rathole) and SFTP server (rclone)
+    pids=$(pgrep -f 'rathole.*sftp-tunnel\.toml' 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        echo "$pids" | xargs kill -TERM 2>/dev/null || true
+        echo "  Stopped SFTP tunnel"
+    fi
+    pids=$(pgrep -f 'rclone serve sftp' 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        echo "$pids" | xargs kill -TERM 2>/dev/null || true
+        echo "  Stopped SFTP server"
+    fi
+
     # Stop x11vnc
     pids=$(pgrep -x x11vnc 2>/dev/null || true)
     if [[ -n "$pids" ]]; then
@@ -526,11 +556,16 @@ stop_all_services() {
         systemctl --user stop unify-vnc.service 2>/dev/null || true
         echo "  Stopped unify-vnc.service"
     fi
+    if systemctl --user is-active unify-sftp.service &>/dev/null 2>&1; then
+        systemctl --user stop unify-sftp.service 2>/dev/null || true
+        echo "  Stopped unify-sftp.service"
+    fi
+    systemctl --user stop unify-sftp-sync.timer 2>/dev/null || true
 
     # Final sweep: kill processes on target ports
     local agent_port
     agent_port="$(agent_service_port)"
-    for port in 5900 6080 "$agent_port"; do
+    for port in 5900 6080 "$agent_port" "$SFTP_LOCAL_PORT"; do
         pids=$(ss -tlnpH "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' || true)
         if [[ -n "$pids" ]]; then
             echo "$pids" | xargs kill -TERM 2>/dev/null || true
@@ -560,6 +595,7 @@ uninstall_all() {
         echo "Cleaning up remote registrations..."
         [[ -n "$orchestra_url" ]] && unregister_desktop "$unify_key" "$orchestra_url"
         [[ -n "$comms_url" ]] && unregister_tunnel "$unify_key" "$comms_url"
+        [[ -n "$comms_url" ]] && unregister_sftp_tunnel "$unify_key" "$comms_url"
     fi
 
     # 3. Remove rathole
@@ -568,15 +604,35 @@ uninstall_all() {
         echo "  Removed rathole directory"
     fi
 
+    # 3b. Remove rclone + SFTP host key / authorized_keys (local-only material).
+    if [[ -d "$RCLONE_DIR" ]]; then
+        rm -rf "$RCLONE_DIR"
+        echo "  Removed rclone directory"
+    fi
+    if [[ -d "$SSH_DIR" ]]; then
+        rm -rf "$SSH_DIR"
+        echo "  Removed SFTP key directory"
+    fi
+
     # 4. Remove systemd user services
     echo ""
     echo "Removing systemd user services..."
-    for svc in unify-vnc unify-websockify unify-agent unify-tray; do
+    for svc in unify-vnc unify-websockify unify-agent unify-tray unify-sftp; do
         local svc_file="$HOME/.config/systemd/user/${svc}.service"
         if [[ -f "$svc_file" ]]; then
             systemctl --user disable "${svc}.service" 2>/dev/null || true
             rm -f "$svc_file"
             echo "  Removed: ${svc}.service"
+        fi
+    done
+    # SFTP key-sync timer + its backing oneshot service
+    systemctl --user stop unify-sftp-sync.timer 2>/dev/null || true
+    systemctl --user disable unify-sftp-sync.timer 2>/dev/null || true
+    for unit in unify-sftp-sync.timer unify-sftp-sync.service; do
+        local unit_file="$HOME/.config/systemd/user/${unit}"
+        if [[ -f "$unit_file" ]]; then
+            rm -f "$unit_file"
+            echo "  Removed: ${unit}"
         fi
     done
     systemctl --user daemon-reload 2>/dev/null || true
@@ -587,6 +643,7 @@ uninstall_all() {
         echo "Removing firewall rules..."
         ufw delete allow 6080/tcp 2>/dev/null && echo "  Removed: port 6080 (noVNC)" || true
         ufw delete allow 3000/tcp 2>/dev/null && echo "  Removed: port 3000 (Agent Service)" || true
+        ufw delete allow "${SFTP_LOCAL_PORT}/tcp" 2>/dev/null && echo "  Removed: port ${SFTP_LOCAL_PORT} (SFTP)" || true
     fi
 
     # 6. Remove autostart desktop entry
@@ -1011,6 +1068,300 @@ tunnel_exists() {
     esac
 }
 
+install_rclone() {
+    echo ""
+    echo "=== Installing rclone ==="
+    if [[ -x "$RCLONE_BIN" ]]; then
+        echo "  rclone already installed"
+        return
+    fi
+    mkdir -p "$RCLONE_DIR"
+
+    local arch rc_arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  rc_arch="linux-amd64" ;;
+        aarch64) rc_arch="linux-arm64" ;;
+        *)       echo "  ERROR: Unsupported architecture: $arch" >&2; return 1 ;;
+    esac
+
+    local url="https://downloads.rclone.org/rclone-current-${rc_arch}.zip"
+    local zip="/tmp/rclone-${rc_arch}.zip"
+    local extract="/tmp/rclone-extract-$$"
+
+    echo "  Downloading rclone (${rc_arch})..."
+    curl -fSL -o "$zip" "$url"
+
+    rm -rf "$extract" && mkdir -p "$extract"
+    unzip -oq "$zip" -d "$extract"
+    local found
+    found=$(find "$extract" -name rclone -type f | head -1)
+    if [[ -z "$found" ]]; then
+        echo "  ERROR: rclone binary not found after extraction" >&2
+        rm -f "$zip"; rm -rf "$extract"; return 1
+    fi
+    cp "$found" "$RCLONE_BIN"
+    chmod +x "$RCLONE_BIN"
+    rm -f "$zip"; rm -rf "$extract"
+
+    if [[ -x "$RCLONE_BIN" ]]; then
+        echo "  rclone installed"
+    else
+        echo "  ERROR: rclone installation failed" >&2
+        return 1
+    fi
+}
+
+# Generate the local SFTP host key (server identity, stays local) and ensure the
+# authorized_keys file exists, then pull the per-link client public keys from
+# Orchestra. The client PRIVATE keys live in Orchestra, never on this machine.
+setup_sftp_server() {
+    echo ""
+    echo "=== Configuring SFTP server (rclone) ==="
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+
+    if [[ ! -f "$SSH_HOST_KEY" ]]; then
+        ssh-keygen -t ed25519 -f "$SSH_HOST_KEY" -N "" -q -C "unify-desktop-sftp-host"
+        echo "  Generated SFTP host key"
+    fi
+
+    if [[ ! -f "$SSH_AUTH_KEYS" ]]; then
+        touch "$SSH_AUTH_KEYS"
+        chmod 600 "$SSH_AUTH_KEYS"
+    fi
+
+    reconcile_sftp_links || echo "  WARNING: could not reconcile SFTP links yet (will retry on the sync timer)"
+
+    # Full install runs as root; the rclone systemd unit runs as the user, so the
+    # key dir must be owned by them (700 root-owned would be unreadable).
+    if [[ "$EUID" -eq 0 ]]; then
+        local tgt
+        tgt="${SUDO_USER:-$(logname 2>/dev/null || echo "")}"
+        if [[ -n "$tgt" && "$tgt" != "root" ]]; then
+            chown -R "$tgt":"$(id -gn "$tgt")" "$SSH_DIR" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Reconcile per-link SFTP state with Orchestra:
+#   1. find this device's assistant links (GET /desktop -> assigned_to_assistant_ids)
+#   2. fetch each filesys-sync link's client public key (GET /desktop/link/{aid}/pubkey)
+#   3. report this device's SFTP tunnel coords (POST /desktop/link/{aid}/sftp-tunnel)
+#   4. atomically rewrite authorized_keys from the collected keys (prunes revoked)
+# Client PRIVATE keys live in Orchestra; only public keys ever touch this machine.
+reconcile_sftp_links() {
+    local unify_key orchestra_url device_id sftp_host sftp_port
+    unify_key=$(get_env_value "UNIFY_KEY")
+    orchestra_url=$(get_env_value "ORCHESTRA_URL")
+    device_id=$(get_env_value "DEVICE_ID")
+    sftp_host=$(get_env_value "SFTP_TUNNEL_HOST")
+    sftp_port=$(get_env_value "SFTP_TUNNEL_PORT")
+    [[ -z "$unify_key" || -z "$orchestra_url" || -z "$device_id" ]] && return 0
+
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+
+    UNIFY_KEY="$unify_key" ORCHESTRA_URL="$orchestra_url" DEVICE_ID="$device_id" \
+    SFTP_TUNNEL_HOST="$sftp_host" SFTP_TUNNEL_PORT="$sftp_port" \
+    SSH_AUTH_KEYS="$SSH_AUTH_KEYS" python3 - <<'PY'
+import json, os, sys, tempfile, urllib.error, urllib.request
+
+base = os.environ["ORCHESTRA_URL"].rstrip("/")
+key = os.environ["UNIFY_KEY"]
+device_id = str(os.environ["DEVICE_ID"])
+host = os.environ.get("SFTP_TUNNEL_HOST") or ""
+port = os.environ.get("SFTP_TUNNEL_PORT") or ""
+auth_keys = os.environ["SSH_AUTH_KEYS"]
+
+
+def req(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(base + path, data=data, method=method)
+    r.add_header("Authorization", "Bearer " + key)
+    if data is not None:
+        r.add_header("Content-Type", "application/json")
+    return urllib.request.urlopen(r, timeout=30)
+
+
+try:
+    with req("GET", "/desktop") as resp:
+        desktops = json.load(resp).get("info", [])
+except Exception as e:  # noqa: BLE001
+    print(f"  WARNING: could not list desktops: {e}", file=sys.stderr)
+    sys.exit(1)
+
+assistant_ids = []
+for d in desktops:
+    if str(d.get("id")) == device_id:
+        assistant_ids = d.get("assigned_to_assistant_ids") or []
+        break
+
+pubkeys = []
+for aid in assistant_ids:
+    try:
+        with req("GET", f"/desktop/link/{aid}/pubkey") as resp:
+            pk = (json.load(resp).get("info") or {}).get("public_key")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:  # 404 == link without filesys_sync; skip quietly
+            print(f"  WARNING: pubkey fetch failed for {aid}: {e}", file=sys.stderr)
+        continue
+    except Exception as e:  # noqa: BLE001
+        print(f"  WARNING: pubkey fetch error for {aid}: {e}", file=sys.stderr)
+        continue
+    if pk and pk.strip():
+        pubkeys.append(pk.strip())
+        if host and port:
+            try:
+                req(
+                    "POST",
+                    f"/desktop/link/{aid}/sftp-tunnel",
+                    {"host": host, "port": int(port)},
+                ).close()
+            except Exception as e:  # noqa: BLE001
+                print(f"  WARNING: tunnel report failed for {aid}: {e}", file=sys.stderr)
+
+body = "".join(k + "\n" for k in pubkeys)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(auth_keys) or ".")
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write(body)
+os.chmod(tmp, 0o600)
+os.replace(tmp, auth_keys)
+print(f"  authorized_keys synced ({len(pubkeys)} key(s) across {len(assistant_ids)} link(s))")
+PY
+}
+
+# Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its
+# client config. Self-host mode: bind on all interfaces so the local Unity stack
+# reaches the SFTP server directly (no tunnel).
+register_sftp_tunnel() {
+    local unify_key=$1
+    local comms_url=$2
+
+    if $SELF_HOST_MODE || [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+        set_env_value "SFTP_BIND_ADDR" "0.0.0.0"
+        set_env_value "SFTP_TUNNEL_HOST" "host.docker.internal"
+        set_env_value "SFTP_TUNNEL_PORT" "$SFTP_LOCAL_PORT"
+        echo ""
+        echo "=== SFTP (self-host) ==="
+        echo "  Reachable at host.docker.internal:${SFTP_LOCAL_PORT}"
+        return 0
+    fi
+
+    set_env_value "SFTP_BIND_ADDR" "127.0.0.1"
+
+    local existing_port
+    existing_port=$(get_env_value "SFTP_TUNNEL_PORT")
+    if [[ -n "$existing_port" && -f "$SFTP_RATHOLE_CONFIG" ]]; then
+        echo ""
+        echo "  SFTP tunnel already registered: $(get_env_value "SFTP_TUNNEL_HOST"):${existing_port}"
+        return 0
+    fi
+
+    echo ""
+    echo "=== Registering SFTP Tunnel ==="
+
+    local resp_file="/tmp/unify_sftp_tunnel.json"
+    local http_code
+    http_code=$(curl -sS -o "$resp_file" -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer ${unify_key}" \
+        -H "Content-Type: application/json" \
+        -d "{\"local_port\": ${SFTP_LOCAL_PORT}, \"protocol\": \"tcp\", \"name\": \"sftp\"}" \
+        "${comms_url}/infra/tunnel/register" || true)
+
+    if [[ "$http_code" != "200" ]]; then
+        echo "  ERROR: SFTP tunnel registration failed (HTTP ${http_code})" >&2
+        [[ -f "$resp_file" ]] && cat "$resp_file" >&2
+        rm -f "$resp_file"
+        return 1
+    fi
+
+    local tunnel_id tcp_host tcp_port client_config
+    tunnel_id=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tunnel_id',''))" < "$resp_file" 2>/dev/null || true)
+    tcp_host=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tcp_host',''))" < "$resp_file" 2>/dev/null || true)
+    tcp_port=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tcp_port',''))" < "$resp_file" 2>/dev/null || true)
+    client_config=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('client_config',''))" < "$resp_file" 2>/dev/null || true)
+    rm -f "$resp_file"
+
+    set_env_value "SFTP_TUNNEL_ID" "$tunnel_id"
+    set_env_value "SFTP_TUNNEL_HOST" "$tcp_host"
+    set_env_value "SFTP_TUNNEL_PORT" "$tcp_port"
+
+    mkdir -p "$RATHOLE_DIR"
+    if [[ -n "$client_config" ]]; then
+        printf '%s\n' "$client_config" > "$SFTP_RATHOLE_CONFIG"
+    fi
+
+    echo "  SFTP tunnel registered: ${tcp_host}:${tcp_port}"
+}
+
+unregister_sftp_tunnel() {
+    local unify_key=$1
+    local comms_url=$2
+
+    local tunnel_id
+    tunnel_id=$(get_env_value "SFTP_TUNNEL_ID")
+    [[ -z "$tunnel_id" ]] && return
+
+    echo "  Deleting SFTP tunnel $tunnel_id..."
+
+    local http_code
+    http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        -X DELETE \
+        -H "Authorization: Bearer ${unify_key}" \
+        "${comms_url}/infra/tunnel/${tunnel_id}" || true)
+
+    if [[ "$http_code" == "200" ]]; then
+        echo "  SFTP tunnel deleted from server"
+    else
+        echo "  WARNING: Could not delete SFTP tunnel from server (HTTP ${http_code})"
+    fi
+
+    set_env_value "SFTP_TUNNEL_ID" ""
+    set_env_value "SFTP_TUNNEL_HOST" ""
+    set_env_value "SFTP_TUNNEL_PORT" ""
+
+    rm -f "$SFTP_RATHOLE_CONFIG"
+}
+
+start_sftp_server() {
+    [[ -x "$RCLONE_BIN" ]] || return 0
+    if [[ ! -f "$SSH_AUTH_KEYS" ]]; then
+        echo "  SFTP server: no authorized_keys yet, skipping"
+        return 0
+    fi
+    if test_port_listening "$SFTP_LOCAL_PORT"; then
+        echo "  SFTP server already running on port $SFTP_LOCAL_PORT"
+        return 0
+    fi
+    local bind user
+    bind=$(get_env_value "SFTP_BIND_ADDR"); [[ -z "$bind" ]] && bind="127.0.0.1"
+    # Fixed contract with the cloud-side rclone client; not the OS account.
+    user=$(get_env_value "SFTP_USER"); [[ -z "$user" ]] && user="unity"
+    echo "  Starting SFTP server (rclone)..."
+    nohup "$RCLONE_BIN" serve sftp "$HOME" \
+        --addr "${bind}:${SFTP_LOCAL_PORT}" \
+        --user "$user" \
+        --authorized-keys "$SSH_AUTH_KEYS" \
+        --key "$SSH_HOST_KEY" \
+        > "$LOG_DIR/sftp.log" 2>&1 &
+}
+
+start_sftp_tunnel() {
+    [[ -x "$RATHOLE_BIN" ]] || return 0
+    if [[ ! -f "$SFTP_RATHOLE_CONFIG" ]]; then
+        echo "  No SFTP tunnel config yet, skipping SFTP tunnel start"
+        return 0
+    fi
+    if pgrep -f "rathole.*sftp-tunnel\.toml" &>/dev/null; then
+        echo "  SFTP tunnel already running"
+        return 0
+    fi
+    echo "  Starting SFTP tunnel..."
+    nohup "$RATHOLE_BIN" "$SFTP_RATHOLE_CONFIG" > "$LOG_DIR/sftp-tunnel.log" 2>&1 &
+}
+
 register_tunnel() {
     local unify_key=$1
     local comms_url=$2
@@ -1332,6 +1683,16 @@ setup_agent_service_env() {
     existing_tunnel_token=$(get_env_value "TUNNEL_TOKEN")
     existing_device_id=$(get_env_value "DEVICE_ID")
 
+    # Capture SFTP values BEFORE the heredoc — the `cat >` redirection truncates
+    # the .env before the here-document is expanded, so inline reads would be empty.
+    local existing_sftp_user existing_sftp_bind existing_sftp_tunnel_id existing_sftp_host existing_sftp_port
+    # Fixed contract with the cloud-side rclone client; not the OS account.
+    existing_sftp_user="unity"
+    existing_sftp_bind=$(get_env_value "SFTP_BIND_ADDR"); [[ -z "$existing_sftp_bind" ]] && existing_sftp_bind="127.0.0.1"
+    existing_sftp_tunnel_id=$(get_env_value "SFTP_TUNNEL_ID")
+    existing_sftp_host=$(get_env_value "SFTP_TUNNEL_HOST")
+    existing_sftp_port=$(get_env_value "SFTP_TUNNEL_PORT")
+
     cat > "$env_file" <<ENVFILE
 # Agent Service Environment Configuration
 # Generated: $(date)
@@ -1348,6 +1709,14 @@ TUNNEL_ID=$existing_tunnel_id
 TUNNEL_URL=$existing_tunnel_url
 TUNNEL_TOKEN=$existing_tunnel_token
 DEVICE_ID=$existing_device_id
+
+# SFTP / Remote FS (managed by setup_sftp_server / register_sftp_tunnel)
+SFTP_LOCAL_PORT=$SFTP_LOCAL_PORT
+SFTP_USER=$existing_sftp_user
+SFTP_BIND_ADDR=$existing_sftp_bind
+SFTP_TUNNEL_ID=$existing_sftp_tunnel_id
+SFTP_TUNNEL_HOST=$existing_sftp_host
+SFTP_TUNNEL_PORT=$existing_sftp_port
 ENVFILE
 
     echo "  .env created"
@@ -1380,9 +1749,9 @@ setup_systemd_services() {
         "$target_home/.config/systemd" \
         "$target_systemd_dir"
 
-    # Install systemd unit files from the systemd/ directory
+    # Install systemd unit files (services + timers) from the systemd/ directory
     if [[ -d "$systemd_dir" ]]; then
-        for unit_file in "$systemd_dir"/*.service; do
+        for unit_file in "$systemd_dir"/*.service "$systemd_dir"/*.timer; do
             if [[ -f "$unit_file" ]]; then
                 local unit_name
                 unit_name=$(basename "$unit_file")
@@ -1400,13 +1769,14 @@ setup_systemd_services() {
         done
     fi
 
-    # Reload systemd for the target user
+    # Reload systemd for the target user. The sftp-sync TIMER is enabled (it
+    # drives the oneshot reconcile); its backing service is not enabled directly.
     if [[ -n "${SUDO_USER:-}" ]]; then
         su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user daemon-reload" 2>/dev/null || true
-        su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service" 2>/dev/null || true
+        su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service unify-sftp.service unify-sftp-sync.timer" 2>/dev/null || true
     else
         systemctl --user daemon-reload 2>/dev/null || true
-        systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service 2>/dev/null || true
+        systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service unify-sftp.service unify-sftp-sync.timer 2>/dev/null || true
     fi
 
     echo "  systemd user services configured"
@@ -1465,7 +1835,14 @@ configure_firewall() {
     local agent_port
     agent_port="$(agent_service_port)"
 
-    for port_desc in "6080/tcp:noVNC" "${agent_port}/tcp:Agent Service"; do
+    local fw_ports=("6080/tcp:noVNC" "${agent_port}/tcp:Agent Service")
+    # Self-host binds SFTP on all interfaces so the local Unity containers can
+    # reach it; cloud mode binds loopback only (tunnel), so no rule is needed.
+    if $SELF_HOST_MODE || [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+        fw_ports+=("${SFTP_LOCAL_PORT}/tcp:SFTP")
+    fi
+
+    for port_desc in "${fw_ports[@]}"; do
         local port="${port_desc%%:*}"
         local desc="${port_desc##*:}"
         if ! ufw status | grep -q "$port.*ALLOW"; then
@@ -1609,6 +1986,15 @@ start_all_services() {
     if $all_ok && ! $SELF_HOST_MODE && [[ "$(get_env_value "SELF_HOST")" != "1" ]]; then
         start_tunnel
     fi
+
+    # SFTP server (rclone) runs in both modes; its tunnel only in cloud mode.
+    start_sftp_server
+    if ! $SELF_HOST_MODE && [[ "$(get_env_value "SELF_HOST")" != "1" ]]; then
+        start_sftp_tunnel
+    fi
+
+    # Periodic key-sync timer (runs in both modes); ignore if units aren't loaded.
+    systemctl --user start unify-sftp-sync.timer 2>/dev/null || true
 }
 
 # =============================================================================
@@ -1680,6 +2066,14 @@ if $DO_STOP; then
     exit 0
 fi
 
+# Handle sync-keys (lightweight reconcile run by the unify-sftp-sync.timer:
+# refresh authorized_keys + report tunnel coords for links enabled in the console
+# after install). Runs as the regular user; no root, no install, no registration.
+if $DO_SYNC_KEYS; then
+    reconcile_sftp_links
+    exit 0
+fi
+
 # Handle uninstall command
 if $DO_UNINSTALL; then
     uninstall_all
@@ -1744,6 +2138,11 @@ if $RECONFIGURE; then
         fi
     fi
 
+    # Re-provision the SFTP server + tunnel and persist the SFTP_* values.
+    register_sftp_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" || true
+    setup_sftp_server || true
+    setup_agent_service_env
+
     start_all_services
     exit 0
 fi
@@ -1768,6 +2167,7 @@ if $PREREQS_ONLY; then
     install_magnitude
     install_agent_service
     install_rathole
+    install_rclone
 
     setup_systemd_services
     setup_autostart
@@ -1827,6 +2227,7 @@ else
     install_magnitude
     install_agent_service
     install_rathole
+    install_rclone
 fi
 
 # Always run configuration
@@ -1860,6 +2261,12 @@ else
         register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
     fi
 fi
+
+# Provision the app-owned SFTP server + (cloud) its raw-TCP tunnel, then re-write
+# the .env so the resolved SFTP_* values are persisted for the systemd unit.
+register_sftp_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" || true
+setup_sftp_server || true
+setup_agent_service_env
 
 # Start services (unless --no-start, e.g. when called from .deb postinst)
 if $NO_START; then

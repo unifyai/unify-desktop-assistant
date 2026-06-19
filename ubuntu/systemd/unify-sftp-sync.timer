@@ -1,0 +1,12 @@
+[Unit]
+Description=Unify Desktop Assistant - periodic SFTP key sync
+Documentation=https://unify.ai
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=unify-sftp-sync.service
+
+[Install]
+WantedBy=timers.target

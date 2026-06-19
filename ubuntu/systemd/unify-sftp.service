@@ -1,0 +1,19 @@
+[Unit]
+Description=Unify Desktop Assistant - SFTP server (rclone)
+Documentation=https://unify.ai
+After=network-online.target
+Wants=network-online.target
+# Stay inactive until at least one per-link public key has been provisioned.
+ConditionPathExists=%INSTALL_DIR%/ssh/authorized_keys
+
+[Service]
+Type=simple
+EnvironmentFile=%AGENT_SERVICE_DIR%/.env
+ExecStart=%INSTALL_DIR%/rclone/rclone serve sftp %h --addr ${SFTP_BIND_ADDR}:${SFTP_LOCAL_PORT} --user ${SFTP_USER} --authorized-keys %INSTALL_DIR%/ssh/authorized_keys --key %INSTALL_DIR%/ssh/host_ed25519
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:%LOG_DIR%/sftp.log
+StandardError=append:%LOG_DIR%/sftp.log
+
+[Install]
+WantedBy=default.target

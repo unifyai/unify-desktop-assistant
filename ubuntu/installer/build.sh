@@ -191,6 +191,7 @@ fi
 echo "  Copying systemd units..."
 mkdir -p "$APP_ROOT/systemd"
 cp "$PROJECT_DIR/systemd/"*.service "$APP_ROOT/systemd/" 2>/dev/null || true
+cp "$PROJECT_DIR/systemd/"*.timer "$APP_ROOT/systemd/" 2>/dev/null || true
 
 # --- magnitude/ (excluding node_modules, .git) ---
 echo "  Copying magnitude/ (excluding node_modules, .git)..."
