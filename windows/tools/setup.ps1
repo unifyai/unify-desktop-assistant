@@ -33,7 +33,8 @@ param(
     [switch]$Force,
     [switch]$SelfHost,
     [switch]$LinkCoordinator,
-    [string]$CoordinatorAgentId
+    [string]$CoordinatorAgentId,
+    [switch]$SyncKeys
 )
 
 Set-StrictMode -Version Latest
@@ -55,6 +56,13 @@ $script:AgentServiceDir = Join-Path $script:InstallDir 'agent-service'
 $script:RatholeDir = Join-Path $script:InstallDir 'rathole'
 $script:RatholeExe = Join-Path $script:RatholeDir 'rathole.exe'
 $script:RatholeConfig = Join-Path $script:RatholeDir 'client.toml'
+$script:RcloneDir = Join-Path $script:InstallDir 'rclone'
+$script:RcloneExe = Join-Path $script:RcloneDir 'rclone.exe'
+$script:SshDir = Join-Path $script:InstallDir 'ssh'
+$script:SshHostKey = Join-Path $script:SshDir 'host_ed25519'
+$script:SshAuthKeys = Join-Path $script:SshDir 'authorized_keys'
+$script:SftpLocalPort = 2222
+$script:SftpRatholeConfig = Join-Path $script:RatholeDir 'sftp-tunnel.toml'
 
 Write-Host ""
 Write-Host "=========================================="
@@ -223,7 +231,8 @@ function Test-FastMode {
     $installChecks = @(
         @{ Path = 'C:\Program Files\TightVNC\tvnserver.exe'; Name = 'TightVNC' },
         @{ Path = (Join-Path $script:NoVncDir 'vnc.html'); Name = 'noVNC' },
-        @{ Path = $script:RatholeExe; Name = 'Rathole' }
+        @{ Path = $script:RatholeExe; Name = 'Rathole' },
+        @{ Path = $script:RcloneExe; Name = 'rclone' }
     )
     
     $allInstalled = $true
@@ -267,8 +276,15 @@ function Stop-AllServices {
         Write-Host "  Stopped websockify (PID $($proc.ProcessId))" -ForegroundColor Green
     }
     
-    # Stop parent cmd.exe processes that launched websockify or agent-service
-    $cmdProcs = Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe' AND (CommandLine LIKE '%websockify%' OR CommandLine LIKE '%agent-service%' OR CommandLine LIKE '%ts-node%')" -ErrorAction SilentlyContinue
+    # Stop SFTP server (rclone serve sftp)
+    $rcloneProcs = Get-CimInstance Win32_Process -Filter "Name = 'rclone.exe' AND CommandLine LIKE '%serve sftp%'" -ErrorAction SilentlyContinue
+    foreach ($proc in $rcloneProcs) {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host "  Stopped SFTP server (PID $($proc.ProcessId))" -ForegroundColor Green
+    }
+    
+    # Stop parent cmd.exe processes that launched websockify, agent-service, or rclone
+    $cmdProcs = Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe' AND (CommandLine LIKE '%websockify%' OR CommandLine LIKE '%agent-service%' OR CommandLine LIKE '%ts-node%' OR CommandLine LIKE '%serve sftp%')" -ErrorAction SilentlyContinue
     foreach ($proc in $cmdProcs) {
         Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
         Write-Host "  Stopped cmd.exe wrapper (PID $($proc.ProcessId))" -ForegroundColor Green
@@ -287,7 +303,7 @@ function Stop-AllServices {
     
     # Final sweep: kill any remaining processes by port (catches anything the above missed)
     $agentPort = Get-AgentServicePort
-    foreach ($port in @(5900, 6080, $agentPort)) {
+    foreach ($port in @(5900, 6080, $agentPort, $script:SftpLocalPort)) {
         $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
         foreach ($conn in $conns) {
             Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
@@ -316,12 +332,13 @@ function Uninstall-All {
         Write-Host "Cleaning up remote registrations..." -ForegroundColor Cyan
         if ($orchestraUrl) { Unregister-Desktop -UnifyKey $unifyKey -OrchestraUrl $orchestraUrl }
         if ($commsUrl) { Unregister-Tunnel -UnifyKey $unifyKey -CommsUrl $commsUrl }
+        if ($commsUrl) { Unregister-SFTPTunnel -UnifyKey $unifyKey -CommsUrl $commsUrl }
     }
     
     # 3. Remove scheduled tasks
     Write-Host ""
     Write-Host "Removing scheduled tasks..." -ForegroundColor Cyan
-    foreach ($taskName in @('UnifyWebsockify', 'UnifyAgentService', 'UnifyTightVNC')) {
+    foreach ($taskName in @('UnifyWebsockify', 'UnifyAgentService', 'UnifyTightVNC', 'UnifySftpSync')) {
         $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if ($task) {
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -332,7 +349,7 @@ function Uninstall-All {
     # 4. Remove firewall rules
     Write-Host ""
     Write-Host "Removing firewall rules..." -ForegroundColor Cyan
-    foreach ($ruleName in @('Unify-noVNC', 'Unify-AgentService')) {
+    foreach ($ruleName in @('Unify-noVNC', 'Unify-AgentService', 'Unify-SFTP')) {
         $rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
         if ($rule) {
             Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
@@ -344,6 +361,16 @@ function Uninstall-All {
     if (Test-Path $script:RatholeDir) {
         Remove-Item -Recurse -Force $script:RatholeDir -ErrorAction SilentlyContinue
         Write-Host "  Removed rathole directory" -ForegroundColor Green
+    }
+
+    # 5b. Remove rclone + SFTP host key / authorized_keys (local-only material)
+    if (Test-Path $script:RcloneDir) {
+        Remove-Item -Recurse -Force $script:RcloneDir -ErrorAction SilentlyContinue
+        Write-Host "  Removed rclone directory" -ForegroundColor Green
+    }
+    if (Test-Path $script:SshDir) {
+        Remove-Item -Recurse -Force $script:SshDir -ErrorAction SilentlyContinue
+        Write-Host "  Removed SFTP key directory" -ForegroundColor Green
     }
     
     Write-Host ""
@@ -944,6 +971,296 @@ function Install-Rathole {
     }
 }
 
+function Install-Rclone {
+    Write-Host ""
+    Write-Host "=== Installing rclone ===" -ForegroundColor Cyan
+
+    if (Test-Path $script:RcloneExe) {
+        Write-Host "  rclone already installed" -ForegroundColor Green
+        return
+    }
+
+    if (-not (Test-Path $script:RcloneDir)) {
+        New-Item -ItemType Directory -Force -Path $script:RcloneDir | Out-Null
+    }
+
+    try {
+        Add-MpPreference -ExclusionPath $script:RcloneDir -ErrorAction Stop
+    } catch {
+        Write-Host "  WARNING: Could not add Defender exclusion: $_" -ForegroundColor Yellow
+    }
+
+    $rcArch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'windows-arm64' } else { 'windows-amd64' }
+    $downloadUrl = "https://downloads.rclone.org/rclone-current-$rcArch.zip"
+    $zipPath = Join-Path $env:TEMP "rclone-$rcArch.zip"
+    $extractDir = Join-Path $env:TEMP "rclone-extract-$PID"
+
+    Write-Host "  Downloading rclone ($rcArch)..."
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
+
+    if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue }
+    Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+    $found = Get-ChildItem -Path $extractDir -Recurse -Filter 'rclone.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) {
+        Copy-Item $found.FullName $script:RcloneExe -Force
+    }
+    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
+
+    if (Test-Path $script:RcloneExe) {
+        Write-Host "  rclone installed" -ForegroundColor Green
+    } else {
+        throw "rclone installation failed -- rclone.exe not found after extraction"
+    }
+}
+
+# Generate the local SFTP host key (server identity, stays local) and ensure the
+# authorized_keys file exists, then pull the per-link client public keys from
+# Orchestra. The client PRIVATE keys live in Orchestra, never on this machine.
+function Setup-SFTPServer {
+    Write-Host ""
+    Write-Host "=== Configuring SFTP server (rclone) ===" -ForegroundColor Cyan
+
+    if (-not (Test-Path $script:SshDir)) {
+        New-Item -ItemType Directory -Force -Path $script:SshDir | Out-Null
+    }
+
+    if (-not (Test-Path $script:SshHostKey)) {
+        $sshKeygen = (Get-Command ssh-keygen -ErrorAction SilentlyContinue).Source
+        if (-not $sshKeygen) {
+            try { Add-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0' -ErrorAction Stop | Out-Null } catch {}
+            $sshKeygen = (Get-Command ssh-keygen -ErrorAction SilentlyContinue).Source
+        }
+        if ($sshKeygen) {
+            # Invoke via cmd so the empty passphrase (-N "") is parsed reliably;
+            # PowerShell 5.1 can drop an empty-string argument to a native exe.
+            $keygenInner = "`"$sshKeygen`" -t ed25519 -f `"$($script:SshHostKey)`" -N `"`" -q -C unify-desktop-sftp-host"
+            Start-Process cmd.exe -ArgumentList "/c $keygenInner" -NoNewWindow -Wait
+            Write-Host "  Generated SFTP host key" -ForegroundColor Green
+        } else {
+            Write-Host "  WARNING: ssh-keygen unavailable; rclone will generate a host key on first run" -ForegroundColor Yellow
+        }
+    }
+
+    if (-not (Test-Path $script:SshAuthKeys)) {
+        New-Item -ItemType File -Force -Path $script:SshAuthKeys | Out-Null
+    }
+
+    Sync-AuthorizedKeys
+}
+
+# Reconcile per-link SFTP state with Orchestra:
+#   1. find this device's assistant links (GET /desktop -> assigned_to_assistant_ids)
+#   2. fetch each filesys-sync link's client public key (GET /desktop/link/{aid}/pubkey)
+#   3. report this device's SFTP tunnel coords (POST /desktop/link/{aid}/sftp-tunnel)
+#   4. rewrite authorized_keys from the collected keys (prunes revoked links)
+# Client PRIVATE keys live in Orchestra; only public keys ever touch this machine.
+# Output is ASCII, no BOM, LF endings (rclone's authorized_keys parser is strict).
+function Sync-AuthorizedKeys {
+    $unifyKey = Get-EnvValue -Key 'UNIFY_KEY'
+    $orchestraUrl = Get-EnvValue -Key 'ORCHESTRA_URL'
+    $deviceId = Get-EnvValue -Key 'DEVICE_ID'
+    $sftpHost = Get-EnvValue -Key 'SFTP_TUNNEL_HOST'
+    $sftpPort = Get-EnvValue -Key 'SFTP_TUNNEL_PORT'
+    if (-not $unifyKey -or -not $orchestraUrl -or -not $deviceId) { return }
+
+    if (-not (Test-Path $script:SshDir)) {
+        New-Item -ItemType Directory -Force -Path $script:SshDir | Out-Null
+    }
+
+    $base = $orchestraUrl.TrimEnd('/')
+    $headers = @{ Authorization = "Bearer $unifyKey" }
+
+    try {
+        $desktops = Invoke-RestMethod -Method GET -Uri "$base/desktop" -Headers $headers -ErrorAction Stop
+    } catch {
+        Write-Host "  WARNING: could not list desktops: $_" -ForegroundColor Yellow
+        return
+    }
+
+    $hasProp = { param($o, $n) $o -and $o.PSObject.Properties[$n] }
+
+    $desktopList = if (& $hasProp $desktops 'info') { @($desktops.info) } else { @() }
+    $assistantIds = @()
+    foreach ($d in $desktopList) {
+        if ("$($d.id)" -eq "$deviceId") {
+            if ((& $hasProp $d 'assigned_to_assistant_ids') -and $d.assigned_to_assistant_ids) {
+                $assistantIds = @($d.assigned_to_assistant_ids)
+            }
+            break
+        }
+    }
+
+    $pubkeys = @()
+    foreach ($aid in $assistantIds) {
+        try {
+            $r = Invoke-RestMethod -Method GET -Uri "$base/desktop/link/$aid/pubkey" -Headers $headers -ErrorAction Stop
+        } catch {
+            $code = 0
+            try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = 0 }
+            if ($code -ne 404) {  # 404 == link without filesys_sync; skip quietly
+                Write-Host "  WARNING: pubkey fetch failed for $aid : $_" -ForegroundColor Yellow
+            }
+            continue
+        }
+        $pk = $null
+        if ((& $hasProp $r 'info') -and (& $hasProp $r.info 'public_key')) { $pk = $r.info.public_key }
+        if ($pk -and $pk.Trim()) {
+            $pubkeys += $pk.Trim()
+            if ($sftpHost -and $sftpPort) {
+                $tBody = @{ host = $sftpHost; port = [int]$sftpPort } | ConvertTo-Json -Compress
+                try {
+                    Invoke-RestMethod -Method POST -Uri "$base/desktop/link/$aid/sftp-tunnel" `
+                        -Headers @{ Authorization = "Bearer $unifyKey"; 'Content-Type' = 'application/json' } `
+                        -Body $tBody -ErrorAction Stop | Out-Null
+                } catch {
+                    Write-Host "  WARNING: tunnel report failed for $aid : $_" -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+
+    $body = ($pubkeys -join "`n")
+    if ($body) { $body += "`n" }
+
+    [System.IO.File]::WriteAllText($script:SshAuthKeys, $body, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "  authorized_keys synced ($($pubkeys.Count) key(s) across $($assistantIds.Count) link(s))" -ForegroundColor Green
+}
+
+# Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its
+# client config. Self-host mode: bind on all interfaces so the local Unity stack
+# reaches the SFTP server directly (no tunnel).
+function Register-SFTPTunnel {
+    param(
+        [string]$UnifyKey,
+        [string]$CommsUrl
+    )
+
+    if ($script:SelfHostMode -or (Get-EnvValue -Key 'SELF_HOST') -eq '1') {
+        Set-EnvValue -Key 'SFTP_BIND_ADDR' -Value '0.0.0.0'
+        Set-EnvValue -Key 'SFTP_TUNNEL_HOST' -Value 'host.docker.internal'
+        Set-EnvValue -Key 'SFTP_TUNNEL_PORT' -Value "$($script:SftpLocalPort)"
+        Write-Host ""
+        Write-Host "=== SFTP (self-host) ===" -ForegroundColor Cyan
+        Write-Host "  Reachable at host.docker.internal:$($script:SftpLocalPort)" -ForegroundColor Green
+        return
+    }
+
+    Set-EnvValue -Key 'SFTP_BIND_ADDR' -Value '127.0.0.1'
+
+    $existingPort = Get-EnvValue -Key 'SFTP_TUNNEL_PORT'
+    if ($existingPort -and (Test-Path $script:SftpRatholeConfig)) {
+        Write-Host "  SFTP tunnel already registered: $(Get-EnvValue -Key 'SFTP_TUNNEL_HOST'):$existingPort" -ForegroundColor Green
+        return
+    }
+
+    Write-Host ""
+    Write-Host "=== Registering SFTP Tunnel ===" -ForegroundColor Cyan
+
+    $body = @{ local_port = $script:SftpLocalPort; protocol = 'tcp'; name = 'sftp' }
+    $headers = @{
+        Authorization = "Bearer $UnifyKey"
+        'Content-Type' = 'application/json'
+    }
+
+    try {
+        $resp = Invoke-RestMethod -Method POST `
+            -Uri "$CommsUrl/infra/tunnel/register" `
+            -Headers $headers `
+            -Body ($body | ConvertTo-Json -Compress) `
+            -ErrorAction Stop
+    } catch {
+        Write-Host "  ERROR: SFTP tunnel registration failed: $_" -ForegroundColor Red
+        return
+    }
+
+    Set-EnvValue -Key 'SFTP_TUNNEL_ID' -Value $resp.tunnel_id
+    Set-EnvValue -Key 'SFTP_TUNNEL_HOST' -Value $resp.tcp_host
+    Set-EnvValue -Key 'SFTP_TUNNEL_PORT' -Value "$($resp.tcp_port)"
+
+    if (-not (Test-Path $script:RatholeDir)) {
+        New-Item -ItemType Directory -Force -Path $script:RatholeDir | Out-Null
+    }
+    if ($resp.client_config) {
+        $resp.client_config | Out-File -FilePath $script:SftpRatholeConfig -Encoding UTF8
+    }
+
+    Write-Host "  SFTP tunnel registered: $($resp.tcp_host):$($resp.tcp_port)" -ForegroundColor Green
+}
+
+function Unregister-SFTPTunnel {
+    param(
+        [string]$UnifyKey,
+        [string]$CommsUrl
+    )
+
+    $tunnelId = Get-EnvValue -Key 'SFTP_TUNNEL_ID'
+    if (-not $tunnelId) { return }
+
+    Write-Host "  Deleting SFTP tunnel $tunnelId..." -ForegroundColor Gray
+
+    $headers = @{ Authorization = "Bearer $UnifyKey" }
+    try {
+        Invoke-RestMethod -Method DELETE `
+            -Uri "$CommsUrl/infra/tunnel/$tunnelId" `
+            -Headers $headers `
+            -ErrorAction Stop | Out-Null
+        Write-Host "  SFTP tunnel deleted from server" -ForegroundColor Green
+    } catch {
+        Write-Host "  WARNING: Could not delete SFTP tunnel from server: $_" -ForegroundColor Yellow
+    }
+
+    Set-EnvValue -Key 'SFTP_TUNNEL_ID' -Value ""
+    Set-EnvValue -Key 'SFTP_TUNNEL_HOST' -Value ""
+    Set-EnvValue -Key 'SFTP_TUNNEL_PORT' -Value ""
+
+    if (Test-Path $script:SftpRatholeConfig) {
+        Remove-Item $script:SftpRatholeConfig -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Start-SFTPServer {
+    if (-not (Test-Path $script:RcloneExe)) {
+        Write-Host "  rclone not installed, skipping SFTP server start" -ForegroundColor Yellow
+        return
+    }
+    if (-not (Test-Path $script:SshAuthKeys)) {
+        Write-Host "  SFTP server: no authorized_keys yet, skipping" -ForegroundColor Yellow
+        return
+    }
+    if (Test-PortListening -Port $script:SftpLocalPort) {
+        Write-Host "  SFTP server already running on port $($script:SftpLocalPort)" -ForegroundColor Green
+        return
+    }
+
+    $bind = Get-EnvValue -Key 'SFTP_BIND_ADDR'; if (-not $bind) { $bind = '127.0.0.1' }
+    # Fixed contract with the cloud-side rclone client; not the OS account.
+    $user = Get-EnvValue -Key 'SFTP_USER'; if (-not $user) { $user = 'unity' }
+    $addr = "${bind}:$($script:SftpLocalPort)"
+    $log = Join-Path $script:RcloneDir 'sftp.log'
+    $keyArg = if (Test-Path $script:SshHostKey) { " --key `"$($script:SshHostKey)`"" } else { "" }
+
+    Write-Host "  Starting SFTP server (rclone)..." -ForegroundColor Gray
+    Start-Process cmd.exe -ArgumentList "/c `"`"$($script:RcloneExe)`" serve sftp `"$($env:USERPROFILE)`" --addr $addr --user `"$user`" --authorized-keys `"$($script:SshAuthKeys)`"$keyArg > `"$log`" 2>&1`"" -WindowStyle Hidden
+}
+
+function Start-SFTPTunnel {
+    if (-not (Test-Path $script:RatholeExe)) { return }
+    if (-not (Test-Path $script:SftpRatholeConfig)) {
+        Write-Host "  No SFTP tunnel config yet, skipping SFTP tunnel start" -ForegroundColor Yellow
+        return
+    }
+    $existing = Get-CimInstance Win32_Process -Filter "Name = 'rathole.exe' AND CommandLine LIKE '%sftp-tunnel%'" -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Host "  SFTP tunnel already running (PID $($existing.ProcessId))" -ForegroundColor Green
+        return
+    }
+    $log = Join-Path $script:RatholeDir 'sftp-tunnel.log'
+    Write-Host "  Starting SFTP tunnel..." -ForegroundColor Gray
+    Start-Process cmd.exe -ArgumentList "/c `"`"$($script:RatholeExe)`" `"$($script:SftpRatholeConfig)`" > `"$log`" 2>&1`"" -WindowStyle Hidden
+}
+
 function Get-EnvValue {
     param([string]$Key)
     $envFile = Join-Path $script:AgentServiceDir '.env'
@@ -1300,8 +1617,9 @@ function Start-Tunnel {
         return
     }
     
-    # Check if rathole is already running
-    $existing = Get-CimInstance Win32_Process -Filter "Name = 'rathole.exe'" -ErrorAction SilentlyContinue
+    # Check if rathole is already running (match the main client.toml only, so the
+    # SFTP tunnel's rathole.exe — sftp-tunnel.toml — is not mistaken for it).
+    $existing = Get-CimInstance Win32_Process -Filter "Name = 'rathole.exe' AND CommandLine LIKE '%client.toml%'" -ErrorAction SilentlyContinue
     if ($existing) {
         Write-Host "  Tunnel already running (PID $($existing.ProcessId))" -ForegroundColor Green
         return
@@ -1315,7 +1633,7 @@ function Start-Tunnel {
     # Wait briefly for the process to start
     Start-Sleep -Seconds 2
     
-    $running = Get-CimInstance Win32_Process -Filter "Name = 'rathole.exe'" -ErrorAction SilentlyContinue
+    $running = Get-CimInstance Win32_Process -Filter "Name = 'rathole.exe' AND CommandLine LIKE '%client.toml%'" -ErrorAction SilentlyContinue
     if ($running) {
         $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
         Write-Host "  Tunnel running (PID $($running.ProcessId))" -ForegroundColor Green
@@ -1564,6 +1882,14 @@ function Setup-AgentServiceEnv {
     $existingDeviceId = Get-EnvValue -Key "DEVICE_ID"
     $agentPort = Get-AgentServicePort
     $selfHostFlag = if ($script:SelfHostMode) { '1' } else { '0' }
+
+    # SFTP values (managed by Setup-SFTPServer / Register-SFTPTunnel).
+    # SFTP_USER is a fixed contract with the cloud-side rclone client, not the OS account.
+    $existingSftpUser = 'unity'
+    $existingSftpBind = Get-EnvValue -Key "SFTP_BIND_ADDR"; if (-not $existingSftpBind) { $existingSftpBind = '127.0.0.1' }
+    $existingSftpTunnelId = Get-EnvValue -Key "SFTP_TUNNEL_ID"
+    $existingSftpHost = Get-EnvValue -Key "SFTP_TUNNEL_HOST"
+    $existingSftpPort = Get-EnvValue -Key "SFTP_TUNNEL_PORT"
     
     $envContent = @"
 # Agent Service Environment Configuration
@@ -1581,6 +1907,14 @@ TUNNEL_ID=$existingTunnelId
 TUNNEL_URL=$existingTunnelUrl
 TUNNEL_TOKEN=$existingTunnelToken
 DEVICE_ID=$existingDeviceId
+
+# SFTP / Remote FS (managed by Setup-SFTPServer / Register-SFTPTunnel)
+SFTP_LOCAL_PORT=$($script:SftpLocalPort)
+SFTP_USER=$existingSftpUser
+SFTP_BIND_ADDR=$existingSftpBind
+SFTP_TUNNEL_ID=$existingSftpTunnelId
+SFTP_TUNNEL_HOST=$existingSftpHost
+SFTP_TUNNEL_PORT=$existingSftpPort
 "@
     
     $envContent | Out-File -FilePath $envFile -Encoding UTF8
@@ -1709,6 +2043,30 @@ objShell.Run """$tvnExe"" -run", 0, False
     Write-Host "  Scheduled task created: $taskName (hidden)" -ForegroundColor Green
 }
 
+function Setup-SFTPSyncStartup {
+    Write-Host ""
+    Write-Host "=== Setting up SFTP key-sync task ===" -ForegroundColor Cyan
+
+    # Periodic reconcile of authorized_keys + tunnel coords so links enabled later
+    # in the console are picked up without a reinstall. Runs setup.ps1 -SyncKeys
+    # hidden, at logon and every 5 minutes.
+    $setupScript = Join-Path $script:ToolsDir 'setup.ps1'
+
+    $taskName = "UnifySftpSync"
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    $argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$setupScript`" -SyncKeys"
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument -WorkingDirectory $script:ToolsDir
+    $triggerLogon = New-ScheduledTaskTrigger -AtLogOn
+    $triggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5) `
+        -RepetitionDuration (New-TimeSpan -Days 3650)
+    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($triggerLogon, $triggerRepeat) -Principal $principal -Settings $settings | Out-Null
+    Write-Host "  Scheduled task created: $taskName (hidden, every 5 min)" -ForegroundColor Green
+}
+
 function Configure-Firewall {
     Write-Host ""
     Write-Host "=== Configuring Firewall ===" -ForegroundColor Cyan
@@ -1718,6 +2076,11 @@ function Configure-Firewall {
         @{ Name = 'Unify-noVNC'; Port = 6080; Description = 'noVNC WebSocket' },
         @{ Name = 'Unify-AgentService'; Port = $agentPort; Description = 'Agent Service API' }
     )
+    # Self-host binds SFTP on all interfaces for the local Unity containers; cloud
+    # mode binds loopback only (tunnel), so no inbound rule is needed there.
+    if ($script:SelfHostMode -or (Get-EnvValue -Key 'SELF_HOST') -eq '1') {
+        $rules += @{ Name = 'Unify-SFTP'; Port = $script:SftpLocalPort; Description = 'SFTP server' }
+    }
     
     foreach ($rule in $rules) {
         $existing = Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue
@@ -1852,6 +2215,12 @@ function Start-AllServices {
     if ($allOk -and -not $script:SelfHostMode -and (Get-EnvValue -Key 'SELF_HOST') -ne '1') {
         Start-Tunnel
     }
+
+    # SFTP server (rclone) runs in both modes; its tunnel only in cloud mode.
+    Start-SFTPServer
+    if (-not $script:SelfHostMode -and (Get-EnvValue -Key 'SELF_HOST') -ne '1') {
+        Start-SFTPTunnel
+    }
 }
 
 # =============================================================================
@@ -1921,6 +2290,14 @@ if ($Stop) {
     exit 0
 }
 
+# Handle sync-keys (lightweight reconcile run by the UnifySftpSync scheduled task:
+# refresh authorized_keys + report tunnel coords for links enabled in the console
+# after install). No admin, no install, no registration.
+if ($SyncKeys) {
+    Sync-AuthorizedKeys
+    exit 0
+}
+
 # Handle uninstall command
 if ($Uninstall) {
     Uninstall-All
@@ -1979,6 +2356,12 @@ if ($Reconfigure) {
         }
     }
 
+    # Re-provision the SFTP server + tunnel and persist the SFTP_* values; the
+    # subsequent Start-AllServices starts them.
+    Register-SFTPTunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl
+    Setup-SFTPServer
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
+
     Start-AllServices
     exit 0
 }
@@ -2027,6 +2410,7 @@ try {
         Install-Magnitude -Force:$Force
         Install-AgentService -Force:$Force
         Install-Rathole
+        Install-Rclone
     }
 
     # Always run configuration
@@ -2041,6 +2425,7 @@ try {
     Setup-TightVNCStartup
     Setup-WebsockifyStartup
     Setup-AgentServiceStartup
+    Setup-SFTPSyncStartup
     Configure-Firewall
 
     # Start services (includes tunnel start after local services are up)
@@ -2057,6 +2442,16 @@ try {
             Start-Tunnel
             Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $tunnelUrl
         }
+    }
+
+    # Provision the app-owned SFTP server + (cloud) its raw-TCP tunnel, then
+    # re-write .env so the resolved SFTP_* values are persisted, and start them.
+    Register-SFTPTunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl
+    Setup-SFTPServer
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
+    Start-SFTPServer
+    if (-not $script:SelfHostMode -and (Get-EnvValue -Key 'SELF_HOST') -ne '1') {
+        Start-SFTPTunnel
     }
 
     # Show summary
