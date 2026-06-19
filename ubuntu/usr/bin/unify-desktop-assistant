@@ -22,8 +22,6 @@ Commands:
   uninstall       Stop services, remove systemd units & firewall rules
   status          Show service status
   settings        Open the settings GUI (tray app)
-  tunnel [args]   Start HTTPS tunnel for the agent service
-  liveview [args] Start HTTPS tunnel for live viewing (VNC proxy)
 
 Setup Options:
   --unify-key KEY         Unify API key (required for setup)
@@ -36,8 +34,6 @@ Examples:
   unify-desktop-assistant start
   unify-desktop-assistant stop
   unify-desktop-assistant status
-  unify-desktop-assistant tunnel
-  unify-desktop-assistant liveview
 
 USAGE
 }
@@ -78,22 +74,6 @@ case "$cmd" in
       exec python3 "$APP_DIR/gui/unify-assistant.py" "$@"
     else
       echo "ERROR: GUI not found at $APP_DIR/gui/unify-assistant.py" >&2
-      exit 1
-    fi
-    ;;
-  tunnel)
-    if [[ -f "$APP_DIR/tools/tunnel.sh" ]]; then
-      exec bash "$APP_DIR/tools/tunnel.sh" "$@"
-    else
-      echo "ERROR: tunnel.sh not found" >&2
-      exit 1
-    fi
-    ;;
-  liveview)
-    if [[ -f "$APP_DIR/tools/liveview.sh" ]]; then
-      exec bash "$APP_DIR/tools/liveview.sh" "$@"
-    else
-      echo "ERROR: liveview.sh not found" >&2
       exit 1
     fi
     ;;

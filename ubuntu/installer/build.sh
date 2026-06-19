@@ -164,14 +164,6 @@ mkdir -p "$APP_ROOT/tools"
 cp "$PROJECT_DIR/tools/setup.sh" "$APP_ROOT/tools/"
 chmod +x "$APP_ROOT/tools/setup.sh"
 
-# Copy tunnel and liveview scripts if they exist in new location
-for script in tunnel.sh liveview.sh; do
-    if [[ -f "$PROJECT_DIR/tools/$script" ]]; then
-        cp "$PROJECT_DIR/tools/$script" "$APP_ROOT/tools/"
-        chmod +x "$APP_ROOT/tools/$script"
-    fi
-done
-
 # --- gui/ ---
 echo "  Copying gui/..."
 mkdir -p "$APP_ROOT/gui"
