@@ -147,7 +147,10 @@ echo "  Baked environment.conf ($ENVIRONMENT)"
 echo "  Copying tools/..."
 mkdir -p "$APP_ROOT/tools"
 cp "$PROJECT_DIR/tools/setup.sh" "$APP_ROOT/tools/"
+# launchd entrypoints execed by the agents at runtime (websockify, agent, sftp).
+cp "$PROJECT_DIR/tools/"run-*.sh "$APP_ROOT/tools/" 2>/dev/null || true
 chmod +x "$APP_ROOT/tools/setup.sh"
+chmod +x "$APP_ROOT/tools/"run-*.sh 2>/dev/null || true
 
 # --- gui/ ---
 echo "  Copying gui/..."

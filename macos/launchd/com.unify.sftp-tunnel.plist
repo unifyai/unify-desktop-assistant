@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.unify.sftp-tunnel</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>%RATHOLE_BIN%</string>
+		<string>%SFTP_RATHOLE_CONFIG%</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Cloud-mode raw-TCP rathole client for the SFTP port. Runs whenever
+	     sftp-client.toml exists (absent in self-host mode, where the local
+	     Unity stack reaches the SFTP server directly). -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+		<key>PathState</key>
+		<dict>
+			<key>%SFTP_RATHOLE_CONFIG%</key>
+			<true/>
+		</dict>
+	</dict>
+
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<key>StandardOutPath</key>
+	<string>%LOG_DIR%/sftp-tunnel.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>%LOG_DIR%/sftp-tunnel.log</string>
+</dict>
+</plist>

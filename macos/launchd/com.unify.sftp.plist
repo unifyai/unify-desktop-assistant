@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.unify.sftp</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>%INSTALL_DIR%/tools/run-sftp.sh</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Run rclone serve sftp whenever authorized_keys exists; restart on
+	     crash/sleep/wake; never crash-loop while no keys are provisioned. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+		<key>PathState</key>
+		<dict>
+			<key>%SSH_AUTH_KEYS%</key>
+			<true/>
+		</dict>
+	</dict>
+
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<key>StandardOutPath</key>
+	<string>%LOG_DIR%/sftp.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>%LOG_DIR%/sftp.log</string>
+</dict>
+</plist>
