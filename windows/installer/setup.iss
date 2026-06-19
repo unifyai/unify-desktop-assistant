@@ -131,7 +131,7 @@ var
 
 function TestComposeSelfHostPresent: Boolean;
 begin
-  Result := FileExists(ExpandConstant('{userprofile}\.unity\docker-compose.yml'));
+  Result := FileExists(ExpandConstant('{%USERPROFILE}\.unity\docker-compose.yml'));
 end;
 
 function GetSetupRunParams(Param: String): String;
