@@ -3,7 +3,7 @@
 # Single script to install, configure, and start all services for localhost use.
 #
 # Usage:
-#   .\setup.ps1 -UnifyKey "your-key" -OrchestraUrl "https://api.unify.ai/v0" -UnityCommsUrl "https://unity-comms-app-000000000000.us-central1.run.app"
+#   .\setup.ps1 -UnifyKey "your-key" -OrchestraUrl "https://api.unify.ai/v0" -DroidCommsUrl "https://service.a.run.app"
 #   .\setup.ps1 -Start       # Start services only (no install/config, no admin needed)
 #   .\setup.ps1 -Stop
 #   .\setup.ps1 -Uninstall   # Stop services, remove scheduled tasks & firewall rules
@@ -12,18 +12,18 @@
 # Services started:
 #   - TightVNC Server (port 5900)
 #   - websockify + noVNC (port 6080)
-#   - Agent Service (port 3000 cloud SaaS, 13000 when ~/.unity compose self-host)
+#   - Agent Service (port 3000 cloud SaaS, 13000 when ~/.droid compose self-host)
 #
 # Access URLs:
 #   - Desktop: http://localhost:6080/custom.html?password=<vnc-password>
-#   - Agent API: http://localhost:3000 (or :13000 for Unity Docker self-host)
+#   - Agent API: http://localhost:3000 (or :13000 for Droid Docker self-host)
 
 param(
     [Parameter(Position = 0)]
     [string]$UnifyKey,
     
     [string]$OrchestraUrl = "https://api.unify.ai/v0",
-    [string]$UnityCommsUrl = "https://unity-comms-app-000000000000.us-central1.run.app",
+    [string]$DroidCommsUrl = "https://service.a.run.app",
     [string]$DeviceName,
     
     [switch]$Start,
@@ -325,7 +325,7 @@ function Uninstall-All {
     # 2. Unregister desktop and tunnel from server
     $unifyKey = Get-EnvValue -Key "UNIFY_KEY"
     $orchestraUrl = Get-EnvValue -Key "ORCHESTRA_URL"
-    $commsUrl = Get-EnvValue -Key "UNITY_COMMS_URL"
+    $commsUrl = Get-EnvValue -Key "DROID_COMMS_URL"
     
     if ($unifyKey) {
         Write-Host ""
@@ -1129,7 +1129,7 @@ function Sync-AuthorizedKeys {
 }
 
 # Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its
-# client config. Self-host mode: bind on all interfaces so the local Unity stack
+# client config. Self-host mode: bind on all interfaces so the local Droid stack
 # reaches the SFTP server directly (no tunnel).
 function Register-SFTPTunnel {
     param(
@@ -1309,7 +1309,7 @@ function Set-EnvValue {
 }
 
 function Test-ComposeSelfHostPresent {
-    return Test-Path (Join-Path $env:USERPROFILE '.unity\docker-compose.yml')
+    return Test-Path (Join-Path $env:USERPROFILE '.droid\docker-compose.yml')
 }
 
 function Apply-ComposeSelfHostMode {
@@ -1318,7 +1318,7 @@ function Apply-ComposeSelfHostMode {
     }
     $script:SelfHostMode = $true
     Set-Variable -Name OrchestraUrl -Value $script:ComposeSelfHostOrchestraUrl -Scope Script
-    Set-Variable -Name UnityCommsUrl -Value $script:ComposeSelfHostCommsUrl -Scope Script
+    Set-Variable -Name DroidCommsUrl -Value $script:ComposeSelfHostCommsUrl -Scope Script
     $script:LinkCoordinator = $true
 }
 
@@ -1335,9 +1335,9 @@ function Explain-OrchestraConnectFailure {
 
     Write-Host "  ERROR: Could not connect to Orchestra at ${OrchestraUrl} while trying to ${ActionDescription}." -ForegroundColor Red
     if ((Test-ComposeSelfHostPresent) -or ($OrchestraUrl -match '127\.0\.0\.1|localhost')) {
-        Write-Host "  Orchestra is not reachable on this machine - the Unity Docker stack is probably stopped." -ForegroundColor Yellow
+        Write-Host "  Orchestra is not reachable on this machine - the Droid Docker stack is probably stopped." -ForegroundColor Yellow
         Write-Host "  Start it first:" -ForegroundColor Yellow
-        Write-Host "    unity stack up" -ForegroundColor Yellow
+        Write-Host "    droid stack up" -ForegroundColor Yellow
         Write-Host "  Wait until Orchestra responds on port 8000, then register again from tray Settings" -ForegroundColor Yellow
         Write-Host "  (paste your API key) or run:" -ForegroundColor Yellow
         Write-Host "    $($script:ToolsDir)\setup.ps1 -Reconfigure -UnifyKey YOUR_KEY" -ForegroundColor Yellow
@@ -1372,7 +1372,7 @@ function Resolve-CoordinatorAgentId {
         return $script:CoordinatorAgentId
     }
 
-    $runtimeFile = Join-Path $env:USERPROFILE '.unity\coordinator-runtime.json'
+    $runtimeFile = Join-Path $env:USERPROFILE '.droid\coordinator-runtime.json'
     if (Test-Path $runtimeFile) {
         try {
             $runtime = Get-Content $runtimeFile -Raw | ConvertFrom-Json
@@ -1448,7 +1448,7 @@ function Register-SelfHostDesktop {
     Write-Host ""
     Write-Host "=== Self-Host Desktop Registration ===" -ForegroundColor Cyan
     Write-Host "  Orchestra: $OrchestraUrl" -ForegroundColor Gray
-    Write-Host "  Agent URL for Unity CM: $regUrl" -ForegroundColor Gray
+    Write-Host "  Agent URL for Droid CM: $regUrl" -ForegroundColor Gray
 
     Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $regUrl
 
@@ -1462,8 +1462,8 @@ function Register-SelfHostDesktop {
         Link-DesktopToCoordinator -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl `
             -DesktopId $desktopId -CoordinatorId $coordinatorId
         Write-Host ""
-        Write-Host "  Restart the Unity stack so CM reloads linked desktops:" -ForegroundColor Yellow
-        Write-Host "    unity restart" -ForegroundColor Yellow
+        Write-Host "  Restart the Droid stack so CM reloads linked desktops:" -ForegroundColor Yellow
+        Write-Host "    droid restart" -ForegroundColor Yellow
     }
 }
 
@@ -1797,7 +1797,7 @@ function Register-Desktop {
 function Ensure-Registration {
     $unifyKey = Get-EnvValue -Key "UNIFY_KEY"
     $orchestraUrl = Get-EnvValue -Key "ORCHESTRA_URL"
-    $commsUrl = Get-EnvValue -Key "UNITY_COMMS_URL"
+    $commsUrl = Get-EnvValue -Key "DROID_COMMS_URL"
     if (-not $unifyKey -or -not $orchestraUrl) { return }
 
     if (-not (Test-Path $script:AgentServiceDir)) {
@@ -1867,7 +1867,7 @@ function Setup-AgentServiceEnv {
     param(
         [string]$UnifyKey,
         [string]$OrchestraUrl,
-        [string]$UnityCommsUrl
+        [string]$DroidCommsUrl
     )
     
     Write-Host ""
@@ -1898,7 +1898,7 @@ function Setup-AgentServiceEnv {
 PORT=$agentPort
 UNIFY_KEY=$UnifyKey
 ORCHESTRA_URL=$OrchestraUrl
-UNITY_COMMS_URL=$UnityCommsUrl
+DROID_COMMS_URL=$DroidCommsUrl
 SELF_HOST=$selfHostFlag
 PLAYWRIGHT_BROWSERS_PATH=C:\ms-playwright
 
@@ -1922,7 +1922,7 @@ SFTP_TUNNEL_PORT=$existingSftpPort
     Write-Host "  .env created" -ForegroundColor Green
     Write-Host "    UNIFY_KEY: $(if ($UnifyKey) { '(set)' } else { '(not set)' })" -ForegroundColor Gray
     Write-Host "    ORCHESTRA_URL: $OrchestraUrl" -ForegroundColor Gray
-    Write-Host "    UNITY_COMMS_URL: $UnityCommsUrl" -ForegroundColor Gray
+    Write-Host "    DROID_COMMS_URL: $DroidCommsUrl" -ForegroundColor Gray
     if ($existingDeviceId) {
         Write-Host "    DEVICE_ID: $existingDeviceId (preserved)" -ForegroundColor Gray
     }
@@ -2076,7 +2076,7 @@ function Configure-Firewall {
         @{ Name = 'Unify-noVNC'; Port = 6080; Description = 'noVNC WebSocket' },
         @{ Name = 'Unify-AgentService'; Port = $agentPort; Description = 'Agent Service API' }
     )
-    # Self-host binds SFTP on all interfaces for the local Unity containers; cloud
+    # Self-host binds SFTP on all interfaces for the local Droid containers; cloud
     # mode binds loopback only (tunnel), so no inbound rule is needed there.
     if ($script:SelfHostMode -or (Get-EnvValue -Key 'SELF_HOST') -eq '1') {
         $rules += @{ Name = 'Unify-SFTP'; Port = $script:SftpLocalPort; Description = 'SFTP server' }
@@ -2324,13 +2324,13 @@ if ($Reconfigure) {
     Apply-ComposeSelfHostMode
     if (-not (Test-ComposeSelfHostPresent)) {
         $existingOrch = Get-EnvValue -Key "ORCHESTRA_URL"
-        $existingComms = Get-EnvValue -Key "UNITY_COMMS_URL"
+        $existingComms = Get-EnvValue -Key "DROID_COMMS_URL"
         if ($existingOrch) { $OrchestraUrl = $existingOrch }
-        if ($existingComms) { $UnityCommsUrl = $existingComms }
+        if ($existingComms) { $DroidCommsUrl = $existingComms }
         if ((Get-EnvValue -Key 'SELF_HOST') -eq '1') {
             $script:SelfHostMode = $true
             if (-not $existingOrch) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
-            if (-not $existingComms) { $UnityCommsUrl = $script:ComposeSelfHostCommsUrl }
+            if (-not $existingComms) { $DroidCommsUrl = $script:ComposeSelfHostCommsUrl }
             $script:LinkCoordinator = $true
         }
     }
@@ -2338,7 +2338,7 @@ if ($Reconfigure) {
     # Rewrite .env (preserves TUNNEL_*/DEVICE_ID) and re-apply the VNC password
     # so the TightVNC server matches the new key (noVNC sends the key as the
     # VNC password). Without this the viewer would fail after a key change.
-    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DroidCommsUrl $DroidCommsUrl
     Set-TightVNCPassword -Plain $UnifyKey
 
     # Restart services so the agent picks up the new key (it reads UNIFY_KEY at
@@ -2349,7 +2349,7 @@ if ($Reconfigure) {
         if (-not $OrchestraUrl) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
         Register-SelfHostDesktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName
     } else {
-        Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
+        Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $DroidCommsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
         $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
         if ($tunnelUrl) {
             Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $tunnelUrl
@@ -2358,9 +2358,9 @@ if ($Reconfigure) {
 
     # Re-provision the SFTP server + tunnel and persist the SFTP_* values; the
     # subsequent Start-AllServices starts them.
-    Register-SFTPTunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl
+    Register-SFTPTunnel -UnifyKey $UnifyKey -CommsUrl $DroidCommsUrl
     Setup-SFTPServer
-    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DroidCommsUrl $DroidCommsUrl
 
     Start-AllServices
     exit 0
@@ -2371,7 +2371,7 @@ if (-not $UnifyKey) {
     Write-Host "ERROR: -UnifyKey is required" -ForegroundColor Red
     Write-Host ""
     Write-Host "Usage:" -ForegroundColor Cyan
-    Write-Host "  .\setup.ps1 -UnifyKey 'your-key' [-OrchestraUrl 'https://api.unify.ai/v0'] [-UnityCommsUrl 'https://...']"
+    Write-Host "  .\setup.ps1 -UnifyKey 'your-key' [-OrchestraUrl 'https://api.unify.ai/v0'] [-DroidCommsUrl 'https://...']"
     Write-Host "  .\setup.ps1 -Start"
     Write-Host "  .\setup.ps1 -Stop"
     Write-Host "  .\setup.ps1 -Uninstall"
@@ -2417,11 +2417,11 @@ try {
     Apply-ComposeSelfHostMode
     if ($script:SelfHostMode) {
         if (-not $OrchestraUrl) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
-        if (-not $UnityCommsUrl) { $UnityCommsUrl = $script:ComposeSelfHostCommsUrl }
+        if (-not $DroidCommsUrl) { $DroidCommsUrl = $script:ComposeSelfHostCommsUrl }
         $script:LinkCoordinator = $true
     }
     Configure-TightVNC -Password $UnifyKey
-    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DroidCommsUrl $DroidCommsUrl
     Setup-TightVNCStartup
     Setup-WebsockifyStartup
     Setup-AgentServiceStartup
@@ -2434,7 +2434,7 @@ try {
     if ($script:SelfHostMode) {
         Register-SelfHostDesktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName
     } else {
-        Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
+        Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $DroidCommsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
         
         $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
         if ($tunnelUrl) {
@@ -2446,9 +2446,9 @@ try {
 
     # Provision the app-owned SFTP server + (cloud) its raw-TCP tunnel, then
     # re-write .env so the resolved SFTP_* values are persisted, and start them.
-    Register-SFTPTunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl
+    Register-SFTPTunnel -UnifyKey $UnifyKey -CommsUrl $DroidCommsUrl
     Setup-SFTPServer
-    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DroidCommsUrl $DroidCommsUrl
     Start-SFTPServer
     if (-not $script:SelfHostMode -and (Get-EnvValue -Key 'SELF_HOST') -ne '1') {
         Start-SFTPTunnel

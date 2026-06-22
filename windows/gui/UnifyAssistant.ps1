@@ -96,7 +96,7 @@ function Get-EnvValue {
 }
 
 function Test-ComposeSelfHostPresent {
-    return Test-Path (Join-Path $env:USERPROFILE '.unity\docker-compose.yml')
+    return Test-Path (Join-Path $env:USERPROFILE '.droid\docker-compose.yml')
 }
 
 function Get-AgentPort {
@@ -424,20 +424,20 @@ function Show-SettingsDialog {
     $form.Controls.Add($txtUrl)
     $yPos += 40
     
-    # Unity Comms URL Label
+    # Droid Comms URL Label
     $lblComms = New-Object System.Windows.Forms.Label
-    $lblComms.Text = "Unity Comms URL:"
+    $lblComms.Text = "Droid Comms URL:"
     $lblComms.Location = New-Object System.Drawing.Point(20, $yPos)
     $lblComms.Size = New-Object System.Drawing.Size(120, 20)
     $form.Controls.Add($lblComms)
     $yPos += 25
     
-    # Unity Comms URL TextBox (read-only)
+    # Droid Comms URL TextBox (read-only)
     $txtComms = New-Object System.Windows.Forms.TextBox
     $txtComms.Location = New-Object System.Drawing.Point(20, $yPos)
     $txtComms.Size = New-Object System.Drawing.Size(390, 25)
-    $txtComms.Text = Get-EnvValue -Key "UNITY_COMMS_URL"
-    if (-not $txtComms.Text) { $txtComms.Text = "https://unity-comms-app-000000000000.us-central1.run.app" }
+    $txtComms.Text = Get-EnvValue -Key "DROID_COMMS_URL"
+    if (-not $txtComms.Text) { $txtComms.Text = "https://service.a.run.app" }
     $txtComms.ReadOnly = $true
     $txtComms.BackColor = [System.Drawing.SystemColors]::Control
     $form.Controls.Add($txtComms)

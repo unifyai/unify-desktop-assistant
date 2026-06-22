@@ -24,11 +24,11 @@
 
 #if Environment == "staging"
   #define OrchestraUrl "https://internal.example.com/v0"
-  #define CommsUrl "https://unity-comms-app-staging-000000000000.us-central1.run.app"
+  #define CommsUrl "https://service.a.run.app"
   #define EnvSuffix "-staging"
 #else
   #define OrchestraUrl "https://api.unify.ai/v0"
-  #define CommsUrl "https://unity-comms-app-000000000000.us-central1.run.app"
+  #define CommsUrl "https://service.a.run.app"
   #define EnvSuffix ""
 #endif
 
@@ -131,7 +131,7 @@ var
 
 function TestComposeSelfHostPresent: Boolean;
 begin
-  Result := FileExists(ExpandConstant('{%USERPROFILE}\.unity\docker-compose.yml'));
+  Result := FileExists(ExpandConstant('{%USERPROFILE}\.droid\docker-compose.yml'));
 end;
 
 function GetSetupRunParams(Param: String): String;
@@ -140,7 +140,7 @@ begin
   if TestComposeSelfHostPresent then
     Result := Result + ' -SelfHost -LinkCoordinator'
   else
-    Result := Result + ' -OrchestraUrl "{#OrchestraUrl}" -UnityCommsUrl "{#CommsUrl}"';
+    Result := Result + ' -OrchestraUrl "{#OrchestraUrl}" -DroidCommsUrl "{#CommsUrl}"';
 end;
 
 // =========================================================================
@@ -350,7 +350,7 @@ begin
     EnvContent := 'PORT=' + AgentPort + Chr(13) + Chr(10) +
                   'UNIFY_KEY=' + UnifyKeyEdit.Text + Chr(13) + Chr(10) +
                   'ORCHESTRA_URL=' + OrchestraUrl + Chr(13) + Chr(10) +
-                  'UNITY_COMMS_URL=' + CommsUrl + Chr(13) + Chr(10) +
+                  'DROID_COMMS_URL=' + CommsUrl + Chr(13) + Chr(10) +
                   'SELF_HOST=' + SelfHostFlag + Chr(13) + Chr(10) +
                   'PLAYWRIGHT_BROWSERS_PATH=C:\ms-playwright' + Chr(13) + Chr(10) +
                   Chr(13) + Chr(10) +
