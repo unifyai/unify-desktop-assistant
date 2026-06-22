@@ -15,11 +15,11 @@
 # Services started:
 #   - x11vnc (port 5900)
 #   - websockify + noVNC (port 6080)
-#   - Agent Service (port 3000 cloud SaaS, 13000 when ~/.unity compose self-host)
+#   - Agent Service (port 3000 cloud SaaS, 13000 when ~/.droid compose self-host)
 #
 # Access URLs:
 #   - Desktop: http://localhost:6080/custom.html?password=<vnc-password>
-#   - Agent API: http://localhost:3000 (or :13000 for Unity Docker self-host)
+#   - Agent API: http://localhost:3000 (or :13000 for Droid Docker self-host)
 
 set -euo pipefail
 
@@ -44,7 +44,7 @@ SFTP_RATHOLE_CONFIG="$RATHOLE_DIR/sftp-tunnel.toml"
 # Default configuration
 UNIFY_KEY=""
 ORCHESTRA_URL="https://api.unify.ai/v0"
-UNITY_COMMS_URL="https://unity-comms-app-000000000000.us-central1.run.app"
+DROID_COMMS_URL="https://service.a.run.app"
 DO_START=false
 DO_STOP=false
 DO_UNINSTALL=false
@@ -73,14 +73,14 @@ Usage: $(basename "$0") [OPTIONS]
 Options:
   --unify-key KEY       Unify API key (required for install)
   --orchestra-url URL   Orchestra URL (default: https://api.unify.ai/v0)
-  --unity-comms-url URL Unity Comms URL
+  --droid-comms-url URL Droid Comms URL
   --start               Start services only (no install/config, no root needed)
   --stop                Stop all services
   --uninstall           Stop services, remove systemd units & firewall rules
   --sync-keys           Reconcile SFTP authorized_keys + report tunnel coords, then exit
   --prereqs-only        Install prerequisites only (no key required, no config/registration)
   --reconfigure         Re-apply key + re-register + restart services (no deps, no root)
-  --self-host           Unity Docker self-host mode (local Orchestra, no tunnel, port ${SELF_HOST_AGENT_PORT})
+  --self-host           Droid Docker self-host mode (local Orchestra, no tunnel, port ${SELF_HOST_AGENT_PORT})
   --link-coordinator    Link registered desktop to the Coordinator assistant (self-host)
   --coordinator-agent-id ID  Coordinator agent id for --link-coordinator (optional)
   --skip-apt            Skip apt-get operations (used by .deb postinst)
@@ -104,8 +104,8 @@ while [[ $# -gt 0 ]]; do
             UNIFY_KEY="$2"; shift 2 ;;
         --orchestra-url)
             ORCHESTRA_URL="$2"; shift 2 ;;
-        --unity-comms-url)
-            UNITY_COMMS_URL="$2"; shift 2 ;;
+        --droid-comms-url)
+            DROID_COMMS_URL="$2"; shift 2 ;;
         --start)
             DO_START=true; shift ;;
         --stop)
@@ -218,7 +218,7 @@ set_env_value() {
 }
 
 # =============================================================================
-# Unity Docker Compose self-host (local ~/.unity stack)
+# Droid Docker Compose self-host (local ~/.droid stack)
 # =============================================================================
 
 compose_self_host_user_home() {
@@ -230,7 +230,7 @@ compose_self_host_user_home() {
 }
 
 compose_self_host_present() {
-    [[ -f "$(compose_self_host_user_home)/.unity/docker-compose.yml" ]]
+    [[ -f "$(compose_self_host_user_home)/.droid/docker-compose.yml" ]]
 }
 
 apply_compose_self_host_mode() {
@@ -239,7 +239,7 @@ apply_compose_self_host_mode() {
     fi
     SELF_HOST_MODE=true
     ORCHESTRA_URL="$COMPOSE_SELF_HOST_ORCHESTRA_URL"
-    UNITY_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
+    DROID_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
     LINK_COORDINATOR=true
 }
 
@@ -254,9 +254,9 @@ explain_orchestra_connect_failure() {
 
     echo "  ERROR: Could not connect to Orchestra at ${orchestra_url} while trying to ${action_description}." >&2
     if compose_self_host_present || [[ "$orchestra_url" == *127.0.0.1* || "$orchestra_url" == *localhost* ]]; then
-        echo "  Orchestra is not reachable on this machine — the Unity Docker stack is probably stopped." >&2
+        echo "  Orchestra is not reachable on this machine — the Droid Docker stack is probably stopped." >&2
         echo "  Start it first:" >&2
-        echo "    unity stack up" >&2
+        echo "    droid stack up" >&2
         echo "  Wait until Orchestra responds on port 8000, then register again from tray Settings" >&2
         echo "  (paste your API key) or run:" >&2
         echo "    $TOOLS_DIR/setup.sh --reconfigure --unify-key YOUR_KEY" >&2
@@ -297,7 +297,7 @@ resolve_coordinator_agent_id() {
     fi
 
     local runtime_file
-    runtime_file="$(compose_self_host_user_home)/.unity/coordinator-runtime.json"
+    runtime_file="$(compose_self_host_user_home)/.droid/coordinator-runtime.json"
     if [[ -f "$runtime_file" ]]; then
         local from_file
         from_file="$(python3 - "$runtime_file" <<'PY'
@@ -398,7 +398,7 @@ register_self_host_desktop() {
     echo ""
     echo "=== Self-Host Desktop Registration ==="
     echo "  Orchestra: ${orchestra_url}"
-    echo "  Agent URL for Unity CM: ${reg_url}"
+    echo "  Agent URL for Droid CM: ${reg_url}"
 
     register_desktop "$unify_key" "$orchestra_url" "$device_name" "$reg_url" || return 1
 
@@ -412,8 +412,8 @@ register_self_host_desktop() {
         fi
         link_desktop_to_coordinator "$unify_key" "$orchestra_url" "$desktop_id" "$coordinator_id" || true
         echo ""
-        echo "  Restart the Unity stack so CM reloads linked desktops:"
-        echo "    unity restart"
+        echo "  Restart the Droid stack so CM reloads linked desktops:"
+        echo "    droid restart"
     fi
 }
 
@@ -588,7 +588,7 @@ uninstall_all() {
     local unify_key orchestra_url comms_url
     unify_key=$(get_env_value "UNIFY_KEY")
     orchestra_url=$(get_env_value "ORCHESTRA_URL")
-    comms_url=$(get_env_value "UNITY_COMMS_URL")
+    comms_url=$(get_env_value "DROID_COMMS_URL")
 
     if [[ -n "$unify_key" ]]; then
         echo ""
@@ -1232,7 +1232,7 @@ PY
 }
 
 # Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its
-# client config. Self-host mode: bind on all interfaces so the local Unity stack
+# client config. Self-host mode: bind on all interfaces so the local Droid stack
 # reaches the SFTP server directly (no tunnel).
 register_sftp_tunnel() {
     local unify_key=$1
@@ -1613,7 +1613,7 @@ ensure_registration() {
 
     unify_key=$(get_env_value "UNIFY_KEY")
     orchestra_url=$(get_env_value "ORCHESTRA_URL")
-    comms_url=$(get_env_value "UNITY_COMMS_URL")
+    comms_url=$(get_env_value "DROID_COMMS_URL")
     [[ -z "$unify_key" || -z "$orchestra_url" ]] && return 0
 
     lock_dir="$AGENT_SERVICE_DIR/.recover.lock"
@@ -1700,7 +1700,7 @@ setup_agent_service_env() {
 PORT=$agent_port
 UNIFY_KEY=$UNIFY_KEY
 ORCHESTRA_URL=$ORCHESTRA_URL
-UNITY_COMMS_URL=$UNITY_COMMS_URL
+DROID_COMMS_URL=$DROID_COMMS_URL
 SELF_HOST=$($SELF_HOST_MODE && echo 1 || echo 0)
 PLAYWRIGHT_BROWSERS_PATH=$INSTALL_DIR/browsers
 
@@ -1722,7 +1722,7 @@ ENVFILE
     echo "  .env created"
     echo "    UNIFY_KEY: $(if [[ -n "$UNIFY_KEY" ]]; then echo '(set)'; else echo '(not set)'; fi)"
     echo "    ORCHESTRA_URL: $ORCHESTRA_URL"
-    echo "    UNITY_COMMS_URL: $UNITY_COMMS_URL"
+    echo "    DROID_COMMS_URL: $DROID_COMMS_URL"
     if [[ -n "$existing_device_id" ]]; then
         echo "    DEVICE_ID: $existing_device_id (preserved)"
     fi
@@ -1836,7 +1836,7 @@ configure_firewall() {
     agent_port="$(agent_service_port)"
 
     local fw_ports=("6080/tcp:noVNC" "${agent_port}/tcp:Agent Service")
-    # Self-host binds SFTP on all interfaces so the local Unity containers can
+    # Self-host binds SFTP on all interfaces so the local Droid containers can
     # reach it; cloud mode binds loopback only (tunnel), so no rule is needed.
     if $SELF_HOST_MODE || [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
         fw_ports+=("${SFTP_LOCAL_PORT}/tcp:SFTP")
@@ -2106,13 +2106,13 @@ if $RECONFIGURE; then
     apply_compose_self_host_mode
     if ! compose_self_host_present; then
         existing_orch="$(get_env_value "ORCHESTRA_URL")"
-        existing_comms="$(get_env_value "UNITY_COMMS_URL")"
+        existing_comms="$(get_env_value "DROID_COMMS_URL")"
         [[ -n "$existing_orch" ]]  && ORCHESTRA_URL="$existing_orch"
-        [[ -n "$existing_comms" ]] && UNITY_COMMS_URL="$existing_comms"
+        [[ -n "$existing_comms" ]] && DROID_COMMS_URL="$existing_comms"
         if [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
             SELF_HOST_MODE=true
             ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
-            UNITY_COMMS_URL="${UNITY_COMMS_URL:-http://127.0.0.1:8001}"
+            DROID_COMMS_URL="${DROID_COMMS_URL:-http://127.0.0.1:8001}"
             LINK_COORDINATOR=true
         fi
     fi
@@ -2131,7 +2131,7 @@ if $RECONFIGURE; then
         ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
         register_self_host_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" || true
     else
-        register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" "$(agent_service_port)" "$DEVICE_NAME" || true
+        register_tunnel "$UNIFY_KEY" "$DROID_COMMS_URL" "$(agent_service_port)" "$DEVICE_NAME" || true
         tunnel_url=$(get_env_value "TUNNEL_URL")
         if [[ -n "$tunnel_url" ]]; then
             register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
@@ -2139,7 +2139,7 @@ if $RECONFIGURE; then
     fi
 
     # Re-provision the SFTP server + tunnel and persist the SFTP_* values.
-    register_sftp_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" || true
+    register_sftp_tunnel "$UNIFY_KEY" "$DROID_COMMS_URL" || true
     setup_sftp_server || true
     setup_agent_service_env
 
@@ -2234,7 +2234,7 @@ fi
 apply_compose_self_host_mode
 if $SELF_HOST_MODE; then
     ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
-    UNITY_COMMS_URL="${UNITY_COMMS_URL:-http://127.0.0.1:8001}"
+    DROID_COMMS_URL="${DROID_COMMS_URL:-http://127.0.0.1:8001}"
     LINK_COORDINATOR=true
 fi
 setup_agent_service_env
@@ -2251,11 +2251,11 @@ if [[ -n "$target_user" && "$target_user" != "root" ]]; then
     chown -R "$target_user":"$(id -gn "$target_user")" "$INSTALL_DIR" 2>/dev/null || true
 fi
 
-# Register desktop for Unity control.
+# Register desktop for Droid control.
 if $SELF_HOST_MODE; then
     register_self_host_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" || true
 else
-    register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" "$(agent_service_port)" "$DEVICE_NAME" || true
+    register_tunnel "$UNIFY_KEY" "$DROID_COMMS_URL" "$(agent_service_port)" "$DEVICE_NAME" || true
     tunnel_url=$(get_env_value "TUNNEL_URL")
     if [[ -n "$tunnel_url" ]]; then
         register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
@@ -2264,7 +2264,7 @@ fi
 
 # Provision the app-owned SFTP server + (cloud) its raw-TCP tunnel, then re-write
 # the .env so the resolved SFTP_* values are persisted for the systemd unit.
-register_sftp_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" || true
+register_sftp_tunnel "$UNIFY_KEY" "$DROID_COMMS_URL" || true
 setup_sftp_server || true
 setup_agent_service_env
 

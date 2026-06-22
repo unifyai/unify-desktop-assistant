@@ -26,7 +26,7 @@ Commands:
 Setup Options:
   --unify-key KEY         Unify API key (required for setup)
   --orchestra-url URL     Orchestra URL (default: https://api.unify.ai/v0)
-  --unity-comms-url URL   Unity Comms URL
+  --droid-comms-url URL   Droid Comms URL
   --force                 Force reinstall all components
 
 Examples:
