@@ -2,7 +2,7 @@
 # Launchd entrypoint: app-owned SFTP server (rclone serve sftp) for Unify Desktop
 # Assistant. Serves the user's $HOME, pubkey-only auth (authorized_keys synced
 # from Orchestra), bound per-mode (cloud=127.0.0.1 behind the rathole tunnel,
-# self-host=0.0.0.0 so the local Unity stack can reach it).
+# self-host=0.0.0.0 so the local Droid stack can reach it).
 set -euo pipefail
 
 TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
