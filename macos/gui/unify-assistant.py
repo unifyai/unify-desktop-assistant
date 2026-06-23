@@ -49,7 +49,19 @@ LOGO_PATH = ASSETS_DIR / "unify_logo_only.png"
 
 VNC_PORT = 5900
 NOVNC_PORT = 6080
-AGENT_PORT = 3000
+
+
+def compose_self_host_present() -> bool:
+    """True when a Droid Docker compose self-host install exists."""
+    return (Path.home() / ".droid" / "docker-compose.yml").exists()
+
+
+def agent_port() -> int:
+    """Agent-service listen port from .env (13000 self-host, 3000 cloud SaaS)."""
+    raw = get_env_value("PORT")
+    if raw.isdigit():
+        return int(raw)
+    return 13000 if compose_self_host_present() else 3000
 
 STATUS_INTERVAL = 5  # seconds
 
@@ -99,7 +111,7 @@ def get_service_status() -> dict:
     """Get status of all services by checking ports."""
     vnc = test_port_listening(VNC_PORT)
     novnc = test_port_listening(NOVNC_PORT)
-    agent = test_port_listening(AGENT_PORT)
+    agent = test_port_listening(agent_port())
     tunnel = is_tunnel_running()
     return {
         "vnc": vnc,
@@ -441,7 +453,6 @@ class UnifyTrayApp(rumps.App):
             return
 
         set_env_value("UNIFY_KEY", key)
-        set_env_value("PORT", "3000")
 
         rumps.notification(
             APP_NAME, "Setting up",
@@ -449,14 +460,11 @@ class UnifyTrayApp(rumps.App):
         )
 
         def worker():
-            # --reconfigure does its own stop + restart with the new key, so the
-            # agent picks up the new key instead of keeping the old one in memory.
+            # setup.sh auto-detects ~/.droid compose self-host on --reconfigure.
             subprocess.run(
                 ["bash", str(SETUP_SCRIPT), "--reconfigure", "--unify-key", key],
                 capture_output=True,
             )
-            # Screen Sharing uses the macOS account (ARD), not a key-derived VNC
-            # password, so it does not need re-enabling when the key changes.
             rumps.notification(
                 APP_NAME, "Ready", "Unify Desktop Assistant is set up.",
             )
@@ -473,7 +481,7 @@ class UnifyTrayApp(rumps.App):
 
     def _open_api(self, _sender):
         """Open the Agent API in the default browser."""
-        webbrowser.open(f"http://localhost:{AGENT_PORT}")
+        webbrowser.open(f"http://localhost:{agent_port()}")
 
     def _copy_public_url(self, _sender):
         """Copy the tunnel public URL to the clipboard."""
@@ -532,8 +540,8 @@ class UnifyTrayApp(rumps.App):
         tunnel_url = get_env_value("TUNNEL_URL") or "(not available)"
         orchestra_url = get_env_value("ORCHESTRA_URL") or "https://api.unify.ai/v0"
         comms_url = (
-            get_env_value("UNITY_COMMS_URL")
-            or "https://unity-comms-app-000000000000.us-central1.run.app"
+            get_env_value("DROID_COMMS_URL")
+            or "https://service.a.run.app"
         )
 
         key_state = "configured" if current_key else "not set"

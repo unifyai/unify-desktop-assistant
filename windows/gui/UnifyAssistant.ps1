@@ -28,7 +28,6 @@ $script:IconPath = Join-Path $script:InstallDir 'assets\icon.ico'
 # Service ports
 $script:VncPort = 5900
 $script:NoVncPort = 6080
-$script:AgentPort = 3000
 
 # Status check interval (ms)
 $script:StatusInterval = 5000
@@ -48,7 +47,7 @@ function Get-ServiceStatus {
 
     $vnc = $listeningPorts -contains $script:VncPort
     $novnc = $listeningPorts -contains $script:NoVncPort
-    $agent = $listeningPorts -contains $script:AgentPort
+    $agent = $listeningPorts -contains (Get-AgentPort)
     
     # Check if rathole tunnel is running
     $tunnel = $false
@@ -94,6 +93,21 @@ function Get-EnvValue {
         }
     }
     return ""
+}
+
+function Test-ComposeSelfHostPresent {
+    return Test-Path (Join-Path $env:USERPROFILE '.droid\docker-compose.yml')
+}
+
+function Get-AgentPort {
+    $raw = Get-EnvValue -Key 'PORT'
+    if ($raw -match '^\d+$') {
+        return [int]$raw
+    }
+    if (Test-ComposeSelfHostPresent) {
+        return 13000
+    }
+    return 3000
 }
 
 function Set-EnvValue {
@@ -273,7 +287,81 @@ function Update-TrayStatus {
 # Settings Dialog
 # =============================================================================
 
+function Invoke-Reconfigure {
+    param([string]$Key)
+
+    # Re-run setup elevated so the new key takes effect: setup.ps1 -Reconfigure
+    # rewrites .env (preserving baked URLs + tunnel/device IDs), updates the
+    # TightVNC password to match the key, re-registers, and restarts services.
+    # It needs admin (writes HKLM + restarts service processes), so we relaunch
+    # via UAC. The key is passed as an argument, matching -Start/-Stop usage.
+    try {
+        Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", "`"$($script:SetupScript)`"",
+            "-Reconfigure", "-UnifyKey", "`"$Key`""
+        )
+        $script:NotifyIcon.ShowBalloonTip(
+            3000, "Updating",
+            "Applying new API key and restarting services...",
+            [System.Windows.Forms.ToolTipIcon]::Info
+        )
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Could not start reconfigure (elevation was cancelled or failed). The new key was saved but services were not restarted.",
+            "Reconfigure",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+    }
+}
+
+function Invoke-Uninstall {
+    $confirm = [System.Windows.Forms.MessageBox]::Show(
+        "This will stop all services, unregister this device, and remove Unify Desktop Assistant from this computer.`n`nThis cannot be undone.`n`nUninstall now?",
+        "Uninstall Unify Desktop Assistant?",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    # Prefer the Inno Setup uninstaller: it self-elevates, runs setup.ps1
+    # -Uninstall, and removes the install dir + the HKCU Run key. Fall back to an
+    # elevated setup.ps1 -Uninstall for dev installs without the uninstaller.
+    $uninst = $null
+    foreach ($name in @('unins000.exe', 'unins001.exe', 'unins002.exe')) {
+        $candidate = Join-Path $script:InstallDir $name
+        if (Test-Path $candidate) { $uninst = $candidate; break }
+    }
+
+    try {
+        if ($uninst) {
+            Start-Process -FilePath $uninst -ArgumentList "/SILENT"
+        } else {
+            Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList @(
+                "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", "`"$($script:SetupScript)`"", "-Uninstall"
+            )
+        }
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Uninstall could not be started (elevation was cancelled or failed).",
+            "Uninstall",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        return
+    }
+
+    # Quit the tray so it doesn't hold files open during removal.
+    $script:NotifyIcon.Visible = $false
+    $script:NotifyIcon.Dispose()
+    $appContext.ExitThread()
+    [System.Windows.Forms.Application]::Exit()
+}
+
 function Show-SettingsDialog {
+    $script:OldUnifyKey = Get-EnvValue -Key "UNIFY_KEY"
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Settings"
     $form.Size = New-Object System.Drawing.Size(450, 480)
@@ -336,20 +424,20 @@ function Show-SettingsDialog {
     $form.Controls.Add($txtUrl)
     $yPos += 40
     
-    # Unity Comms URL Label
+    # Droid Comms URL Label
     $lblComms = New-Object System.Windows.Forms.Label
-    $lblComms.Text = "Unity Comms URL:"
+    $lblComms.Text = "Droid Comms URL:"
     $lblComms.Location = New-Object System.Drawing.Point(20, $yPos)
     $lblComms.Size = New-Object System.Drawing.Size(120, 20)
     $form.Controls.Add($lblComms)
     $yPos += 25
     
-    # Unity Comms URL TextBox (read-only)
+    # Droid Comms URL TextBox (read-only)
     $txtComms = New-Object System.Windows.Forms.TextBox
     $txtComms.Location = New-Object System.Drawing.Point(20, $yPos)
     $txtComms.Size = New-Object System.Drawing.Size(390, 25)
-    $txtComms.Text = Get-EnvValue -Key "UNITY_COMMS_URL"
-    if (-not $txtComms.Text) { $txtComms.Text = "https://unity-comms-app-000000000000.us-central1.run.app" }
+    $txtComms.Text = Get-EnvValue -Key "DROID_COMMS_URL"
+    if (-not $txtComms.Text) { $txtComms.Text = "https://service.a.run.app" }
     $txtComms.ReadOnly = $true
     $txtComms.BackColor = [System.Drawing.SystemColors]::Control
     $form.Controls.Add($txtComms)
@@ -443,10 +531,11 @@ function Show-SettingsDialog {
     $btnSave.Location = New-Object System.Drawing.Point(230, $yPos)
     $btnSave.Size = New-Object System.Drawing.Size(80, 30)
     $btnSave.Add_Click({
-        # Save .env values
-        Set-EnvValue -Key "UNIFY_KEY" -Value $txtKey.Text
-        Set-EnvValue -Key "ORCHESTRA_URL" -Value $txtUrl.Text
-        Set-EnvValue -Key "UNITY_COMMS_URL" -Value $txtComms.Text
+        # Persist only the API key here. The URLs are baked at install and are
+        # preserved by setup.ps1 -Reconfigure, so we don't rewrite them from the
+        # (read-only) fields and risk clobbering a staging/custom URL.
+        $newKey = $txtKey.Text.Trim()
+        Set-EnvValue -Key "UNIFY_KEY" -Value $newKey
         
         # Ensure startup registry key is always set
         $startupPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
@@ -457,6 +546,13 @@ function Show-SettingsDialog {
         # Save settings (always auto-start)
         Save-Settings @{
             AutoStartServices = $true
+        }
+        
+        # If the key actually changed, re-run setup so services restart and the
+        # VNC password is updated to match. Writing .env alone leaves the old key
+        # live in the running agent and the old VNC password on the server.
+        if ($newKey -and $newKey -ne $script:OldUnifyKey) {
+            Invoke-Reconfigure -Key $newKey
         }
         
         $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
@@ -580,6 +676,12 @@ $contextMenu.Items.Add($logsItem) | Out-Null
 
 # Separator
 $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+# Uninstall
+$uninstallItem = New-Object System.Windows.Forms.ToolStripMenuItem
+$uninstallItem.Text = "Uninstall..."
+$uninstallItem.Add_Click({ Invoke-Uninstall })
+$contextMenu.Items.Add($uninstallItem) | Out-Null
 
 # Exit
 $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem

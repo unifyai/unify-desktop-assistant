@@ -21,6 +21,45 @@ import { getLlmConfig } from './llmConfig';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+const DESKTOP_NOVNC_HOST = process.env.DESKTOP_NOVNC_HOST || '127.0.0.1';
+const DESKTOP_NOVNC_PORT = Number(process.env.DESKTOP_NOVNC_PORT || 6080);
+
+/** VNC password matches setup.sh (first 8 chars of UNIFY_KEY). */
+function buildDesktopNoVncUrl(): string {
+  const password = (process.env.UNIFY_KEY || '').slice(0, 8);
+  const params = new URLSearchParams({
+    password,
+    autoconnect: '1',
+    resize: 'scale',
+    reconnect: '1',
+    show_dot: '1',
+  });
+  return `http://${DESKTOP_NOVNC_HOST}:${DESKTOP_NOVNC_PORT}/vnc.html?${params}`;
+}
+
+/** Playwright desktop mode loads the local noVNC page; fail fast if websockify is down. */
+async function waitForLocalNoVnc(timeoutMs = 20000): Promise<void> {
+  const probeUrl = buildDesktopNoVncUrl();
+  const deadline = Date.now() + timeoutMs;
+  let lastError = 'unknown';
+  while (Date.now() < deadline) {
+    try {
+      const resp = await fetch(probeUrl, { redirect: 'manual' });
+      if (resp.ok) {
+        return;
+      }
+      lastError = `HTTP ${resp.status}`;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+    await sleep(500);
+  }
+  throw new Error(
+    `noVNC is not reachable at http://${DESKTOP_NOVNC_HOST}:${DESKTOP_NOVNC_PORT} (${lastError}). ` +
+    'Start websockify on port 6080 before user-desktop control.',
+  );
+}
+
 // --- Debug logging helpers ---
 const MAGNITUDE_DEBUG = process.env.MAGNITUDE_DEBUG === 'true';
 const MAGNITUDE_LOG_DIR = process.env.MAGNITUDE_LOG_DIR || '';
@@ -64,15 +103,15 @@ function debugLog(line: string): void {
 // --- File System and Command Execution Utilities ---
 //
 // Workspace root for file operations, command execution, and browser downloads.
-// Matches Unity's get_local_root() default of ~/Unity/Local.
-// Override via UNITY_LOCAL_ROOT env var.
-const LOCAL_ROOT = process.env.UNITY_LOCAL_ROOT || path.join(os.homedir(), 'Unity', 'Local');
+// Matches Droid's get_local_root() default of ~/Droid/Local.
+// Override via DROID_LOCAL_ROOT env var.
+const LOCAL_ROOT = process.env.DROID_LOCAL_ROOT || path.join(os.homedir(), 'Droid', 'Local');
 try { fs.mkdirSync(LOCAL_ROOT, { recursive: true }); } catch (_e) { /* ignore */ }
 const DEFAULT_EXEC_TIMEOUT = 60 * 60 * 1000; // 1 hour
 
 
 // Multer configuration for multipart file uploads
-const uploadTempDir = path.join(os.tmpdir(), 'unity-uploads');
+const uploadTempDir = path.join(os.tmpdir(), 'droid-uploads');
 try {
   fs.mkdirSync(uploadTempDir, { recursive: true });
 } catch (_e) {
@@ -613,7 +652,10 @@ process.on('exit', cleanupDemoSites);
 
 // --- Agent Initialization ---
 console.log(`Starting Magnitude BrowserAgent...`);
-app.listen(port, () => {
+const root = express();
+root.use('/api', app);
+root.use(app);
+root.listen(port, () => {
   console.log(`🚀 BrowserAgent service listening on http://localhost:${port}`);
 });
 
@@ -672,8 +714,8 @@ const getLaunchOptions = (
 
 const startDesktop = async (): Promise<BrowserAgent> => {
   try {
-    const encodedPassword = encodeURIComponent(process.env.UNIFY_KEY || '');
-    const desktopUrl = `http://localhost:6080/custom.html?password=${encodedPassword}`;
+    await waitForLocalNoVnc();
+    const desktopUrl = buildDesktopNoVncUrl();
     const desktopOrigin = new URL(desktopUrl).origin;
     const agent = await startBrowserAgent({
       url: desktopUrl,
@@ -1157,17 +1199,24 @@ app.post('/start', async (req: Request, res: Response) => {
   }
 
   // Desktop mode is singleton -- one physical display, one session.
-  // Close any existing desktop session before creating a new one.
+  // Fully stop any existing desktop session before creating a new one so
+  // Playwright does not tear down the browser context mid-start.
   if (mode === "desktop") {
+    const stopTasks: Array<Promise<void>> = [];
     for (const [existingId, existing] of activeSessions.entries()) {
       if (existing.mode === "desktop") {
         console.log(`Replacing existing desktop session: ${existingId}`);
-        existing.agent.stop().catch((err: unknown) =>
-          console.error(`Error stopping old desktop session: ${err}`)
+        stopTasks.push(
+          existing.agent.stop().catch((err: unknown) => {
+            console.error(`Error stopping old desktop session: ${err}`);
+          }),
         );
         activeSessions.delete(existingId);
         broadcastSessionEvent(existingId, 'replaced');
       }
+    }
+    if (stopTasks.length > 0) {
+      await Promise.all(stopTasks);
     }
   }
 
@@ -1222,7 +1271,7 @@ app.post('/start', async (req: Request, res: Response) => {
       // if magnitude's route already handled it, this won't fire.
       // If this DOES fire for a mapped URL, it means magnitude's route did NOT catch it.
       try {
-        await agent.context.route('**/*', async (route) => {
+        await agent.context.route('**/*', async (route: any) => {
           const req = route.request();
           const url = req.url();
           const isNav = req.isNavigationRequest();
@@ -1654,7 +1703,7 @@ function nativeScreenshotCommand(dest: string): string {
 }
 
 function nativeScreenshot(): string {
-  const dest = path.join(os.tmpdir(), `unity-screenshot-${randomUUID()}.png`);
+  const dest = path.join(os.tmpdir(), `droid-screenshot-${randomUUID()}.png`);
   try {
     execSync(nativeScreenshotCommand(dest), { timeout: 10_000 });
     const buf = fs.readFileSync(dest);
@@ -2194,7 +2243,7 @@ app.post('/captcha/solve', isAgentReady, async (req: Request, res: Response) => 
     try {
       settledVia = await Promise.race([
         page.waitForResponse(
-          (r) => /recaptcha\/(api2|enterprise)\/userverify/.test(r.url()),
+          (r: { url: () => string }) => /recaptcha\/(api2|enterprise)\/userverify/.test(r.url()),
           { timeout: SETTLE_TIMEOUT_MS },
         ).then(() => 'userverify' as const),
         page.waitForLoadState('networkidle', { timeout: SETTLE_TIMEOUT_MS })
@@ -2296,7 +2345,7 @@ app.post('/googlemeet/join', auth, async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'bad_request', message: 'meetUrl is required.' });
   }
 
-  const name = displayName || 'Unity Assistant';
+  const name = displayName || 'Droid Assistant';
   const sessionId = randomUUID();
   const t0 = Date.now();
   console.log(`[googlemeet/join] BEGIN sessionId=${sessionId} url=${meetUrl}`);
@@ -2883,7 +2932,7 @@ app.post('/teamsmeet/join', auth, async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'bad_request', message: 'meetUrl is required.' });
   }
 
-  const name = displayName || 'Unity Assistant';
+  const name = displayName || 'Droid Assistant';
   const sessionId = randomUUID();
   const t0 = Date.now();
   console.log(`[teamsmeet/join] BEGIN sessionId=${sessionId} url=${meetUrl}`);

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.unify.sftp-sync</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>%INSTALL_DIR%/tools/setup.sh</string>
+		<string>--sync-keys</string>
+	</array>
+
+	<!-- Reconcile authorized_keys + report SFTP tunnel coordinates on a timer so
+	     links enabled later in the console are picked up without a reinstall. -->
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>StartInterval</key>
+	<integer>300</integer>
+
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+
+	<key>StandardOutPath</key>
+	<string>%LOG_DIR%/sftp-sync.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>%LOG_DIR%/sftp-sync.log</string>
+</dict>
+</plist>

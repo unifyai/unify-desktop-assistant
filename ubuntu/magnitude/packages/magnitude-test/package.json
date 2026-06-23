@@ -61,8 +61,8 @@
     "@types/node": "^22.13.4",
     "@types/react": "^18.2.0",
     "pkgroll": "^2.10.0",
-    "typescript": "~5.7.2",
-    "playwright": "npm:rebrowser-playwright@^1.52.0"
+    "playwright": "npm:rebrowser-playwright@^1.52.0",
+    "typescript": "~5.7.2"
   },
   "dependencies": {
     "@commander-js/extra-typings": "^14.0.0",
@@ -71,7 +71,7 @@
     "chalk": "^5.4.1",
     "commander": "^14.0.0",
     "dotenv": "^16.5.0",
-    "esbuild": "^0.25.1",
+    "esbuild": "0.28.1",
     "glob": "^11.0.1",
     "jiti": "^2.4.2",
     "log-update": "^6.1.0",

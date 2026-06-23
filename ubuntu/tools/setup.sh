@@ -15,11 +15,11 @@
 # Services started:
 #   - x11vnc (port 5900)
 #   - websockify + noVNC (port 6080)
-#   - Agent Service (port 3000)
+#   - Agent Service (port 3000 cloud SaaS, 13000 when ~/.droid compose self-host)
 #
 # Access URLs:
 #   - Desktop: http://localhost:6080/custom.html?password=<vnc-password>
-#   - Agent API: http://localhost:3000
+#   - Agent API: http://localhost:3000 (or :13000 for Droid Docker self-host)
 
 set -euo pipefail
 
@@ -33,18 +33,34 @@ LOG_DIR="$INSTALL_DIR/logs"
 RATHOLE_DIR="$INSTALL_DIR/rathole"
 RATHOLE_BIN="$RATHOLE_DIR/rathole"
 RATHOLE_CONFIG="$RATHOLE_DIR/client.toml"
+RCLONE_DIR="$INSTALL_DIR/rclone"
+RCLONE_BIN="$RCLONE_DIR/rclone"
+SSH_DIR="$INSTALL_DIR/ssh"
+SSH_HOST_KEY="$SSH_DIR/host_ed25519"
+SSH_AUTH_KEYS="$SSH_DIR/authorized_keys"
+SFTP_LOCAL_PORT=2222
+SFTP_RATHOLE_CONFIG="$RATHOLE_DIR/sftp-tunnel.toml"
 
 # Default configuration
 UNIFY_KEY=""
 ORCHESTRA_URL="https://api.unify.ai/v0"
-UNITY_COMMS_URL="https://unity-comms-app-000000000000.us-central1.run.app"
+DROID_COMMS_URL="https://service.a.run.app"
 DO_START=false
 DO_STOP=false
 DO_UNINSTALL=false
+DO_SYNC_KEYS=false
+RECONFIGURE=false
 FORCE=false
 SKIP_APT=false
 NO_START=false
+PREREQS_ONLY=false
 DEVICE_NAME=""
+SELF_HOST_MODE=false
+LINK_COORDINATOR=false
+COORDINATOR_AGENT_ID=""
+SELF_HOST_AGENT_PORT=13000
+COMPOSE_SELF_HOST_ORCHESTRA_URL="http://127.0.0.1:8000/v0"
+COMPOSE_SELF_HOST_COMMS_URL="http://127.0.0.1:8001"
 
 # =============================================================================
 # Argument Parsing
@@ -57,10 +73,16 @@ Usage: $(basename "$0") [OPTIONS]
 Options:
   --unify-key KEY       Unify API key (required for install)
   --orchestra-url URL   Orchestra URL (default: https://api.unify.ai/v0)
-  --unity-comms-url URL Unity Comms URL
+  --droid-comms-url URL Droid Comms URL
   --start               Start services only (no install/config, no root needed)
   --stop                Stop all services
   --uninstall           Stop services, remove systemd units & firewall rules
+  --sync-keys           Reconcile SFTP authorized_keys + report tunnel coords, then exit
+  --prereqs-only        Install prerequisites only (no key required, no config/registration)
+  --reconfigure         Re-apply key + re-register + restart services (no deps, no root)
+  --self-host           Droid Docker self-host mode (local Orchestra, no tunnel, port ${SELF_HOST_AGENT_PORT})
+  --link-coordinator    Link registered desktop to the Coordinator assistant (self-host)
+  --coordinator-agent-id ID  Coordinator agent id for --link-coordinator (optional)
   --skip-apt            Skip apt-get operations (used by .deb postinst)
   --no-start            Skip starting services at end (used by .deb postinst)
   --device-name NAME    Friendly device name for registration (default: short hostname)
@@ -82,14 +104,26 @@ while [[ $# -gt 0 ]]; do
             UNIFY_KEY="$2"; shift 2 ;;
         --orchestra-url)
             ORCHESTRA_URL="$2"; shift 2 ;;
-        --unity-comms-url)
-            UNITY_COMMS_URL="$2"; shift 2 ;;
+        --droid-comms-url)
+            DROID_COMMS_URL="$2"; shift 2 ;;
         --start)
             DO_START=true; shift ;;
         --stop)
             DO_STOP=true; shift ;;
         --uninstall)
             DO_UNINSTALL=true; shift ;;
+        --sync-keys)
+            DO_SYNC_KEYS=true; shift ;;
+        --reconfigure)
+            RECONFIGURE=true; shift ;;
+        --self-host)
+            SELF_HOST_MODE=true; shift ;;
+        --link-coordinator)
+            LINK_COORDINATOR=true; shift ;;
+        --coordinator-agent-id)
+            COORDINATOR_AGENT_ID="$2"; shift 2 ;;
+        --prereqs-only)
+            PREREQS_ONLY=true; shift ;;
         --skip-apt)
             SKIP_APT=true; shift ;;
         --no-start)
@@ -184,6 +218,206 @@ set_env_value() {
 }
 
 # =============================================================================
+# Droid Docker Compose self-host (local ~/.droid stack)
+# =============================================================================
+
+compose_self_host_user_home() {
+    if [[ -n "${SUDO_USER:-}" && "$EUID" -eq 0 ]]; then
+        eval echo "~$SUDO_USER"
+        return 0
+    fi
+    echo "$HOME"
+}
+
+compose_self_host_present() {
+    [[ -f "$(compose_self_host_user_home)/.droid/docker-compose.yml" ]]
+}
+
+apply_compose_self_host_mode() {
+    if ! compose_self_host_present; then
+        return 0
+    fi
+    SELF_HOST_MODE=true
+    ORCHESTRA_URL="$COMPOSE_SELF_HOST_ORCHESTRA_URL"
+    DROID_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
+    LINK_COORDINATOR=true
+}
+
+explain_orchestra_connect_failure() {
+    local action_description=$1
+    local orchestra_url=$2
+    local http_code=$3
+
+    if [[ -n "$http_code" && "$http_code" != "000" ]]; then
+        return 1
+    fi
+
+    echo "  ERROR: Could not connect to Orchestra at ${orchestra_url} while trying to ${action_description}." >&2
+    if compose_self_host_present || [[ "$orchestra_url" == *127.0.0.1* || "$orchestra_url" == *localhost* ]]; then
+        echo "  Orchestra is not reachable on this machine — the Droid Docker stack is probably stopped." >&2
+        echo "  Start it first:" >&2
+        echo "    droid stack up" >&2
+        echo "  Wait until Orchestra responds on port 8000, then register again from tray Settings" >&2
+        echo "  (paste your API key) or run:" >&2
+        echo "    $TOOLS_DIR/setup.sh --reconfigure --unify-key YOUR_KEY" >&2
+    else
+        echo "  Check that Orchestra is reachable from this machine and your network is connected." >&2
+    fi
+    return 0
+}
+
+agent_service_port() {
+    local env_file="$AGENT_SERVICE_DIR/.env"
+    if [[ -f "$env_file" ]]; then
+        local port
+        port="$(grep -E '^PORT=' "$env_file" 2>/dev/null | sed 's/^PORT=//' || true)"
+        if [[ -n "$port" ]]; then
+            echo "$port"
+            return 0
+        fi
+    fi
+    if $SELF_HOST_MODE || [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+        echo "$SELF_HOST_AGENT_PORT"
+    else
+        echo "3000"
+    fi
+}
+
+self_host_registration_url() {
+    echo "http://host.docker.internal:$(agent_service_port)"
+}
+
+resolve_coordinator_agent_id() {
+    local unify_key=$1
+    local orchestra_url=$2
+
+    if [[ -n "$COORDINATOR_AGENT_ID" ]]; then
+        echo "$COORDINATOR_AGENT_ID"
+        return 0
+    fi
+
+    local runtime_file
+    runtime_file="$(compose_self_host_user_home)/.droid/coordinator-runtime.json"
+    if [[ -f "$runtime_file" ]]; then
+        local from_file
+        from_file="$(python3 - "$runtime_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+print(
+    data.get("coordinatorAgentId")
+    or data.get("coordinator_agent_id")
+    or ""
+)
+PY
+)"
+        if [[ -n "$from_file" ]]; then
+            echo "$from_file"
+            return 0
+        fi
+    fi
+
+    local resp_file="/tmp/unify_coordinator_lookup.json"
+    local http_code
+    http_code=$(curl -sS -o "$resp_file" -w "%{http_code}" \
+        -H "Authorization: Bearer ${unify_key}" \
+        "${orchestra_url%/}/assistant" || true)
+    if [[ "$http_code" != "200" ]]; then
+        rm -f "$resp_file"
+        return 1
+    fi
+    python3 - "$resp_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    raw = json.load(fh)
+items = raw.get("info") if isinstance(raw, dict) else raw
+if not isinstance(items, list):
+    raise SystemExit(1)
+for item in items:
+    if item.get("is_coordinator"):
+        print(item.get("agent_id") or item.get("agentId") or "")
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    rm -f "$resp_file"
+}
+
+link_desktop_to_coordinator() {
+    local unify_key=$1
+    local orchestra_url=$2
+    local desktop_id=$3
+    local coordinator_id=$4
+
+    echo ""
+    echo "=== Linking Desktop to Coordinator ==="
+
+    local http_code
+    http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer ${unify_key}" \
+        -H "Content-Type: application/json" \
+        -d "$(python3 - "$coordinator_id" "$desktop_id" <<'PY'
+import json
+import sys
+
+assistant_id, desktop_id = sys.argv[1], sys.argv[2]
+print(
+    json.dumps(
+        {
+            "assistant_id": int(assistant_id),
+            "desktop_id": int(desktop_id),
+            "filesys_sync": False,
+        },
+    ),
+)
+PY
+)" \
+        "${orchestra_url%/}/desktop/link" || true)
+
+    if [[ "$http_code" != "200" ]]; then
+        if explain_orchestra_connect_failure "link this desktop to the Coordinator" "$orchestra_url" "$http_code"; then
+            return 1
+        fi
+        echo "  ERROR: Desktop link failed (HTTP ${http_code})" >&2
+        return 1
+    fi
+    echo "  Linked desktop ${desktop_id} to Coordinator assistant ${coordinator_id}"
+}
+
+register_self_host_desktop() {
+    local unify_key=$1
+    local orchestra_url=$2
+    local device_name=$3
+    local reg_url
+    reg_url="$(self_host_registration_url)"
+
+    echo ""
+    echo "=== Self-Host Desktop Registration ==="
+    echo "  Orchestra: ${orchestra_url}"
+    echo "  Agent URL for Droid CM: ${reg_url}"
+
+    register_desktop "$unify_key" "$orchestra_url" "$device_name" "$reg_url" || return 1
+
+    if $LINK_COORDINATOR; then
+        local desktop_id coordinator_id
+        desktop_id="$(get_env_value "DEVICE_ID")"
+        coordinator_id="$(resolve_coordinator_agent_id "$unify_key" "$orchestra_url" || true)"
+        if [[ -z "$desktop_id" || -z "$coordinator_id" ]]; then
+            echo "  WARNING: Could not link desktop — missing device or coordinator id" >&2
+            return 0
+        fi
+        link_desktop_to_coordinator "$unify_key" "$orchestra_url" "$desktop_id" "$coordinator_id" || true
+        echo ""
+        echo "  Restart the Droid stack so CM reloads linked desktops:"
+        echo "    droid restart"
+    fi
+}
+
+# =============================================================================
 # Fast Mode Detection
 # =============================================================================
 
@@ -254,6 +488,13 @@ test_fast_mode() {
         all_ok=false
     fi
 
+    if [[ -x "$RCLONE_BIN" ]]; then
+        echo "  [OK] rclone" >&2
+    else
+        echo "  [--] rclone (will install)" >&2
+        all_ok=false
+    fi
+
     $all_ok
 }
 
@@ -283,6 +524,18 @@ stop_all_services() {
         echo "  Stopped websockify"
     fi
 
+    # Stop SFTP tunnel (rathole) and SFTP server (rclone)
+    pids=$(pgrep -f 'rathole.*sftp-tunnel\.toml' 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        echo "$pids" | xargs kill -TERM 2>/dev/null || true
+        echo "  Stopped SFTP tunnel"
+    fi
+    pids=$(pgrep -f 'rclone serve sftp' 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        echo "$pids" | xargs kill -TERM 2>/dev/null || true
+        echo "  Stopped SFTP server"
+    fi
+
     # Stop x11vnc
     pids=$(pgrep -x x11vnc 2>/dev/null || true)
     if [[ -n "$pids" ]]; then
@@ -303,9 +556,16 @@ stop_all_services() {
         systemctl --user stop unify-vnc.service 2>/dev/null || true
         echo "  Stopped unify-vnc.service"
     fi
+    if systemctl --user is-active unify-sftp.service &>/dev/null 2>&1; then
+        systemctl --user stop unify-sftp.service 2>/dev/null || true
+        echo "  Stopped unify-sftp.service"
+    fi
+    systemctl --user stop unify-sftp-sync.timer 2>/dev/null || true
 
     # Final sweep: kill processes on target ports
-    for port in 5900 6080 3000; do
+    local agent_port
+    agent_port="$(agent_service_port)"
+    for port in 5900 6080 "$agent_port" "$SFTP_LOCAL_PORT"; do
         pids=$(ss -tlnpH "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' || true)
         if [[ -n "$pids" ]]; then
             echo "$pids" | xargs kill -TERM 2>/dev/null || true
@@ -328,13 +588,14 @@ uninstall_all() {
     local unify_key orchestra_url comms_url
     unify_key=$(get_env_value "UNIFY_KEY")
     orchestra_url=$(get_env_value "ORCHESTRA_URL")
-    comms_url=$(get_env_value "UNITY_COMMS_URL")
+    comms_url=$(get_env_value "DROID_COMMS_URL")
 
     if [[ -n "$unify_key" ]]; then
         echo ""
         echo "Cleaning up remote registrations..."
         [[ -n "$orchestra_url" ]] && unregister_desktop "$unify_key" "$orchestra_url"
         [[ -n "$comms_url" ]] && unregister_tunnel "$unify_key" "$comms_url"
+        [[ -n "$comms_url" ]] && unregister_sftp_tunnel "$unify_key" "$comms_url"
     fi
 
     # 3. Remove rathole
@@ -343,15 +604,35 @@ uninstall_all() {
         echo "  Removed rathole directory"
     fi
 
+    # 3b. Remove rclone + SFTP host key / authorized_keys (local-only material).
+    if [[ -d "$RCLONE_DIR" ]]; then
+        rm -rf "$RCLONE_DIR"
+        echo "  Removed rclone directory"
+    fi
+    if [[ -d "$SSH_DIR" ]]; then
+        rm -rf "$SSH_DIR"
+        echo "  Removed SFTP key directory"
+    fi
+
     # 4. Remove systemd user services
     echo ""
     echo "Removing systemd user services..."
-    for svc in unify-vnc unify-websockify unify-agent unify-tray; do
+    for svc in unify-vnc unify-websockify unify-agent unify-tray unify-sftp; do
         local svc_file="$HOME/.config/systemd/user/${svc}.service"
         if [[ -f "$svc_file" ]]; then
             systemctl --user disable "${svc}.service" 2>/dev/null || true
             rm -f "$svc_file"
             echo "  Removed: ${svc}.service"
+        fi
+    done
+    # SFTP key-sync timer + its backing oneshot service
+    systemctl --user stop unify-sftp-sync.timer 2>/dev/null || true
+    systemctl --user disable unify-sftp-sync.timer 2>/dev/null || true
+    for unit in unify-sftp-sync.timer unify-sftp-sync.service; do
+        local unit_file="$HOME/.config/systemd/user/${unit}"
+        if [[ -f "$unit_file" ]]; then
+            rm -f "$unit_file"
+            echo "  Removed: ${unit}"
         fi
     done
     systemctl --user daemon-reload 2>/dev/null || true
@@ -362,6 +643,7 @@ uninstall_all() {
         echo "Removing firewall rules..."
         ufw delete allow 6080/tcp 2>/dev/null && echo "  Removed: port 6080 (noVNC)" || true
         ufw delete allow 3000/tcp 2>/dev/null && echo "  Removed: port 3000 (Agent Service)" || true
+        ufw delete allow "${SFTP_LOCAL_PORT}/tcp" 2>/dev/null && echo "  Removed: port ${SFTP_LOCAL_PORT} (SFTP)" || true
     fi
 
     # 6. Remove autostart desktop entry
@@ -415,14 +697,16 @@ install_system_deps() {
 }
 
 install_nodejs() {
-    if command -v node &>/dev/null; then
+    if command -v node &>/dev/null && command -v npx &>/dev/null; then
         local node_major
         node_major=$(node --version | sed 's/v\([0-9]*\).*/\1/')
         if [[ "$node_major" -ge 22 ]]; then
-            echo "  Node.js already installed ($(node --version))"
+            echo "  Node.js already installed ($(node --version), npx present)"
             return
         fi
         echo "  Node.js $(node --version) found, but v22+ required. Upgrading..."
+    elif command -v node &>/dev/null; then
+        echo "  Node.js $(node --version) found, but npx is missing. Reinstalling..."
     fi
 
     echo ""
@@ -434,10 +718,31 @@ install_nodejs() {
         return
     fi
 
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y nodejs
+    # NOTE: `curl ... | bash -` silently swallows curl failures (empty stdin →
+    # bash exits 0), which leaves the distro Node (no npm/npx). Download first,
+    # abort on a bad fetch, then run.
+    local ns_script="/tmp/nodesource_setup_22.sh"
+    if curl -fsSL https://deb.nodesource.com/setup_22.x -o "$ns_script"; then
+        bash "$ns_script"
+        apt-get install -y nodejs
+        rm -f "$ns_script"
+    else
+        echo "  WARNING: Failed to fetch NodeSource setup script." >&2
+    fi
 
-    echo "  Node.js installed ($(node --version))"
+    # Verify npm/npx actually exist — distro Node ships them in a separate `npm`
+    # package, so fall back to it if NodeSource didn't provide them.
+    if ! command -v npx &>/dev/null; then
+        echo "  npx still missing after Node install; installing distro npm as fallback..." >&2
+        apt-get install -y npm || true
+    fi
+
+    if ! command -v npx &>/dev/null; then
+        echo "  ERROR: Node.js installed but npx is unavailable. Cannot continue." >&2
+        return 1
+    fi
+
+    echo "  Node.js installed ($(node --version), npx $(npx --version 2>/dev/null || echo '?'))"
 }
 
 install_bun() {
@@ -697,6 +1002,378 @@ install_rathole() {
     fi
 }
 
+# Check whether a previously-registered backend resource still exists, so a
+# resource deleted outside the app (e.g. in the console) can be safely
+# re-created. Echo one of: present | missing | unknown.
+#   present  -> still exists; keep the local id
+#   missing  -> backend definitively reports it gone; safe to re-register
+#   unknown  -> could not verify (offline / 5xx / bad key); KEEP the id so a
+#               transient failure never wipes a good registration
+#
+# Desktop: GET /desktop lists this key's desktops; 200 + id absent = missing.
+desktop_exists() {
+    local unify_key=$1
+    local orchestra_url=$2
+    local device_id=$3
+
+    command -v python3 >/dev/null 2>&1 || { echo "unknown"; return; }
+
+    local resp_file="/tmp/unify_desktop_list.json"
+    local http_code
+    http_code=$(curl -sS --connect-timeout 5 --max-time 15 -o "$resp_file" -w "%{http_code}" \
+        -H "Authorization: Bearer ${unify_key}" \
+        "${orchestra_url%/}/desktop" 2>/dev/null || true)
+
+    if [[ "$http_code" != "200" ]]; then
+        rm -f "$resp_file"
+        echo "unknown"
+        return
+    fi
+
+    local result
+    result=$(DEVICE_ID="$device_id" python3 - "$resp_file" <<'PY' 2>/dev/null || true
+import json, os, sys
+device_id = str(os.environ.get("DEVICE_ID", ""))
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+    items = data.get("info", []) if isinstance(data, dict) else []
+    print("present" if any(str(d.get("id")) == device_id for d in items) else "missing")
+except Exception:
+    print("unknown")
+PY
+)
+    rm -f "$resp_file"
+    case "$result" in
+        present|missing) echo "$result" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+# Tunnel: GET /infra/tunnel/{id}; 200 = present, 404 = missing, else unknown.
+tunnel_exists() {
+    local unify_key=$1
+    local comms_url=$2
+    local tunnel_id=$3
+
+    local http_code
+    http_code=$(curl -sS --connect-timeout 5 --max-time 15 -o /dev/null -w "%{http_code}" \
+        -H "Authorization: Bearer ${unify_key}" \
+        "${comms_url%/}/infra/tunnel/${tunnel_id}" 2>/dev/null || true)
+
+    case "$http_code" in
+        200) echo "present" ;;
+        404) echo "missing" ;;
+        *)   echo "unknown" ;;
+    esac
+}
+
+install_rclone() {
+    echo ""
+    echo "=== Installing rclone ==="
+    if [[ -x "$RCLONE_BIN" ]]; then
+        echo "  rclone already installed"
+        return
+    fi
+    mkdir -p "$RCLONE_DIR"
+
+    local arch rc_arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  rc_arch="linux-amd64" ;;
+        aarch64) rc_arch="linux-arm64" ;;
+        *)       echo "  ERROR: Unsupported architecture: $arch" >&2; return 1 ;;
+    esac
+
+    local url="https://downloads.rclone.org/rclone-current-${rc_arch}.zip"
+    local zip="/tmp/rclone-${rc_arch}.zip"
+    local extract="/tmp/rclone-extract-$$"
+
+    echo "  Downloading rclone (${rc_arch})..."
+    curl -fSL -o "$zip" "$url"
+
+    rm -rf "$extract" && mkdir -p "$extract"
+    unzip -oq "$zip" -d "$extract"
+    local found
+    found=$(find "$extract" -name rclone -type f | head -1)
+    if [[ -z "$found" ]]; then
+        echo "  ERROR: rclone binary not found after extraction" >&2
+        rm -f "$zip"; rm -rf "$extract"; return 1
+    fi
+    cp "$found" "$RCLONE_BIN"
+    chmod +x "$RCLONE_BIN"
+    rm -f "$zip"; rm -rf "$extract"
+
+    if [[ -x "$RCLONE_BIN" ]]; then
+        echo "  rclone installed"
+    else
+        echo "  ERROR: rclone installation failed" >&2
+        return 1
+    fi
+}
+
+# Generate the local SFTP host key (server identity, stays local) and ensure the
+# authorized_keys file exists, then pull the per-link client public keys from
+# Orchestra. The client PRIVATE keys live in Orchestra, never on this machine.
+setup_sftp_server() {
+    echo ""
+    echo "=== Configuring SFTP server (rclone) ==="
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+
+    if [[ ! -f "$SSH_HOST_KEY" ]]; then
+        ssh-keygen -t ed25519 -f "$SSH_HOST_KEY" -N "" -q -C "unify-desktop-sftp-host"
+        echo "  Generated SFTP host key"
+    fi
+
+    if [[ ! -f "$SSH_AUTH_KEYS" ]]; then
+        touch "$SSH_AUTH_KEYS"
+        chmod 600 "$SSH_AUTH_KEYS"
+    fi
+
+    reconcile_sftp_links || echo "  WARNING: could not reconcile SFTP links yet (will retry on the sync timer)"
+
+    # Full install runs as root; the rclone systemd unit runs as the user, so the
+    # key dir must be owned by them (700 root-owned would be unreadable).
+    if [[ "$EUID" -eq 0 ]]; then
+        local tgt
+        tgt="${SUDO_USER:-$(logname 2>/dev/null || echo "")}"
+        if [[ -n "$tgt" && "$tgt" != "root" ]]; then
+            chown -R "$tgt":"$(id -gn "$tgt")" "$SSH_DIR" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Reconcile per-link SFTP state with Orchestra:
+#   1. find this device's assistant links (GET /desktop -> assigned_to_assistant_ids)
+#   2. fetch each filesys-sync link's client public key (GET /desktop/link/{aid}/pubkey)
+#   3. report this device's SFTP tunnel coords (POST /desktop/link/{aid}/sftp-tunnel)
+#   4. atomically rewrite authorized_keys from the collected keys (prunes revoked)
+# Client PRIVATE keys live in Orchestra; only public keys ever touch this machine.
+reconcile_sftp_links() {
+    local unify_key orchestra_url device_id sftp_host sftp_port
+    unify_key=$(get_env_value "UNIFY_KEY")
+    orchestra_url=$(get_env_value "ORCHESTRA_URL")
+    device_id=$(get_env_value "DEVICE_ID")
+    sftp_host=$(get_env_value "SFTP_TUNNEL_HOST")
+    sftp_port=$(get_env_value "SFTP_TUNNEL_PORT")
+    [[ -z "$unify_key" || -z "$orchestra_url" || -z "$device_id" ]] && return 0
+
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+
+    UNIFY_KEY="$unify_key" ORCHESTRA_URL="$orchestra_url" DEVICE_ID="$device_id" \
+    SFTP_TUNNEL_HOST="$sftp_host" SFTP_TUNNEL_PORT="$sftp_port" \
+    SSH_AUTH_KEYS="$SSH_AUTH_KEYS" python3 - <<'PY'
+import json, os, sys, tempfile, urllib.error, urllib.request
+
+base = os.environ["ORCHESTRA_URL"].rstrip("/")
+key = os.environ["UNIFY_KEY"]
+device_id = str(os.environ["DEVICE_ID"])
+host = os.environ.get("SFTP_TUNNEL_HOST") or ""
+port = os.environ.get("SFTP_TUNNEL_PORT") or ""
+auth_keys = os.environ["SSH_AUTH_KEYS"]
+
+
+def req(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(base + path, data=data, method=method)
+    r.add_header("Authorization", "Bearer " + key)
+    if data is not None:
+        r.add_header("Content-Type", "application/json")
+    return urllib.request.urlopen(r, timeout=30)
+
+
+try:
+    with req("GET", "/desktop") as resp:
+        desktops = json.load(resp).get("info", [])
+except Exception as e:  # noqa: BLE001
+    print(f"  WARNING: could not list desktops: {e}", file=sys.stderr)
+    sys.exit(1)
+
+assistant_ids = []
+for d in desktops:
+    if str(d.get("id")) == device_id:
+        assistant_ids = d.get("assigned_to_assistant_ids") or []
+        break
+
+pubkeys = []
+for aid in assistant_ids:
+    try:
+        with req("GET", f"/desktop/link/{aid}/pubkey") as resp:
+            pk = (json.load(resp).get("info") or {}).get("public_key")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:  # 404 == link without filesys_sync; skip quietly
+            print(f"  WARNING: pubkey fetch failed for {aid}: {e}", file=sys.stderr)
+        continue
+    except Exception as e:  # noqa: BLE001
+        print(f"  WARNING: pubkey fetch error for {aid}: {e}", file=sys.stderr)
+        continue
+    if pk and pk.strip():
+        pubkeys.append(pk.strip())
+        if host and port:
+            try:
+                req(
+                    "POST",
+                    f"/desktop/link/{aid}/sftp-tunnel",
+                    {"host": host, "port": int(port)},
+                ).close()
+            except Exception as e:  # noqa: BLE001
+                print(f"  WARNING: tunnel report failed for {aid}: {e}", file=sys.stderr)
+
+body = "".join(k + "\n" for k in pubkeys)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(auth_keys) or ".")
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write(body)
+os.chmod(tmp, 0o600)
+os.replace(tmp, auth_keys)
+print(f"  authorized_keys synced ({len(pubkeys)} key(s) across {len(assistant_ids)} link(s))")
+PY
+}
+
+# Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its
+# client config. Self-host mode: bind on all interfaces so the local Droid stack
+# reaches the SFTP server directly (no tunnel).
+register_sftp_tunnel() {
+    local unify_key=$1
+    local comms_url=$2
+
+    if $SELF_HOST_MODE || [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+        set_env_value "SFTP_BIND_ADDR" "0.0.0.0"
+        set_env_value "SFTP_TUNNEL_HOST" "host.docker.internal"
+        set_env_value "SFTP_TUNNEL_PORT" "$SFTP_LOCAL_PORT"
+        echo ""
+        echo "=== SFTP (self-host) ==="
+        echo "  Reachable at host.docker.internal:${SFTP_LOCAL_PORT}"
+        return 0
+    fi
+
+    set_env_value "SFTP_BIND_ADDR" "127.0.0.1"
+
+    local existing_sftp_id
+    existing_sftp_id=$(get_env_value "SFTP_TUNNEL_ID")
+    if [[ -n "$existing_sftp_id" ]]; then
+        local status
+        status=$(tunnel_exists "$unify_key" "$comms_url" "$existing_sftp_id")
+        if [[ "$status" == "missing" ]]; then
+            echo "  SFTP tunnel $existing_sftp_id no longer exists on server — re-registering"
+            set_env_value "SFTP_TUNNEL_ID" ""
+            set_env_value "SFTP_TUNNEL_HOST" ""
+            set_env_value "SFTP_TUNNEL_PORT" ""
+            rm -f "$SFTP_RATHOLE_CONFIG"
+            # fall through to fresh registration below
+        else
+            echo ""
+            echo "  SFTP tunnel already registered: $(get_env_value "SFTP_TUNNEL_HOST"):$(get_env_value "SFTP_TUNNEL_PORT")"
+            [[ "$status" == "unknown" ]] && echo "  (could not verify with server; keeping existing registration)"
+            return 0
+        fi
+    fi
+
+    echo ""
+    echo "=== Registering SFTP Tunnel ==="
+
+    local resp_file="/tmp/unify_sftp_tunnel.json"
+    local http_code
+    http_code=$(curl -sS -o "$resp_file" -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer ${unify_key}" \
+        -H "Content-Type: application/json" \
+        -d "{\"local_port\": ${SFTP_LOCAL_PORT}, \"protocol\": \"tcp\", \"name\": \"sftp\"}" \
+        "${comms_url}/infra/tunnel/register" || true)
+
+    if [[ "$http_code" != "200" ]]; then
+        echo "  ERROR: SFTP tunnel registration failed (HTTP ${http_code})" >&2
+        [[ -f "$resp_file" ]] && cat "$resp_file" >&2
+        rm -f "$resp_file"
+        return 1
+    fi
+
+    local tunnel_id tcp_host tcp_port client_config
+    tunnel_id=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tunnel_id',''))" < "$resp_file" 2>/dev/null || true)
+    tcp_host=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tcp_host',''))" < "$resp_file" 2>/dev/null || true)
+    tcp_port=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tcp_port',''))" < "$resp_file" 2>/dev/null || true)
+    client_config=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('client_config',''))" < "$resp_file" 2>/dev/null || true)
+    rm -f "$resp_file"
+
+    set_env_value "SFTP_TUNNEL_ID" "$tunnel_id"
+    set_env_value "SFTP_TUNNEL_HOST" "$tcp_host"
+    set_env_value "SFTP_TUNNEL_PORT" "$tcp_port"
+
+    mkdir -p "$RATHOLE_DIR"
+    if [[ -n "$client_config" ]]; then
+        printf '%s\n' "$client_config" > "$SFTP_RATHOLE_CONFIG"
+    fi
+
+    echo "  SFTP tunnel registered: ${tcp_host}:${tcp_port}"
+}
+
+unregister_sftp_tunnel() {
+    local unify_key=$1
+    local comms_url=$2
+
+    local tunnel_id
+    tunnel_id=$(get_env_value "SFTP_TUNNEL_ID")
+    [[ -z "$tunnel_id" ]] && return
+
+    echo "  Deleting SFTP tunnel $tunnel_id..."
+
+    local http_code
+    http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        -X DELETE \
+        -H "Authorization: Bearer ${unify_key}" \
+        "${comms_url}/infra/tunnel/${tunnel_id}" || true)
+
+    if [[ "$http_code" == "200" ]]; then
+        echo "  SFTP tunnel deleted from server"
+    else
+        echo "  WARNING: Could not delete SFTP tunnel from server (HTTP ${http_code})"
+    fi
+
+    set_env_value "SFTP_TUNNEL_ID" ""
+    set_env_value "SFTP_TUNNEL_HOST" ""
+    set_env_value "SFTP_TUNNEL_PORT" ""
+
+    rm -f "$SFTP_RATHOLE_CONFIG"
+}
+
+start_sftp_server() {
+    [[ -x "$RCLONE_BIN" ]] || return 0
+    if [[ ! -f "$SSH_AUTH_KEYS" ]]; then
+        echo "  SFTP server: no authorized_keys yet, skipping"
+        return 0
+    fi
+    if test_port_listening "$SFTP_LOCAL_PORT"; then
+        echo "  SFTP server already running on port $SFTP_LOCAL_PORT"
+        return 0
+    fi
+    local bind user
+    bind=$(get_env_value "SFTP_BIND_ADDR"); [[ -z "$bind" ]] && bind="127.0.0.1"
+    # Fixed contract with the cloud-side rclone client; not the OS account.
+    user=$(get_env_value "SFTP_USER"); [[ -z "$user" ]] && user="unity"
+    echo "  Starting SFTP server (rclone)..."
+    nohup "$RCLONE_BIN" serve sftp "$HOME" \
+        --addr "${bind}:${SFTP_LOCAL_PORT}" \
+        --user "$user" \
+        --authorized-keys "$SSH_AUTH_KEYS" \
+        --key "$SSH_HOST_KEY" \
+        > "$LOG_DIR/sftp.log" 2>&1 &
+}
+
+start_sftp_tunnel() {
+    [[ -x "$RATHOLE_BIN" ]] || return 0
+    if [[ ! -f "$SFTP_RATHOLE_CONFIG" ]]; then
+        echo "  No SFTP tunnel config yet, skipping SFTP tunnel start"
+        return 0
+    fi
+    if pgrep -f "rathole.*sftp-tunnel\.toml" &>/dev/null; then
+        echo "  SFTP tunnel already running"
+        return 0
+    fi
+    echo "  Starting SFTP tunnel..."
+    nohup "$RATHOLE_BIN" "$SFTP_RATHOLE_CONFIG" > "$LOG_DIR/sftp-tunnel.log" 2>&1 &
+}
+
 register_tunnel() {
     local unify_key=$1
     local comms_url=$2
@@ -709,11 +1386,23 @@ register_tunnel() {
     local existing_id
     existing_id=$(get_env_value "TUNNEL_ID")
     if [[ -n "$existing_id" ]]; then
-        echo "  Tunnel already registered: $existing_id"
-        local existing_url
-        existing_url=$(get_env_value "TUNNEL_URL")
-        [[ -n "$existing_url" ]] && echo "  URL: $existing_url"
-        return
+        local status
+        status=$(tunnel_exists "$unify_key" "$comms_url" "$existing_id")
+        if [[ "$status" == "missing" ]]; then
+            echo "  Tunnel $existing_id no longer exists on server — re-registering"
+            set_env_value "TUNNEL_ID" ""
+            set_env_value "TUNNEL_URL" ""
+            set_env_value "TUNNEL_TOKEN" ""
+            rm -f "$RATHOLE_CONFIG"
+            # fall through to fresh registration below
+        else
+            echo "  Tunnel already registered: $existing_id"
+            [[ "$status" == "unknown" ]] && echo "  (could not verify with server; keeping existing registration)"
+            local existing_url
+            existing_url=$(get_env_value "TUNNEL_URL")
+            [[ -n "$existing_url" ]] && echo "  URL: $existing_url"
+            return
+        fi
     fi
 
     local body="{\"local_port\": ${local_port}}"
@@ -853,27 +1542,40 @@ register_desktop() {
     local existing_id
     existing_id=$(get_env_value "DEVICE_ID")
     if [[ -n "$existing_id" ]]; then
-        echo "  Desktop already registered: ID=$existing_id"
-        if [[ -n "$tunnel_url" ]]; then
-            echo "  Updating URL to: $tunnel_url"
-            local http_code
-            http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
-                -X PATCH \
-                -H "Authorization: Bearer ${unify_key}" \
-                -H "Content-Type: application/json" \
-                -d "{\"url\": \"${tunnel_url}\"}" \
-                "${orchestra_url}/desktop/${existing_id}" || true)
-            if [[ "$http_code" == "200" ]]; then
-                echo "  URL updated"
-            else
-                echo "  WARNING: Could not update desktop URL (HTTP ${http_code})"
+        local status
+        status=$(desktop_exists "$unify_key" "$orchestra_url" "$existing_id")
+        if [[ "$status" == "missing" ]]; then
+            echo "  Desktop $existing_id no longer exists on server — re-registering"
+            set_env_value "DEVICE_ID" ""
+            # fall through to fresh registration below
+        else
+            echo "  Desktop already registered: ID=$existing_id"
+            [[ "$status" == "unknown" ]] && echo "  (could not verify with server; keeping existing registration)"
+            if [[ -n "$tunnel_url" ]]; then
+                echo "  Updating URL to: $tunnel_url"
+                local http_code
+                http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+                    -X PATCH \
+                    -H "Authorization: Bearer ${unify_key}" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"url\": \"${tunnel_url}\"}" \
+                    "${orchestra_url}/desktop/${existing_id}" || true)
+                if [[ "$http_code" == "200" ]]; then
+                    echo "  URL updated"
+                else
+                    if explain_orchestra_connect_failure "update the desktop URL" "$orchestra_url" "$http_code"; then
+                        echo "  WARNING: Could not update desktop URL (Orchestra unreachable)" >&2
+                    else
+                        echo "  WARNING: Could not update desktop URL (HTTP ${http_code})" >&2
+                    fi
+                fi
             fi
+            return
         fi
-        return
     fi
 
     if [[ -z "$tunnel_url" ]]; then
-        echo "  ERROR: No tunnel URL available for desktop registration" >&2
+        echo "  ERROR: No desktop URL available for registration" >&2
         return 1
     fi
 
@@ -892,6 +1594,10 @@ register_desktop() {
         "${orchestra_url}/desktop" || true)
 
     if [[ "$http_code" != "200" ]]; then
+        if explain_orchestra_connect_failure "register this desktop" "$orchestra_url" "$http_code"; then
+            rm -f "$resp_file"
+            return 1
+        fi
         echo "  ERROR: Desktop registration failed (HTTP ${http_code})" >&2
         [[ -f "$resp_file" ]] && cat "$resp_file" >&2
         rm -f "$resp_file"
@@ -907,6 +1613,43 @@ register_desktop() {
     echo "  Desktop registered: ID=$device_id"
     echo "  Name: $device_name"
     echo "  URL: $tunnel_url"
+}
+
+# Best-effort recovery run on --start (login/boot): if the tunnel or desktop was
+# deleted on the backend while local ids persisted, re-register it. Safe by
+# construction — register_tunnel/register_desktop only re-create on a definitive
+# server "missing", never on a transient/auth failure. Gated on a configured key
+# and guarded by a lock dir so it can't race a concurrent --reconfigure.
+ensure_registration() {
+    local unify_key orchestra_url comms_url tunnel_url lock_dir
+
+    unify_key=$(get_env_value "UNIFY_KEY")
+    orchestra_url=$(get_env_value "ORCHESTRA_URL")
+    comms_url=$(get_env_value "DROID_COMMS_URL")
+    [[ -z "$unify_key" || -z "$orchestra_url" ]] && return 0
+
+    lock_dir="$AGENT_SERVICE_DIR/.recover.lock"
+    mkdir -p "$AGENT_SERVICE_DIR" 2>/dev/null || true
+    # Clear a stale lock (>10 min) left behind by a crashed run.
+    if [[ -d "$lock_dir" && -n "$(find "$lock_dir" -maxdepth 0 -mmin +10 2>/dev/null)" ]]; then
+        rmdir "$lock_dir" 2>/dev/null || true
+    fi
+    mkdir "$lock_dir" 2>/dev/null || return 0
+
+    echo ""
+    echo "=== Verifying registration ==="
+    if [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+        register_desktop "$unify_key" "$orchestra_url" "$DEVICE_NAME" "$(self_host_registration_url)" || true
+    elif [[ -n "$comms_url" ]]; then
+        register_tunnel "$unify_key" "$comms_url" 3000 "$DEVICE_NAME" || true
+        register_sftp_tunnel "$unify_key" "$comms_url" || true
+        tunnel_url=$(get_env_value "TUNNEL_URL")
+        if [[ -n "$tunnel_url" ]]; then
+            register_desktop "$unify_key" "$orchestra_url" "$DEVICE_NAME" "$tunnel_url" || true
+        fi
+    fi
+
+    rmdir "$lock_dir" 2>/dev/null || true
 }
 
 unregister_desktop() {
@@ -943,6 +1686,8 @@ setup_agent_service_env() {
     echo "=== Configuring Agent Service ==="
 
     local env_file="$AGENT_SERVICE_DIR/.env"
+    local agent_port
+    agent_port="$(agent_service_port)"
 
     # Preserve existing tunnel/device values if .env already exists
     local existing_tunnel_id existing_tunnel_url existing_tunnel_token existing_device_id
@@ -951,14 +1696,25 @@ setup_agent_service_env() {
     existing_tunnel_token=$(get_env_value "TUNNEL_TOKEN")
     existing_device_id=$(get_env_value "DEVICE_ID")
 
+    # Capture SFTP values BEFORE the heredoc — the `cat >` redirection truncates
+    # the .env before the here-document is expanded, so inline reads would be empty.
+    local existing_sftp_user existing_sftp_bind existing_sftp_tunnel_id existing_sftp_host existing_sftp_port
+    # Fixed contract with the cloud-side rclone client; not the OS account.
+    existing_sftp_user="unity"
+    existing_sftp_bind=$(get_env_value "SFTP_BIND_ADDR"); [[ -z "$existing_sftp_bind" ]] && existing_sftp_bind="127.0.0.1"
+    existing_sftp_tunnel_id=$(get_env_value "SFTP_TUNNEL_ID")
+    existing_sftp_host=$(get_env_value "SFTP_TUNNEL_HOST")
+    existing_sftp_port=$(get_env_value "SFTP_TUNNEL_PORT")
+
     cat > "$env_file" <<ENVFILE
 # Agent Service Environment Configuration
 # Generated: $(date)
 
-PORT=3000
+PORT=$agent_port
 UNIFY_KEY=$UNIFY_KEY
 ORCHESTRA_URL=$ORCHESTRA_URL
-UNITY_COMMS_URL=$UNITY_COMMS_URL
+DROID_COMMS_URL=$DROID_COMMS_URL
+SELF_HOST=$($SELF_HOST_MODE && echo 1 || echo 0)
 PLAYWRIGHT_BROWSERS_PATH=$INSTALL_DIR/browsers
 
 # Tunnel & Device (managed by setup/registration)
@@ -966,12 +1722,20 @@ TUNNEL_ID=$existing_tunnel_id
 TUNNEL_URL=$existing_tunnel_url
 TUNNEL_TOKEN=$existing_tunnel_token
 DEVICE_ID=$existing_device_id
+
+# SFTP / Remote FS (managed by setup_sftp_server / register_sftp_tunnel)
+SFTP_LOCAL_PORT=$SFTP_LOCAL_PORT
+SFTP_USER=$existing_sftp_user
+SFTP_BIND_ADDR=$existing_sftp_bind
+SFTP_TUNNEL_ID=$existing_sftp_tunnel_id
+SFTP_TUNNEL_HOST=$existing_sftp_host
+SFTP_TUNNEL_PORT=$existing_sftp_port
 ENVFILE
 
     echo "  .env created"
     echo "    UNIFY_KEY: $(if [[ -n "$UNIFY_KEY" ]]; then echo '(set)'; else echo '(not set)'; fi)"
     echo "    ORCHESTRA_URL: $ORCHESTRA_URL"
-    echo "    UNITY_COMMS_URL: $UNITY_COMMS_URL"
+    echo "    DROID_COMMS_URL: $DROID_COMMS_URL"
     if [[ -n "$existing_device_id" ]]; then
         echo "    DEVICE_ID: $existing_device_id (preserved)"
     fi
@@ -998,9 +1762,9 @@ setup_systemd_services() {
         "$target_home/.config/systemd" \
         "$target_systemd_dir"
 
-    # Install systemd unit files from the systemd/ directory
+    # Install systemd unit files (services + timers) from the systemd/ directory
     if [[ -d "$systemd_dir" ]]; then
-        for unit_file in "$systemd_dir"/*.service; do
+        for unit_file in "$systemd_dir"/*.service "$systemd_dir"/*.timer; do
             if [[ -f "$unit_file" ]]; then
                 local unit_name
                 unit_name=$(basename "$unit_file")
@@ -1018,13 +1782,14 @@ setup_systemd_services() {
         done
     fi
 
-    # Reload systemd for the target user
+    # Reload systemd for the target user. The sftp-sync TIMER is enabled (it
+    # drives the oneshot reconcile); its backing service is not enabled directly.
     if [[ -n "${SUDO_USER:-}" ]]; then
         su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user daemon-reload" 2>/dev/null || true
-        su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service" 2>/dev/null || true
+        su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service unify-sftp.service unify-sftp-sync.timer" 2>/dev/null || true
     else
         systemctl --user daemon-reload 2>/dev/null || true
-        systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service 2>/dev/null || true
+        systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service unify-sftp.service unify-sftp-sync.timer 2>/dev/null || true
     fi
 
     echo "  systemd user services configured"
@@ -1050,7 +1815,7 @@ Type=Application
 Name=Unify Desktop Assistant
 Comment=System tray for Unify Desktop Assistant
 Exec=python3 $INSTALL_DIR/gui/unify-assistant.py
-Icon=$INSTALL_DIR/assets/icon.png
+Icon=$INSTALL_DIR/assets/unify_logo_only.png
 Terminal=false
 Categories=Utility;
 X-GNOME-Autostart-enabled=true
@@ -1080,7 +1845,17 @@ configure_firewall() {
         return
     fi
 
-    for port_desc in "6080/tcp:noVNC" "3000/tcp:Agent Service"; do
+    local agent_port
+    agent_port="$(agent_service_port)"
+
+    local fw_ports=("6080/tcp:noVNC" "${agent_port}/tcp:Agent Service")
+    # Self-host binds SFTP on all interfaces so the local Droid containers can
+    # reach it; cloud mode binds loopback only (tunnel), so no rule is needed.
+    if $SELF_HOST_MODE || [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+        fw_ports+=("${SFTP_LOCAL_PORT}/tcp:SFTP")
+    fi
+
+    for port_desc in "${fw_ports[@]}"; do
         local port="${port_desc%%:*}"
         local desc="${port_desc##*:}"
         if ! ufw status | grep -q "$port.*ALLOW"; then
@@ -1101,6 +1876,9 @@ start_all_services() {
     echo "=== Starting Services ==="
 
     mkdir -p "$LOG_DIR"
+
+    local agent_port
+    agent_port="$(agent_service_port)"
 
     # Determine DISPLAY
     local display="${DISPLAY:-:0}"
@@ -1141,16 +1919,16 @@ start_all_services() {
         echo "  websockify already running on port 6080"
     fi
 
-    # Start Agent Service (only if not already running on 3000)
-    if ! test_port_listening 3000; then
-        echo "  Starting Agent Service..."
+    # Start Agent Service (only if not already running on configured PORT)
+    if ! test_port_listening "$agent_port"; then
+        echo "  Starting Agent Service on port ${agent_port}..."
         (
             cd "$AGENT_SERVICE_DIR"
             export PLAYWRIGHT_BROWSERS_PATH="$INSTALL_DIR/browsers"
             nohup npx -y ts-node src/index.ts > "$LOG_DIR/agent.log" 2>&1 &
         )
     else
-        echo "  Agent Service already running on port 3000"
+        echo "  Agent Service already running on port ${agent_port}"
     fi
 
     # Poll for services to come up (up to 20 seconds)
@@ -1166,7 +1944,7 @@ start_all_services() {
         local vnc_up=false ws_up=false agent_up=false
         test_port_listening 5900 && vnc_up=true
         test_port_listening 6080 && ws_up=true
-        test_port_listening 3000 && agent_up=true
+        test_port_listening "$agent_port" && agent_up=true
 
         if $vnc_up && $ws_up && $agent_up; then break; fi
 
@@ -1201,10 +1979,10 @@ start_all_services() {
         fi
     fi
 
-    if test_port_listening 3000; then
-        echo "  [OK] Agent Service (port 3000)"
+    if test_port_listening "$agent_port"; then
+        echo "  [OK] Agent Service (port ${agent_port})"
     else
-        echo "  [FAIL] Agent Service (port 3000)"
+        echo "  [FAIL] Agent Service (port ${agent_port})"
         all_ok=false
         if [[ -f "$LOG_DIR/agent.log" ]]; then
             echo "  Log ($LOG_DIR/agent.log):"
@@ -1217,10 +1995,19 @@ start_all_services() {
         echo "  Some services failed to start. Check the log files above for details."
     fi
 
-    # Start tunnel after local services are confirmed up
-    if $all_ok; then
+    # The tunnel forwards the agent port to the cloud; skip it in self-host mode.
+    if $all_ok && ! $SELF_HOST_MODE && [[ "$(get_env_value "SELF_HOST")" != "1" ]]; then
         start_tunnel
     fi
+
+    # SFTP server (rclone) runs in both modes; its tunnel only in cloud mode.
+    start_sftp_server
+    if ! $SELF_HOST_MODE && [[ "$(get_env_value "SELF_HOST")" != "1" ]]; then
+        start_sftp_tunnel
+    fi
+
+    # Periodic key-sync timer (runs in both modes); ignore if units aren't loaded.
+    systemctl --user start unify-sftp-sync.timer 2>/dev/null || true
 }
 
 # =============================================================================
@@ -1239,20 +2026,23 @@ show_summary() {
     echo ""
     echo "Local URLs:"
 
+    local agent_port
+    agent_port="$(agent_service_port)"
+
     local vnc_url="http://localhost:6080/custom.html"
     if [[ -n "$UNIFY_KEY" ]]; then
         vnc_url="${vnc_url}?password=${UNIFY_KEY}"
     fi
 
     echo "  Desktop:       $vnc_url"
-    echo "  Agent Service: http://localhost:3000"
+    echo "  Agent Service: http://localhost:${agent_port}"
 
     local tunnel_url tunnel_id device_id
     tunnel_url=$(get_env_value "TUNNEL_URL")
     tunnel_id=$(get_env_value "TUNNEL_ID")
     device_id=$(get_env_value "DEVICE_ID")
 
-    if [[ -n "$tunnel_url" ]]; then
+    if [[ -n "$tunnel_url" ]] && ! $SELF_HOST_MODE && [[ "$(get_env_value "SELF_HOST")" != "1" ]]; then
         echo ""
         echo "Public Access:"
         echo "  Tunnel URL:  $tunnel_url"
@@ -1276,6 +2066,9 @@ show_summary() {
 
 # Handle start command (just start services, no install/config - no root needed)
 if $DO_START; then
+    # Self-heal: re-register tunnel/desktop if they were deleted on the backend
+    # while local ids persisted. Best-effort and offline-safe (never blocks start).
+    ensure_registration || true
     start_all_services
     exit 0
 fi
@@ -1286,9 +2079,121 @@ if $DO_STOP; then
     exit 0
 fi
 
+# Handle sync-keys (lightweight reconcile run by the unify-sftp-sync.timer:
+# refresh authorized_keys + report tunnel coords for links enabled in the console
+# after install). Runs as the regular user; no root, no install, no registration.
+if $DO_SYNC_KEYS; then
+    reconcile_sftp_links
+    exit 0
+fi
+
 # Handle uninstall command
 if $DO_UNINSTALL; then
     uninstall_all
+    exit 0
+fi
+
+# Handle reconfigure (lightweight key update: re-apply key + re-register +
+# restart services). Used by the tray when the API key changes. It deliberately
+# skips dependency installs AND setup_autostart: services run in the user
+# session, .env is user-owned, and the tray itself has no port, so a plain
+# user-context stop/start is safe and never kills the menu-bar app.
+if $RECONFIGURE; then
+    echo ""
+    echo "Reconfigure mode"
+
+    if [[ -z "$UNIFY_KEY" ]]; then
+        echo "ERROR: --reconfigure requires --unify-key" >&2
+        exit 1
+    fi
+
+    # Run as the regular user (registration writes the user-owned .env; matches --start).
+    if [[ "$EUID" -eq 0 ]]; then
+        echo "ERROR: Do not run --reconfigure as root." >&2
+        exit 1
+    fi
+
+    # Settings only changes the API key — preserve the URLs baked at install.
+    # Otherwise setup_agent_service_env would overwrite them with setup.sh's
+    # hardcoded production defaults, breaking a staging/custom install.
+    apply_compose_self_host_mode
+    if ! compose_self_host_present; then
+        existing_orch="$(get_env_value "ORCHESTRA_URL")"
+        existing_comms="$(get_env_value "DROID_COMMS_URL")"
+        [[ -n "$existing_orch" ]]  && ORCHESTRA_URL="$existing_orch"
+        [[ -n "$existing_comms" ]] && DROID_COMMS_URL="$existing_comms"
+        if [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+            SELF_HOST_MODE=true
+            ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
+            DROID_COMMS_URL="${DROID_COMMS_URL:-http://127.0.0.1:8001}"
+            LINK_COORDINATOR=true
+        fi
+    fi
+
+    # Rewrite .env with the new key (preserves TUNNEL_*/DEVICE_ID and URLs).
+    setup_agent_service_env
+
+    # Stop running services so they restart with the new key (x11vnc password +
+    # agent both read UNIFY_KEY at process start).
+    stop_all_services
+
+    mkdir -p "$LOG_DIR"
+
+    # Re-register tunnel + desktop with the new key.
+    if $SELF_HOST_MODE; then
+        ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
+        register_self_host_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" || true
+    else
+        register_tunnel "$UNIFY_KEY" "$DROID_COMMS_URL" "$(agent_service_port)" "$DEVICE_NAME" || true
+        tunnel_url=$(get_env_value "TUNNEL_URL")
+        if [[ -n "$tunnel_url" ]]; then
+            register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
+        fi
+    fi
+
+    # Re-provision the SFTP server + tunnel and persist the SFTP_* values.
+    register_sftp_tunnel "$UNIFY_KEY" "$DROID_COMMS_URL" || true
+    setup_sftp_server || true
+    setup_agent_service_env
+
+    start_all_services
+    exit 0
+fi
+
+# Handle prereqs-only (install dependencies without requiring a key).
+# Used by the .deb postinst deferred phase so the tray launches and the user
+# can enter their key via the tray Settings dialog on first run.
+if $PREREQS_ONLY; then
+    echo ""
+    echo "Prerequisites-only mode"
+
+    if [[ "$EUID" -ne 0 ]]; then
+        echo "ERROR: Prerequisites install requires root. Run with sudo." >&2
+        exit 1
+    fi
+
+    install_system_deps
+    install_nodejs
+    install_bun
+    install_websockify
+    install_novnc
+    install_magnitude
+    install_agent_service
+    install_rathole
+    install_rclone
+
+    setup_systemd_services
+    setup_autostart
+    configure_firewall
+
+    # Fix ownership
+    target_user="${SUDO_USER:-$(logname 2>/dev/null || echo "")}"
+    if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+        chown -R "$target_user":"$(id -gn "$target_user")" "$INSTALL_DIR" 2>/dev/null || true
+    fi
+
+    echo ""
+    echo "Prerequisites installed. Open the tray icon to enter your API key and start services."
     exit 0
 fi
 
@@ -1335,9 +2240,16 @@ else
     install_magnitude
     install_agent_service
     install_rathole
+    install_rclone
 fi
 
 # Always run configuration
+apply_compose_self_host_mode
+if $SELF_HOST_MODE; then
+    ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
+    DROID_COMMS_URL="${DROID_COMMS_URL:-http://127.0.0.1:8001}"
+    LINK_COORDINATOR=true
+fi
 setup_agent_service_env
 setup_systemd_services
 setup_autostart
@@ -1352,13 +2264,22 @@ if [[ -n "$target_user" && "$target_user" != "root" ]]; then
     chown -R "$target_user":"$(id -gn "$target_user")" "$INSTALL_DIR" 2>/dev/null || true
 fi
 
-# Register tunnel and desktop (always, so config is ready for --start)
-register_tunnel "$UNIFY_KEY" "$UNITY_COMMS_URL" 3000 "$DEVICE_NAME" || true
-
-tunnel_url=$(get_env_value "TUNNEL_URL")
-if [[ -n "$tunnel_url" ]]; then
-    register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
+# Register desktop for Droid control.
+if $SELF_HOST_MODE; then
+    register_self_host_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" || true
+else
+    register_tunnel "$UNIFY_KEY" "$DROID_COMMS_URL" "$(agent_service_port)" "$DEVICE_NAME" || true
+    tunnel_url=$(get_env_value "TUNNEL_URL")
+    if [[ -n "$tunnel_url" ]]; then
+        register_desktop "$UNIFY_KEY" "$ORCHESTRA_URL" "$DEVICE_NAME" "$tunnel_url" || true
+    fi
 fi
+
+# Provision the app-owned SFTP server + (cloud) its raw-TCP tunnel, then re-write
+# the .env so the resolved SFTP_* values are persisted for the systemd unit.
+register_sftp_tunnel "$UNIFY_KEY" "$DROID_COMMS_URL" || true
+setup_sftp_server || true
+setup_agent_service_env
 
 # Start services (unless --no-start, e.g. when called from .deb postinst)
 if $NO_START; then

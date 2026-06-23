@@ -17,6 +17,7 @@ Mirrors: windows/gui/UnifyAssistant.ps1
 
 import os
 import sys
+import math
 import signal
 import subprocess
 import socket
@@ -50,19 +51,42 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 
 APP_NAME = "Unify Desktop Assistant"
 APP_ID = "ai.unify.desktop-assistant"
+DEB_PACKAGE = "unify-desktop-assistant"
 
 INSTALL_DIR = Path(__file__).resolve().parent.parent
 TOOLS_DIR = INSTALL_DIR / "tools"
 AGENT_SERVICE_DIR = INSTALL_DIR / "agent-service"
+ASSETS_DIR = INSTALL_DIR / "assets"
+LOGO_PATH = ASSETS_DIR / "unify_logo_only.png"
 SETUP_SCRIPT = TOOLS_DIR / "setup.sh"
 ENV_FILE = AGENT_SERVICE_DIR / ".env"
 SETTINGS_FILE = INSTALL_DIR / "settings.json"
 SIGNAL_FILE = INSTALL_DIR / "uninstall.signal"
 LOG_DIR = INSTALL_DIR / "logs"
 
+# Status dot colors (RGB), matching the macOS tray palette.
+STATUS_COLORS = {
+    "running": (76, 175, 80),    # Green
+    "partial": (255, 193, 7),    # Yellow/Amber
+    "stopped": (244, 67, 54),    # Red
+}
+
 VNC_PORT = 5900
 NOVNC_PORT = 6080
-AGENT_PORT = 3000
+
+
+def compose_self_host_present() -> bool:
+    """True when a Droid Docker compose self-host install exists."""
+    return (Path.home() / ".droid" / "docker-compose.yml").exists()
+
+
+def agent_port() -> int:
+    """Agent-service listen port from .env (13000 self-host, 3000 cloud SaaS)."""
+    raw = get_env_value("PORT")
+    if raw.isdigit():
+        return int(raw)
+    return 13000 if compose_self_host_present() else 3000
+
 
 STATUS_INTERVAL_MS = 5000  # 5 seconds
 
@@ -98,7 +122,7 @@ def get_service_status() -> dict:
     """Get status of all services by checking ports."""
     vnc = test_port_listening(VNC_PORT)
     novnc = test_port_listening(NOVNC_PORT)
-    agent = test_port_listening(AGENT_PORT)
+    agent = test_port_listening(agent_port())
     tunnel = is_tunnel_running()
     return {
         "vnc": vnc,
@@ -226,23 +250,27 @@ class UnifyTrayApp:
         # Initial status
         self._update_status()
 
-        # Auto-start services if key is configured
+        # Auto-start services if key is configured; otherwise prompt on first run.
         key = get_env_value("UNIFY_KEY")
         if key:
             self._start_services(None)
+        else:
+            GLib.timeout_add(800, self._show_first_run_dialog)
 
     def _create_icon_files(self):
-        """Create temporary icon files for AppIndicator (requires file paths)."""
+        """Create temporary icon files for AppIndicator (requires file paths).
+
+        Composites the Unify logo with a colored status dot at the lower-right
+        (matching the macOS/Windows trays). Falls back to a plain colored circle
+        if the logo asset is missing or compositing fails.
+        """
         import tempfile
         import cairo
 
         icon_dir = Path(tempfile.mkdtemp(prefix="unify-tray-"))
+        have_logo = LOGO_PATH.exists()
 
-        for status, (r, g, b) in [
-            ("running", (76, 175, 80)),
-            ("partial", (255, 193, 7)),
-            ("stopped", (244, 67, 54)),
-        ]:
+        for status, (r, g, b) in STATUS_COLORS.items():
             size = 22
             surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
             ctx = cairo.Context(surface)
@@ -250,14 +278,46 @@ class UnifyTrayApp:
             ctx.set_source_rgba(0, 0, 0, 0)
             ctx.paint()
 
-            cx, cy = size / 2, size / 2
-            radius = size / 2 - 2
-            ctx.arc(cx, cy, radius, 0, 2 * 3.14159)
-            ctx.set_source_rgb(r / 255, g / 255, b / 255)
-            ctx.fill_preserve()
-            ctx.set_source_rgb(0.12, 0.12, 0.12)
-            ctx.set_line_width(1)
-            ctx.stroke()
+            drew_logo = False
+            if have_logo:
+                try:
+                    logo = GdkPixbuf.Pixbuf.new_from_file_at_size(
+                        str(LOGO_PATH), size, size
+                    )
+                    # Center the (aspect-fit) logo on the canvas.
+                    lx = (size - logo.get_width()) / 2.0
+                    ly = (size - logo.get_height()) / 2.0
+                    Gdk.cairo_set_source_pixbuf(ctx, logo, lx, ly)
+                    ctx.paint()
+
+                    # Status dot at the lower-right, with a white ring for
+                    # contrast against the logo / panel background.
+                    diam = size * 0.46
+                    margin = size * 0.02
+                    ring = size * 0.07
+                    dcx = size - diam / 2.0 - margin
+                    dcy = size - diam / 2.0 - margin
+
+                    ctx.set_source_rgb(1, 1, 1)
+                    ctx.arc(dcx, dcy, diam / 2.0 + ring, 0, 2 * math.pi)
+                    ctx.fill()
+
+                    ctx.set_source_rgb(r / 255, g / 255, b / 255)
+                    ctx.arc(dcx, dcy, diam / 2.0, 0, 2 * math.pi)
+                    ctx.fill()
+                    drew_logo = True
+                except Exception:
+                    drew_logo = False
+
+            if not drew_logo:
+                cx, cy = size / 2, size / 2
+                radius = size / 2 - 2
+                ctx.arc(cx, cy, radius, 0, 2 * math.pi)
+                ctx.set_source_rgb(r / 255, g / 255, b / 255)
+                ctx.fill_preserve()
+                ctx.set_source_rgb(0.12, 0.12, 0.12)
+                ctx.set_line_width(1)
+                ctx.stroke()
 
             icon_path = icon_dir / f"unify-{status}.png"
             surface.write_to_png(str(icon_path))
@@ -317,6 +377,11 @@ class UnifyTrayApp:
         self.menu.append(logs_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
+
+        # Uninstall
+        uninstall_item = Gtk.MenuItem(label="Uninstall...")
+        uninstall_item.connect("activate", self._uninstall)
+        self.menu.append(uninstall_item)
 
         # Exit
         exit_item = Gtk.MenuItem(label="Exit")
@@ -411,7 +476,7 @@ class UnifyTrayApp:
 
     def _open_api(self, _widget):
         """Open the Agent API in the default browser."""
-        webbrowser.open(f"http://localhost:{AGENT_PORT}")
+        webbrowser.open(f"http://localhost:{agent_port()}")
 
     def _copy_public_url(self, _widget):
         """Copy the tunnel public URL to the clipboard."""
@@ -434,11 +499,72 @@ class UnifyTrayApp:
 
     def _show_settings(self, _widget):
         """Show the settings dialog."""
+        old_key = get_env_value("UNIFY_KEY")
         dialog = SettingsDialog()
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
+            new_key = dialog.txt_key.get_text().strip()
             dialog.save()
+            # If the API key actually changed, re-run setup so services restart
+            # and pick up the new key (x11vnc password + agent both read it at
+            # process start). Writing .env alone would leave the old key live.
+            if new_key and new_key != old_key:
+                self._apply_key_and_setup(new_key)
         dialog.destroy()
+
+    def _apply_key_and_setup(self, key: str):
+        """Re-apply the API key via setup.sh --reconfigure in the background.
+
+        --reconfigure rewrites .env (preserving baked URLs + tunnel/device IDs),
+        stops services, re-registers the tunnel/desktop, and restarts services
+        with the new key. It runs in the user session (no root) and never touches
+        autostart, so it won't kill this tray app. Kicked off on a worker thread
+        so the menu stays responsive.
+        """
+        self._notify("Updating", "Applying new API key and restarting services…")
+
+        def worker():
+            subprocess.run(
+                [str(SETUP_SCRIPT), "--reconfigure", "--unify-key", key],
+                capture_output=True,
+            )
+            self._notify("Ready", "Unify Desktop Assistant is configured.")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_first_run_dialog(self) -> bool:
+        """Shown once on first launch when no API key is configured.
+
+        Explains where to get the key and opens the Settings dialog so the
+        user can paste it in immediately. Returns False so GLib does not
+        reschedule the timeout.
+        """
+        dialog = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="Welcome to Unify Desktop Assistant",
+        )
+        dialog.format_secondary_text(
+            "To get started, enter your Unify API key in Settings.\n\n"
+            "• Cloud users: find your key in the Unify Console under Settings → API Keys.\n"
+            "• Self-hosted users: register on your local Console (http://localhost:3000) "
+            "then copy your key from Settings → API Keys.\n\n"
+            "Click OK to open Settings now."
+        )
+        dialog.run()
+        dialog.destroy()
+        self._show_settings(None)
+        return False
+
+    def _notify(self, title: str, body: str):
+        """Best-effort desktop notification via notify-send (no hard dependency)."""
+        try:
+            subprocess.Popen(
+                ["notify-send", f"{APP_NAME}: {title}", body],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
 
     def _view_logs(self, _widget):
         """Open the agent log file in the default text editor."""
@@ -454,6 +580,56 @@ class UnifyTrayApp:
             dialog.format_secondary_text(f"Log file not found: {log_file}")
             dialog.run()
             dialog.destroy()
+
+    def _uninstall(self, _widget):
+        """Uninstall the app via an elevated cleanup, then quit.
+
+        Uninstall needs root (stop services, unregister, remove system files).
+        When installed as a .deb we use `apt-get purge` so dpkg's postrm runs the
+        full cleanup (removes /opt, systemd units across /home/*, firewall rules).
+        Otherwise we fall back to `setup.sh --uninstall`. Either way pkexec
+        provides a graphical root prompt (polkit). Runs on a worker thread; the
+        tray quits once cleanup finishes.
+        """
+        dialog = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Uninstall Unify Desktop Assistant?",
+        )
+        dialog.format_secondary_text(
+            "This will stop all services, unregister this device, and remove "
+            "Unify Desktop Assistant from this computer.\n\nThis cannot be undone."
+        )
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        response = dialog.run()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+
+        self._notify("Uninstalling", "Removing Unify Desktop Assistant…")
+
+        def worker():
+            installed_via_apt = False
+            try:
+                installed_via_apt = subprocess.run(
+                    ["dpkg", "-s", DEB_PACKAGE],
+                    capture_output=True,
+                ).returncode == 0
+            except Exception:
+                pass
+
+            if installed_via_apt:
+                cmd = ["pkexec", "apt-get", "purge", "-y", DEB_PACKAGE]
+            else:
+                cmd = ["pkexec", "bash", str(SETUP_SCRIPT), "--uninstall"]
+
+            try:
+                subprocess.run(cmd, capture_output=True)
+            except Exception:
+                pass
+            GLib.idle_add(Gtk.main_quit)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _quit(self, _widget):
         """Quit the tray application."""
@@ -518,14 +694,14 @@ class SettingsDialog(Gtk.Dialog):
         self.txt_url.set_sensitive(False)
         box.pack_start(self.txt_url, False, False, 0)
 
-        # --- Unity Comms URL ---
-        lbl_comms = Gtk.Label(label="Unity Comms URL:", xalign=0)
+        # --- Droid Comms URL ---
+        lbl_comms = Gtk.Label(label="Droid Comms URL:", xalign=0)
         box.pack_start(lbl_comms, False, False, 4)
 
         self.txt_comms = Gtk.Entry()
         self.txt_comms.set_text(
-            get_env_value("UNITY_COMMS_URL")
-            or "https://unity-comms-app-000000000000.us-central1.run.app"
+            get_env_value("DROID_COMMS_URL")
+            or "https://service.a.run.app"
         )
         self.txt_comms.set_sensitive(False)
         box.pack_start(self.txt_comms, False, False, 0)
@@ -584,8 +760,7 @@ class SettingsDialog(Gtk.Dialog):
         """Save the settings to .env file."""
         set_env_value("UNIFY_KEY", self.txt_key.get_text())
         set_env_value("ORCHESTRA_URL", self.txt_url.get_text())
-        set_env_value("UNITY_COMMS_URL", self.txt_comms.get_text())
-        set_env_value("PORT", "3000")
+        set_env_value("DROID_COMMS_URL", self.txt_comms.get_text())
 
 
 # =============================================================================
