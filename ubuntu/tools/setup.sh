@@ -1250,12 +1250,24 @@ register_sftp_tunnel() {
 
     set_env_value "SFTP_BIND_ADDR" "127.0.0.1"
 
-    local existing_port
-    existing_port=$(get_env_value "SFTP_TUNNEL_PORT")
-    if [[ -n "$existing_port" && -f "$SFTP_RATHOLE_CONFIG" ]]; then
-        echo ""
-        echo "  SFTP tunnel already registered: $(get_env_value "SFTP_TUNNEL_HOST"):${existing_port}"
-        return 0
+    local existing_sftp_id
+    existing_sftp_id=$(get_env_value "SFTP_TUNNEL_ID")
+    if [[ -n "$existing_sftp_id" ]]; then
+        local status
+        status=$(tunnel_exists "$unify_key" "$comms_url" "$existing_sftp_id")
+        if [[ "$status" == "missing" ]]; then
+            echo "  SFTP tunnel $existing_sftp_id no longer exists on server — re-registering"
+            set_env_value "SFTP_TUNNEL_ID" ""
+            set_env_value "SFTP_TUNNEL_HOST" ""
+            set_env_value "SFTP_TUNNEL_PORT" ""
+            rm -f "$SFTP_RATHOLE_CONFIG"
+            # fall through to fresh registration below
+        else
+            echo ""
+            echo "  SFTP tunnel already registered: $(get_env_value "SFTP_TUNNEL_HOST"):$(get_env_value "SFTP_TUNNEL_PORT")"
+            [[ "$status" == "unknown" ]] && echo "  (could not verify with server; keeping existing registration)"
+            return 0
+        fi
     fi
 
     echo ""
@@ -1630,6 +1642,7 @@ ensure_registration() {
         register_desktop "$unify_key" "$orchestra_url" "$DEVICE_NAME" "$(self_host_registration_url)" || true
     elif [[ -n "$comms_url" ]]; then
         register_tunnel "$unify_key" "$comms_url" 3000 "$DEVICE_NAME" || true
+        register_sftp_tunnel "$unify_key" "$comms_url" || true
         tunnel_url=$(get_env_value "TUNNEL_URL")
         if [[ -n "$tunnel_url" ]]; then
             register_desktop "$unify_key" "$orchestra_url" "$DEVICE_NAME" "$tunnel_url" || true

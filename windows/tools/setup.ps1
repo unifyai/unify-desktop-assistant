@@ -1149,10 +1149,25 @@ function Register-SFTPTunnel {
 
     Set-EnvValue -Key 'SFTP_BIND_ADDR' -Value '127.0.0.1'
 
-    $existingPort = Get-EnvValue -Key 'SFTP_TUNNEL_PORT'
-    if ($existingPort -and (Test-Path $script:SftpRatholeConfig)) {
-        Write-Host "  SFTP tunnel already registered: $(Get-EnvValue -Key 'SFTP_TUNNEL_HOST'):$existingPort" -ForegroundColor Green
-        return
+    $existingSftpId = Get-EnvValue -Key 'SFTP_TUNNEL_ID'
+    if ($existingSftpId) {
+        $status = Test-TunnelExists -UnifyKey $UnifyKey -CommsUrl $CommsUrl -TunnelId $existingSftpId
+        if ($status -eq 'missing') {
+            Write-Host "  SFTP tunnel $existingSftpId no longer exists on server - re-registering" -ForegroundColor Yellow
+            Set-EnvValue -Key 'SFTP_TUNNEL_ID' -Value ""
+            Set-EnvValue -Key 'SFTP_TUNNEL_HOST' -Value ""
+            Set-EnvValue -Key 'SFTP_TUNNEL_PORT' -Value ""
+            if (Test-Path $script:SftpRatholeConfig) {
+                Remove-Item $script:SftpRatholeConfig -Force -ErrorAction SilentlyContinue
+            }
+            # fall through to fresh registration below
+        } else {
+            Write-Host "  SFTP tunnel already registered: $(Get-EnvValue -Key 'SFTP_TUNNEL_HOST'):$(Get-EnvValue -Key 'SFTP_TUNNEL_PORT')" -ForegroundColor Green
+            if ($status -eq 'unknown') {
+                Write-Host "  (could not verify with server; keeping existing registration)" -ForegroundColor Gray
+            }
+            return
+        }
     }
 
     Write-Host ""
@@ -1824,6 +1839,7 @@ function Ensure-Registration {
             Register-Desktop -UnifyKey $unifyKey -OrchestraUrl $orchestraUrl -DeviceName $DeviceName -TunnelUrl (Get-SelfHostRegistrationUrl)
         } elseif ($commsUrl) {
             Register-Tunnel -UnifyKey $unifyKey -CommsUrl $commsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
+            Register-SFTPTunnel -UnifyKey $unifyKey -CommsUrl $commsUrl
             $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
             if ($tunnelUrl) {
                 Register-Desktop -UnifyKey $unifyKey -OrchestraUrl $orchestraUrl -DeviceName $DeviceName -TunnelUrl $tunnelUrl
