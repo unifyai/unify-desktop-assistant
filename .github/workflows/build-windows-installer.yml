@@ -42,16 +42,19 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          $buildArgs = @('-Clean')
+          # Use HASHTABLE splatting, not an array. Array splatting passes elements
+          # positionally, so '-Clean'/'-Staging' would NOT bind to the switches --
+          # '-Clean' lands in build.ps1's first positional param (-Version) and
+          # -Staging is dropped, silently producing a mislabeled production build.
+          $buildArgs = @{ Clean = $true }
 
           # Determine environment.
           # IMPORTANT: do NOT name this variable $env. $env is PowerShell's reserved
           # environment-variable drive; assigning to it does not round-trip, so the
-          # comparison below silently fails, -Staging is dropped, and a PRODUCTION
-          # installer gets built and then mislabeled as staging.
+          # comparison below would silently fail.
           $environment = "${{ inputs.environment }}"
           if ($environment -eq 'staging') {
-            $buildArgs += '-Staging'
+            $buildArgs['Staging'] = $true
             Write-Host "Building for STAGING environment"
           } else {
             Write-Host "Building for PRODUCTION environment"
@@ -60,12 +63,11 @@ jobs:
           # Optional version override
           $version = "${{ inputs.version }}"
           if ($version -ne '') {
-            $buildArgs += "-Version"
-            $buildArgs += $version
+            $buildArgs['Version'] = $version
             Write-Host "Version override: $version"
           }
 
-          Write-Host "Running: .\windows\installer\build.ps1 $($buildArgs -join ' ')"
+          Write-Host "Running build.ps1 with: $(($buildArgs.GetEnumerator() | ForEach-Object { "-$($_.Key) $($_.Value)" }) -join ' ')"
           & .\windows\installer\build.ps1 @buildArgs
 
       - name: Verify, version & rename installer
