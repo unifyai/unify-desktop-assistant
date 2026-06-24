@@ -1932,6 +1932,11 @@ function Setup-AgentServiceEnv {
     Write-Host ""
     Write-Host "=== Configuring Agent Service ===" -ForegroundColor Cyan
     
+    # This may run before Install-AgentService (we write the core config up front
+    # so a partial install still leaves a configured .env), so ensure the dir.
+    if (-not (Test-Path $script:AgentServiceDir)) {
+        New-Item -ItemType Directory -Force -Path $script:AgentServiceDir | Out-Null
+    }
     $envFile = Join-Path $script:AgentServiceDir '.env'
     
     # Preserve existing tunnel/device values if .env already exists
@@ -2440,6 +2445,34 @@ if (-not $UnifyKey) {
 }
 
 try {
+    # Resolve backend URLs / self-host mode up front and write the core .env
+    # BEFORE any failure-prone install step. A partial install (e.g. a failed
+    # prerequisite) must still leave a configured .env rather than an empty one
+    # that the GUI would disguise as a production install.
+    Apply-ComposeSelfHostMode
+    if ($script:SelfHostMode) {
+        if (-not $OrchestraUrl) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
+        if (-not $DroidCommsUrl) { $DroidCommsUrl = $script:ComposeSelfHostCommsUrl }
+        $script:LinkCoordinator = $true
+    } else {
+        # Fall back to this build's stamped backend URLs when not passed explicitly.
+        if (-not $OrchestraUrl) { $OrchestraUrl = $script:BuildOrchestraUrl }
+        if (-not $DroidCommsUrl) { $DroidCommsUrl = $script:BuildDroidCommsUrl }
+    }
+
+    # Fail loudly (and early, before the long install) rather than silently
+    # writing a production default into .env.
+    if (-not $script:SelfHostMode -and (-not $OrchestraUrl -or -not $DroidCommsUrl)) {
+        Write-Host ""
+        Write-Host "ERROR: No backend URL configured (ORCHESTRA_URL / DROID_COMMS_URL)." -ForegroundColor Red
+        Write-Host "  Pass -OrchestraUrl and -DroidCommsUrl, or install via the packaged installer." -ForegroundColor Yellow
+        exit 1
+    }
+
+    # Persist the core config now; later Setup-AgentServiceEnv calls are
+    # idempotent and refresh it with registration/SFTP results.
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DroidCommsUrl $DroidCommsUrl
+
     # Detect fast mode
     $fastMode = (Test-FastMode) -and -not $Force
 
@@ -2472,28 +2505,11 @@ try {
         Install-Rclone
     }
 
-    # Always run configuration
-    Apply-ComposeSelfHostMode
-    if ($script:SelfHostMode) {
-        if (-not $OrchestraUrl) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
-        if (-not $DroidCommsUrl) { $DroidCommsUrl = $script:ComposeSelfHostCommsUrl }
-        $script:LinkCoordinator = $true
-    } else {
-        # Fall back to this build's stamped backend URLs when not passed explicitly.
-        if (-not $OrchestraUrl) { $OrchestraUrl = $script:BuildOrchestraUrl }
-        if (-not $DroidCommsUrl) { $DroidCommsUrl = $script:BuildDroidCommsUrl }
-    }
-
-    # Fail loudly rather than silently writing a production default into .env.
-    if (-not $script:SelfHostMode -and (-not $OrchestraUrl -or -not $DroidCommsUrl)) {
-        Write-Host ""
-        Write-Host "ERROR: No backend URL configured (ORCHESTRA_URL / DROID_COMMS_URL)." -ForegroundColor Red
-        Write-Host "  Pass -OrchestraUrl and -DroidCommsUrl, or install via the packaged installer." -ForegroundColor Yellow
-        exit 1
-    }
-
+    # Backend URLs / self-host mode and the core .env were resolved and written
+    # up front (before the install block) so a partial install still leaves a
+    # configured .env. Registration/SFTP results are persisted by the
+    # idempotent Setup-AgentServiceEnv call after Register-SFTPTunnel below.
     Configure-TightVNC -Password $UnifyKey
-    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DroidCommsUrl $DroidCommsUrl
     Setup-TightVNCStartup
     Setup-WebsockifyStartup
     Setup-AgentServiceStartup
