@@ -1053,9 +1053,17 @@ function Setup-SFTPServer {
         if ($sshKeygen) {
             # Invoke via cmd so the empty passphrase (-N "") is parsed reliably;
             # PowerShell 5.1 can drop an empty-string argument to a native exe.
+            # Wrap the whole command and use /s so cmd strips only the outer
+            # quotes and runs the inner (multi-quoted) command verbatim - a plain
+            # "/c <multi-quote>" mangles the exe path ("filename ... syntax is
+            # incorrect").
             $keygenInner = "`"$sshKeygen`" -t ed25519 -f `"$($script:SshHostKey)`" -N `"`" -q -C unify-desktop-sftp-host"
-            Start-Process cmd.exe -ArgumentList "/c $keygenInner" -NoNewWindow -Wait
-            Write-Host "  Generated SFTP host key" -ForegroundColor Green
+            Start-Process cmd.exe -ArgumentList "/s /c `"$keygenInner`"" -NoNewWindow -Wait
+            if (Test-Path $script:SshHostKey) {
+                Write-Host "  Generated SFTP host key" -ForegroundColor Green
+            } else {
+                Write-Host "  WARNING: ssh-keygen produced no host key; rclone will generate one on first run" -ForegroundColor Yellow
+            }
         } else {
             Write-Host "  WARNING: ssh-keygen unavailable; rclone will generate a host key on first run" -ForegroundColor Yellow
         }
