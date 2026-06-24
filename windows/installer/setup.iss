@@ -12,7 +12,12 @@
 ;   .\build.ps1
 
 #define AppName "Unify Desktop Assistant"
-#define AppVersion "1.0.0"
+; Version: overridable via ISCC /DAppVersion=... (build.ps1 -Version / CI input).
+; Must be guarded by #ifndef, otherwise an unconditional #define here would clobber
+; the command-line value and the built installer would always report 1.0.0.
+#ifndef AppVersion
+  #define AppVersion "1.0.0"
+#endif
 #define AppPublisher "Unify"
 #define AppURL "https://unify.ai"
 #define AppExeName "UnifyAssistant.vbs"

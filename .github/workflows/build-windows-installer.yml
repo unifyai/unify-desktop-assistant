@@ -44,9 +44,13 @@ jobs:
         run: |
           $buildArgs = @('-Clean')
 
-          # Determine environment
-          $env = "${{ inputs.environment }}"
-          if ($env -eq 'staging') {
+          # Determine environment.
+          # IMPORTANT: do NOT name this variable $env. $env is PowerShell's reserved
+          # environment-variable drive; assigning to it does not round-trip, so the
+          # comparison below silently fails, -Staging is dropped, and a PRODUCTION
+          # installer gets built and then mislabeled as staging.
+          $environment = "${{ inputs.environment }}"
+          if ($environment -eq 'staging') {
             $buildArgs += '-Staging'
             Write-Host "Building for STAGING environment"
           } else {
@@ -64,40 +68,67 @@ jobs:
           Write-Host "Running: .\windows\installer\build.ps1 $($buildArgs -join ' ')"
           & .\windows\installer\build.ps1 @buildArgs
 
-      - name: Determine version tag
+      - name: Verify, version & rename installer
         id: version
         shell: pwsh
         run: |
-          $version = "${{ inputs.version }}"
-          if ($version -eq '') {
-            $issContent = Get-Content windows/installer/setup.iss -Raw
-            if ($issContent -match '#define MyAppVersion\s+"([^"]+)"') {
-              $version = $Matches[1]
-            } else {
-              Write-Error "Could not determine version from setup.iss"
-              exit 1
-            }
+          $environment = "${{ inputs.environment }}"
+
+          $exe = Get-ChildItem windows/installer/output/*.exe | Select-Object -First 1
+          if (-not $exe) { throw "No installer was produced by build.ps1" }
+          Write-Host "Compiled artifact: $($exe.Name)"
+
+          # The compiled OutputBaseFilename carries the -staging suffix only when the
+          # installer was actually built for staging, so treat it as the source of
+          # truth. Fail loudly if it disagrees with the requested environment -- this
+          # catches the class of bug where the staging flag is silently dropped and a
+          # production binary would otherwise be published under the staging name.
+          $isStagingBuild = $exe.Name -like '*-staging.exe'
+          if ($environment -eq 'staging' -and -not $isStagingBuild) {
+            throw "Requested 'staging' but compiled '$($exe.Name)' has no -staging suffix => PRODUCTION was built. Aborting."
+          }
+          if ($environment -ne 'staging' -and $isStagingBuild) {
+            throw "Requested 'main' but compiled '$($exe.Name)' has a -staging suffix => STAGING was built. Aborting."
+          }
+
+          # Defense in depth: the staging backend host is baked in only for staging
+          # builds. (The production host is always present via the GUI fallback, so
+          # we key off the staging host's presence/absence instead.)
+          $hasStagingHost = [bool](Select-String -Path $exe.FullName -Pattern 'internal.example.com' -SimpleMatch -Quiet)
+          if ($environment -eq 'staging' -and -not $hasStagingHost) {
+            throw "Staging build does not contain the staging backend host. Aborting."
+          }
+          if ($environment -ne 'staging' -and $hasStagingHost) {
+            throw "Production build unexpectedly contains the staging backend host. Aborting."
+          }
+
+          # Derive the version from the compiled filename so the release tag always
+          # matches the binary: UnifyDesktopAssistant-Setup-<ver>[-staging].exe
+          if ($exe.Name -match '^UnifyDesktopAssistant-Setup-(.+?)(-staging)?\.exe$') {
+            $version = $Matches[1]
+          } else {
+            throw "Could not parse version from compiled filename '$($exe.Name)'"
           }
           $tag = "v$version"
           Write-Host "Version: $version, Tag: $tag"
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
 
-      - name: Rename installer
-        shell: pwsh
-        run: |
-          $exe = Get-ChildItem windows/installer/output/*.exe | Select-Object -First 1
-          if ("${{ inputs.environment }}" -eq "staging") {
-            Move-Item $exe.FullName windows/installer/output/unify-desktop-assistant-staging.exe
+          # Publish under a stable, frontend-friendly name.
+          if ($environment -eq 'staging') {
+            $dest = 'windows/installer/output/unify-desktop-assistant-staging.exe'
           } else {
-            Move-Item $exe.FullName windows/installer/output/unify-desktop-assistant.exe
+            $dest = 'windows/installer/output/unify-desktop-assistant.exe'
           }
+          Move-Item $exe.FullName $dest -Force
+          "asset=$dest" >> $env:GITHUB_OUTPUT
+          Write-Host "Renamed -> $dest"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Unify Desktop Assistant ${{ steps.version.outputs.version }}
-          files: windows/installer/output/unify-desktop-assistant*.exe
+          files: ${{ steps.version.outputs.asset }}
           prerelease: ${{ inputs.environment == 'staging' }}
           generate_release_notes: false
