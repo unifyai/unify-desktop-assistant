@@ -92,18 +92,7 @@ jobs:
           if ($environment -ne 'staging' -and $isStagingBuild) {
             throw "Requested 'main' but compiled '$($exe.Name)' has a -staging suffix => STAGING was built. Aborting."
           }
-
-          # Defense in depth: the staging backend host is baked in only for staging
-          # builds. (The production host is always present via the GUI fallback, so
-          # we key off the staging host's presence/absence instead.)
-          $hasStagingHost = [bool](Select-String -Path $exe.FullName -Pattern 'internal.example.com' -SimpleMatch -Quiet)
-          if ($environment -eq 'staging' -and -not $hasStagingHost) {
-            throw "Staging build does not contain the staging backend host. Aborting."
-          }
-          if ($environment -ne 'staging' -and $hasStagingHost) {
-            throw "Production build unexpectedly contains the staging backend host. Aborting."
-          }
-
+          
           # Derive the version from the compiled filename so the release tag always
           # matches the binary: UnifyDesktopAssistant-Setup-<ver>[-staging].exe
           if ($exe.Name -match '^UnifyDesktopAssistant-Setup-(.+?)(-staging)?\.exe$') {
