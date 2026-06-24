@@ -236,6 +236,41 @@ function Build-Installer {
 }
 
 # =============================================================================
+# Stamp per-environment backend URLs into setup.ps1
+# =============================================================================
+# setup.ps1 ships verbatim and has no compile-time environment of its own, so we
+# replace its @@...@@ URL sentinels with this build's backend URLs. Keep these in
+# sync with the OrchestraUrl/CommsUrl defines in setup.iss.
+
+function Get-BackendUrls {
+    if ($Staging) {
+        return @{
+            Orchestra = 'https://internal.example.com/v0'
+            Comms     = 'https://service.a.run.app'
+        }
+    }
+    return @{
+        Orchestra = 'https://api.unify.ai/v0'
+        Comms     = 'https://service.a.run.app'
+    }
+}
+
+function Stamp-SetupScript {
+    param([string]$ScriptPath, [hashtable]$Urls)
+    $original = [System.IO.File]::ReadAllText($ScriptPath)
+    $stamped = $original.Replace('@@ORCHESTRA_URL@@', $Urls.Orchestra).Replace('@@DROID_COMMS_URL@@', $Urls.Comms)
+    [System.IO.File]::WriteAllText($ScriptPath, $stamped, (New-Object System.Text.UTF8Encoding($false)))
+    return $original
+}
+
+function Restore-SetupScript {
+    param([string]$ScriptPath, [string]$Original)
+    if ($null -ne $Original) {
+        [System.IO.File]::WriteAllText($ScriptPath, $Original, (New-Object System.Text.UTF8Encoding($false)))
+    }
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -263,7 +298,23 @@ Write-Host "Found Inno Setup: $iscc" -ForegroundColor Green
 # Create placeholder assets if needed
 Create-PlaceholderAssets
 
-# Build
-Build-Installer -ISCC $iscc
+# Stamp this build's backend URLs into setup.ps1, build, then restore the repo
+# copy to its @@...@@ sentinels so the working tree is left unchanged.
+$setupScript = Join-Path $script:ProjectDir 'tools\setup.ps1'
+$backendUrls = Get-BackendUrls
+$originalSetupScript = $null
+try {
+    if ($Staging) {
+        Write-Host "  Stamping staging backend URLs into setup.ps1" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Stamping production backend URLs into setup.ps1" -ForegroundColor Green
+    }
+    $originalSetupScript = Stamp-SetupScript -ScriptPath $setupScript -Urls $backendUrls
+
+    # Build
+    Build-Installer -ISCC $iscc
+} finally {
+    Restore-SetupScript -ScriptPath $setupScript -Original $originalSetupScript
+}
 
 Write-Host ""

@@ -22,8 +22,12 @@ param(
     [Parameter(Position = 0)]
     [string]$UnifyKey,
     
-    [string]$OrchestraUrl = "https://api.unify.ai/v0",
-    [string]$DroidCommsUrl = "https://service.a.run.app",
+    # No production default: an unspecified backend URL must fail loudly rather
+    # than silently configuring a device against production. The packaged
+    # installer always passes these explicitly; -Reconfigure/-Start read them
+    # back from .env.
+    [string]$OrchestraUrl = "",
+    [string]$DroidCommsUrl = "",
     [string]$DeviceName,
     
     [switch]$Start,
@@ -46,6 +50,16 @@ $script:CoordinatorAgentId = $CoordinatorAgentId
 $script:SelfHostAgentPort = 13000
 $script:ComposeSelfHostOrchestraUrl = 'http://127.0.0.1:8000/v0'
 $script:ComposeSelfHostCommsUrl = 'http://127.0.0.1:8001'
+
+# Per-build backend URL defaults. build.ps1 stamps these for the target
+# environment (-Staging/main) at package time. In-repo they stay as the
+# @@...@@ sentinels, which we neutralize to '' so a dev run can't silently
+# register against the wrong backend (it must pass -OrchestraUrl/-DroidCommsUrl
+# or hit the loud check in the full-install path).
+$script:BuildOrchestraUrl = '@@ORCHESTRA_URL@@'
+$script:BuildDroidCommsUrl = '@@DROID_COMMS_URL@@'
+if ($script:BuildOrchestraUrl -like '@@*@@') { $script:BuildOrchestraUrl = '' }
+if ($script:BuildDroidCommsUrl -like '@@*@@') { $script:BuildDroidCommsUrl = '' }
 
 $script:StartTime = Get-Date
 $script:ToolsDir = $PSScriptRoot
@@ -2456,7 +2470,20 @@ try {
         if (-not $OrchestraUrl) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
         if (-not $DroidCommsUrl) { $DroidCommsUrl = $script:ComposeSelfHostCommsUrl }
         $script:LinkCoordinator = $true
+    } else {
+        # Fall back to this build's stamped backend URLs when not passed explicitly.
+        if (-not $OrchestraUrl) { $OrchestraUrl = $script:BuildOrchestraUrl }
+        if (-not $DroidCommsUrl) { $DroidCommsUrl = $script:BuildDroidCommsUrl }
     }
+
+    # Fail loudly rather than silently writing a production default into .env.
+    if (-not $script:SelfHostMode -and (-not $OrchestraUrl -or -not $DroidCommsUrl)) {
+        Write-Host ""
+        Write-Host "ERROR: No backend URL configured (ORCHESTRA_URL / DROID_COMMS_URL)." -ForegroundColor Red
+        Write-Host "  Pass -OrchestraUrl and -DroidCommsUrl, or install via the packaged installer." -ForegroundColor Yellow
+        exit 1
+    }
+
     Configure-TightVNC -Password $UnifyKey
     Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DroidCommsUrl $DroidCommsUrl
     Setup-TightVNCStartup
