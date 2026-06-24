@@ -1052,9 +1052,10 @@ function Setup-SFTPServer {
 
 # Reconcile per-link SFTP state with Orchestra:
 #   1. find this device's assistant links (GET /desktop -> assigned_to_assistant_ids)
-#   2. fetch each filesys-sync link's client public key (GET /desktop/link/{aid}/pubkey)
-#   3. report this device's SFTP tunnel coords (POST /desktop/link/{aid}/sftp-tunnel)
-#   4. rewrite authorized_keys from the collected keys (prunes revoked links)
+#   2. report this device's SFTP tunnel id (POST /desktop/{device_id}/sftp-tunnel)
+#   3. fetch each filesys-sync link's client public key (GET /desktop/link/{aid}/pubkey)
+#   4. report this device's SFTP tunnel coords (POST /desktop/link/{aid}/sftp-tunnel)
+#   5. rewrite authorized_keys from the collected keys (prunes revoked links)
 # Client PRIVATE keys live in Orchestra; only public keys ever touch this machine.
 # Output is ASCII, no BOM, LF endings (rclone's authorized_keys parser is strict).
 function Sync-AuthorizedKeys {
@@ -1063,6 +1064,7 @@ function Sync-AuthorizedKeys {
     $deviceId = Get-EnvValue -Key 'DEVICE_ID'
     $sftpHost = Get-EnvValue -Key 'SFTP_TUNNEL_HOST'
     $sftpPort = Get-EnvValue -Key 'SFTP_TUNNEL_PORT'
+    $sftpId = Get-EnvValue -Key 'SFTP_TUNNEL_ID'
     if (-not $unifyKey -or -not $orchestraUrl -or -not $deviceId) { return }
 
     if (-not (Test-Path $script:SshDir)) {
@@ -1083,12 +1085,27 @@ function Sync-AuthorizedKeys {
 
     $desktopList = if (& $hasProp $desktops 'info') { @($desktops.info) } else { @() }
     $assistantIds = @()
+    $deviceFound = $false
     foreach ($d in $desktopList) {
         if ("$($d.id)" -eq "$deviceId") {
+            $deviceFound = $true
             if ((& $hasProp $d 'assigned_to_assistant_ids') -and $d.assigned_to_assistant_ids) {
                 $assistantIds = @($d.assigned_to_assistant_ids)
             }
             break
+        }
+    }
+
+    # Report this device's SFTP tunnel id once (per-device, used by Console to tear
+    # the tunnel down on desktop delete). Skips self-host (no tunnel id is set).
+    if ($deviceFound -and $sftpId -and $sftpHost -and $sftpPort) {
+        $dBody = @{ tunnel_id = $sftpId; host = $sftpHost; port = [int]$sftpPort } | ConvertTo-Json -Compress
+        try {
+            Invoke-RestMethod -Method POST -Uri "$base/desktop/$deviceId/sftp-tunnel" `
+                -Headers @{ Authorization = "Bearer $unifyKey"; 'Content-Type' = 'application/json' } `
+                -Body $dBody -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Host "  WARNING: desktop tunnel report failed: $_" -ForegroundColor Yellow
         }
     }
 

@@ -1146,24 +1146,26 @@ setup_sftp_server() {
 
 # Reconcile per-link SFTP state with Orchestra:
 #   1. find this device's assistant links (GET /desktop -> assigned_to_assistant_ids)
-#   2. fetch each filesys-sync link's client public key (GET /desktop/link/{aid}/pubkey)
-#   3. report this device's SFTP tunnel coords (POST /desktop/link/{aid}/sftp-tunnel)
-#   4. atomically rewrite authorized_keys from the collected keys (prunes revoked)
+#   2. report this device's SFTP tunnel id (POST /desktop/{device_id}/sftp-tunnel)
+#   3. fetch each filesys-sync link's client public key (GET /desktop/link/{aid}/pubkey)
+#   4. report this device's SFTP tunnel coords (POST /desktop/link/{aid}/sftp-tunnel)
+#   5. atomically rewrite authorized_keys from the collected keys (prunes revoked)
 # Client PRIVATE keys live in Orchestra; only public keys ever touch this machine.
 reconcile_sftp_links() {
-    local unify_key orchestra_url device_id sftp_host sftp_port
+    local unify_key orchestra_url device_id sftp_host sftp_port sftp_id
     unify_key=$(get_env_value "UNIFY_KEY")
     orchestra_url=$(get_env_value "ORCHESTRA_URL")
     device_id=$(get_env_value "DEVICE_ID")
     sftp_host=$(get_env_value "SFTP_TUNNEL_HOST")
     sftp_port=$(get_env_value "SFTP_TUNNEL_PORT")
+    sftp_id=$(get_env_value "SFTP_TUNNEL_ID")
     [[ -z "$unify_key" || -z "$orchestra_url" || -z "$device_id" ]] && return 0
 
     mkdir -p "$SSH_DIR"
     chmod 700 "$SSH_DIR"
 
     UNIFY_KEY="$unify_key" ORCHESTRA_URL="$orchestra_url" DEVICE_ID="$device_id" \
-    SFTP_TUNNEL_HOST="$sftp_host" SFTP_TUNNEL_PORT="$sftp_port" \
+    SFTP_TUNNEL_HOST="$sftp_host" SFTP_TUNNEL_PORT="$sftp_port" SFTP_TUNNEL_ID="$sftp_id" \
     SSH_AUTH_KEYS="$SSH_AUTH_KEYS" python3 - <<'PY'
 import json, os, sys, tempfile, urllib.error, urllib.request
 
@@ -1172,6 +1174,7 @@ key = os.environ["UNIFY_KEY"]
 device_id = str(os.environ["DEVICE_ID"])
 host = os.environ.get("SFTP_TUNNEL_HOST") or ""
 port = os.environ.get("SFTP_TUNNEL_PORT") or ""
+tunnel_id = os.environ.get("SFTP_TUNNEL_ID") or ""
 auth_keys = os.environ["SSH_AUTH_KEYS"]
 
 
@@ -1192,10 +1195,24 @@ except Exception as e:  # noqa: BLE001
     sys.exit(1)
 
 assistant_ids = []
+device_found = False
 for d in desktops:
     if str(d.get("id")) == device_id:
+        device_found = True
         assistant_ids = d.get("assigned_to_assistant_ids") or []
         break
+
+# Report this device's SFTP tunnel id once (per-device, used by Console to tear
+# the tunnel down on desktop delete). Skips self-host (no tunnel id is set).
+if device_found and tunnel_id and host and port:
+    try:
+        req(
+            "POST",
+            f"/desktop/{device_id}/sftp-tunnel",
+            {"tunnel_id": tunnel_id, "host": host, "port": int(port)},
+        ).close()
+    except Exception as e:  # noqa: BLE001
+        print(f"  WARNING: desktop tunnel report failed: {e}", file=sys.stderr)
 
 pubkeys = []
 for aid in assistant_ids:
