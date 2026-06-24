@@ -389,7 +389,11 @@ function Install-Chocolatey {
     Write-Host ""
     Write-Host "=== Installing Chocolatey ===" -ForegroundColor Cyan
     
-    Set-ExecutionPolicy Bypass -Scope Process -Force
+    # Equivalent to Set-ExecutionPolicy Bypass -Scope Process, but without loading
+    # Microsoft.PowerShell.Security (which can fail to autoload when PSModulePath is
+    # clobbered on some Windows images). The process is already launched with
+    # -ExecutionPolicy Bypass, so this is belt-and-suspenders.
+    $env:PSExecutionPolicyPreference = 'Bypass'
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
     Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
     
