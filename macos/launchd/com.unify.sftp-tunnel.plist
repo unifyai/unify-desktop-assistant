@@ -16,7 +16,7 @@
 
 	<!-- Cloud-mode raw-TCP rathole client for the SFTP port. Runs whenever
 	     sftp-client.toml exists (absent in self-host mode, where the local
-	     Droid stack reaches the SFTP server directly). -->
+	     Unity stack reaches the SFTP server directly). -->
 	<key>KeepAlive</key>
 	<dict>
 		<key>SuccessfulExit</key>

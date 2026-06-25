@@ -52,8 +52,14 @@ NOVNC_PORT = 6080
 
 
 def compose_self_host_present() -> bool:
-    """True when a Droid Docker compose self-host install exists."""
-    return (Path.home() / ".droid" / "docker-compose.yml").exists()
+    """True when a Unity Docker compose self-host install exists.
+
+    Prefers the new ~/.unity dir; falls back to legacy ~/.droid.
+    """
+    return (
+        (Path.home() / ".unity" / "docker-compose.yml").exists()
+        or (Path.home() / ".droid" / "docker-compose.yml").exists()
+    )
 
 
 def agent_port() -> int:
@@ -460,7 +466,7 @@ class UnifyTrayApp(rumps.App):
         )
 
         def worker():
-            # setup.sh auto-detects ~/.droid compose self-host on --reconfigure.
+            # setup.sh auto-detects ~/.unity compose self-host on --reconfigure.
             subprocess.run(
                 ["bash", str(SETUP_SCRIPT), "--reconfigure", "--unify-key", key],
                 capture_output=True,
@@ -540,7 +546,8 @@ class UnifyTrayApp(rumps.App):
         tunnel_url = get_env_value("TUNNEL_URL") or "(not available)"
         orchestra_url = get_env_value("ORCHESTRA_URL") or "https://api.unify.ai/v0"
         comms_url = (
-            get_env_value("DROID_COMMS_URL")
+            get_env_value("UNITY_COMMS_URL")
+            or get_env_value("DROID_COMMS_URL")
             or "https://service.a.run.app"
         )
 

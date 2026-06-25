@@ -23,11 +23,18 @@ case "$1" in
         COMPOSE_SELF_HOST=0
         AGENT_PORT=3000
         SELF_HOST_FLAG=0
-        if [ -f "$TARGET_HOME/.droid/docker-compose.yml" ]; then
+        # Prefer the new ~/.unity self-host dir; fall back to legacy ~/.droid.
+        SELF_HOST_DIR=""
+        if [ -f "$TARGET_HOME/.unity/docker-compose.yml" ]; then
+            SELF_HOST_DIR="$TARGET_HOME/.unity"
+        elif [ -f "$TARGET_HOME/.droid/docker-compose.yml" ]; then
+            SELF_HOST_DIR="$TARGET_HOME/.droid"
+        fi
+        if [ -n "$SELF_HOST_DIR" ]; then
             COMPOSE_SELF_HOST=1
             AGENT_PORT=$SELF_HOST_AGENT_PORT
             SELF_HOST_FLAG=1
-            echo "Droid compose self-host detected at $TARGET_HOME/.droid — agent port ${AGENT_PORT}"
+            echo "Unity compose self-host detected at $SELF_HOST_DIR — agent port ${AGENT_PORT}"
         fi
 
         chmod +x "$SETUP_SCRIPT"
@@ -57,12 +64,15 @@ case "$1" in
         if [ -f "$ENV_CONF" ]; then
             . "$ENV_CONF"
         fi
+        # environment.conf (baked by build.sh) provides UNITY_COMMS_URL; accept a
+        # legacy DROID_COMMS_URL too so an older baked conf still resolves.
+        UNITY_COMMS_URL="${UNITY_COMMS_URL:-${DROID_COMMS_URL:-}}"
         if [ "$COMPOSE_SELF_HOST" = "1" ]; then
             ORCHESTRA_URL="$COMPOSE_SELF_HOST_ORCHESTRA_URL"
-            DROID_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
+            UNITY_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
         else
             ORCHESTRA_URL="${ORCHESTRA_URL:-https://api.unify.ai/v0}"
-            DROID_COMMS_URL="${DROID_COMMS_URL:-https://service.a.run.app}"
+            UNITY_COMMS_URL="${UNITY_COMMS_URL:-https://service.a.run.app}"
         fi
 
         cat > "$ENV_FILE" <<ENVFILE
@@ -72,7 +82,9 @@ case "$1" in
 PORT=$AGENT_PORT
 UNIFY_KEY=$EXISTING_UNIFY_KEY
 ORCHESTRA_URL=$ORCHESTRA_URL
-DROID_COMMS_URL=$DROID_COMMS_URL
+UNITY_COMMS_URL=$UNITY_COMMS_URL
+# Legacy alias kept during the droid->unity sync transition.
+DROID_COMMS_URL=$UNITY_COMMS_URL
 SELF_HOST=$SELF_HOST_FLAG
 PLAYWRIGHT_BROWSERS_PATH=$APP_DIR/browsers
 

@@ -41,18 +41,28 @@ if [ -f "$ENV_CONF" ]; then
     . "$ENV_CONF"
 fi
 ORCHESTRA_URL="${ORCHESTRA_URL:-https://api.unify.ai/v0}"
-DROID_COMMS_URL="${DROID_COMMS_URL:-https://service.a.run.app}"
+# environment.conf (baked by build.sh) provides UNITY_COMMS_URL; accept a legacy
+# DROID_COMMS_URL too so an older baked conf still resolves.
+UNITY_COMMS_URL="${UNITY_COMMS_URL:-${DROID_COMMS_URL:-}}"
+UNITY_COMMS_URL="${UNITY_COMMS_URL:-https://service.a.run.app}"
 
 COMPOSE_SELF_HOST=0
 AGENT_PORT=3000
 SELF_HOST_FLAG=0
-if [ -f "$TARGET_HOME/.droid/docker-compose.yml" ]; then
+# Prefer the new ~/.unity self-host dir; fall back to legacy ~/.droid.
+SELF_HOST_DIR=""
+if [ -f "$TARGET_HOME/.unity/docker-compose.yml" ]; then
+    SELF_HOST_DIR="$TARGET_HOME/.unity"
+elif [ -f "$TARGET_HOME/.droid/docker-compose.yml" ]; then
+    SELF_HOST_DIR="$TARGET_HOME/.droid"
+fi
+if [ -n "$SELF_HOST_DIR" ]; then
     COMPOSE_SELF_HOST=1
     AGENT_PORT=$SELF_HOST_AGENT_PORT
     SELF_HOST_FLAG=1
     ORCHESTRA_URL="$COMPOSE_SELF_HOST_ORCHESTRA_URL"
-    DROID_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
-    echo "[postinstall] Droid compose self-host detected at $TARGET_HOME/.droid — agent port ${AGENT_PORT}"
+    UNITY_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
+    echo "[postinstall] Unity compose self-host detected at $SELF_HOST_DIR — agent port ${AGENT_PORT}"
 fi
 
 chmod +x "$SETUP_SCRIPT"
@@ -85,7 +95,7 @@ UNIFY_KEY="${EXISTING_UNIFY_KEY:-}"
 if [ -z "$UNIFY_KEY" ] && [ -n "$TARGET_UID" ] && [ "$TARGET_USER" != "root" ]; then
     echo "[postinstall] Prompting for Unify API Key..."
     if [ "$COMPOSE_SELF_HOST" = "1" ]; then
-        PROMPT_BODY="Enter your Coordinator API key (Console: Connect your desktop). Droid self-host uses agent port ${AGENT_PORT}; Console stays on 3000."
+        PROMPT_BODY="Enter your Coordinator API key (Console: Connect your desktop). Unity self-host uses agent port ${AGENT_PORT}; Console stays on 3000."
     else
         PROMPT_BODY="Enter your Unify API Key to finish setup.
 
@@ -113,7 +123,9 @@ cat > "$ENV_FILE" <<ENVFILE
 PORT=$AGENT_PORT
 UNIFY_KEY=$UNIFY_KEY
 ORCHESTRA_URL=$ORCHESTRA_URL
-DROID_COMMS_URL=$DROID_COMMS_URL
+UNITY_COMMS_URL=$UNITY_COMMS_URL
+# Legacy alias kept during the droid->unity sync transition.
+DROID_COMMS_URL=$UNITY_COMMS_URL
 SELF_HOST=$SELF_HOST_FLAG
 PLAYWRIGHT_BROWSERS_PATH=$APP_DIR/browsers
 
@@ -169,7 +181,7 @@ mkdir -p "$LOG_DIR"
             su - "$TARGET_USER" -c "'$SETUP_SCRIPT' --force --no-start \
                 --unify-key '$UNIFY_KEY' \
                 --orchestra-url '$ORCHESTRA_URL' \
-                --droid-comms-url '$DROID_COMMS_URL'" || {
+                --unity-comms-url '$UNITY_COMMS_URL'" || {
                 echo "[$(date)] WARNING: setup.sh encountered errors" >&2
             }
         fi

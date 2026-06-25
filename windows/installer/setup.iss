@@ -136,7 +136,9 @@ var
 
 function TestComposeSelfHostPresent: Boolean;
 begin
-  Result := FileExists(ExpandConstant('{%USERPROFILE}\.droid\docker-compose.yml'));
+  // Prefer the new ~/.unity self-host dir; fall back to legacy ~/.droid.
+  Result := FileExists(ExpandConstant('{%USERPROFILE}\.unity\docker-compose.yml')) or
+            FileExists(ExpandConstant('{%USERPROFILE}\.droid\docker-compose.yml'));
 end;
 
 function GetSetupRunParams(Param: String): String;
@@ -145,7 +147,7 @@ begin
   if TestComposeSelfHostPresent then
     Result := Result + ' -SelfHost -LinkCoordinator'
   else
-    Result := Result + ' -OrchestraUrl "{#OrchestraUrl}" -DroidCommsUrl "{#CommsUrl}"';
+    Result := Result + ' -OrchestraUrl "{#OrchestraUrl}" -UnityCommsUrl "{#CommsUrl}"';
 end;
 
 // =========================================================================
@@ -355,6 +357,7 @@ begin
     EnvContent := 'PORT=' + AgentPort + Chr(13) + Chr(10) +
                   'UNIFY_KEY=' + UnifyKeyEdit.Text + Chr(13) + Chr(10) +
                   'ORCHESTRA_URL=' + OrchestraUrl + Chr(13) + Chr(10) +
+                  'UNITY_COMMS_URL=' + CommsUrl + Chr(13) + Chr(10) +
                   'DROID_COMMS_URL=' + CommsUrl + Chr(13) + Chr(10) +
                   'SELF_HOST=' + SelfHostFlag + Chr(13) + Chr(10) +
                   'PLAYWRIGHT_BROWSERS_PATH=C:\ms-playwright' + Chr(13) + Chr(10) +

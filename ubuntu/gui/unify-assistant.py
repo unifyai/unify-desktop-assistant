@@ -76,8 +76,14 @@ NOVNC_PORT = 6080
 
 
 def compose_self_host_present() -> bool:
-    """True when a Droid Docker compose self-host install exists."""
-    return (Path.home() / ".droid" / "docker-compose.yml").exists()
+    """True when a Unity Docker compose self-host install exists.
+
+    Prefers the new ~/.unity dir; falls back to legacy ~/.droid.
+    """
+    return (
+        (Path.home() / ".unity" / "docker-compose.yml").exists()
+        or (Path.home() / ".droid" / "docker-compose.yml").exists()
+    )
 
 
 def agent_port() -> int:
@@ -694,13 +700,14 @@ class SettingsDialog(Gtk.Dialog):
         self.txt_url.set_sensitive(False)
         box.pack_start(self.txt_url, False, False, 0)
 
-        # --- Droid Comms URL ---
-        lbl_comms = Gtk.Label(label="Droid Comms URL:", xalign=0)
+        # --- Unity Comms URL ---
+        lbl_comms = Gtk.Label(label="Unity Comms URL:", xalign=0)
         box.pack_start(lbl_comms, False, False, 4)
 
         self.txt_comms = Gtk.Entry()
         self.txt_comms.set_text(
-            get_env_value("DROID_COMMS_URL")
+            get_env_value("UNITY_COMMS_URL")
+            or get_env_value("DROID_COMMS_URL")
             or "https://service.a.run.app"
         )
         self.txt_comms.set_sensitive(False)
@@ -760,6 +767,8 @@ class SettingsDialog(Gtk.Dialog):
         """Save the settings to .env file."""
         set_env_value("UNIFY_KEY", self.txt_key.get_text())
         set_env_value("ORCHESTRA_URL", self.txt_url.get_text())
+        set_env_value("UNITY_COMMS_URL", self.txt_comms.get_text())
+        # Legacy alias kept during the droid->unity sync transition.
         set_env_value("DROID_COMMS_URL", self.txt_comms.get_text())
 
 

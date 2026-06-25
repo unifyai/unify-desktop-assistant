@@ -258,7 +258,7 @@ function Get-BackendUrls {
 function Stamp-SetupScript {
     param([string]$ScriptPath, [hashtable]$Urls)
     $original = [System.IO.File]::ReadAllText($ScriptPath)
-    $stamped = $original.Replace('@@ORCHESTRA_URL@@', $Urls.Orchestra).Replace('@@DROID_COMMS_URL@@', $Urls.Comms)
+    $stamped = $original.Replace('@@ORCHESTRA_URL@@', $Urls.Orchestra).Replace('@@UNITY_COMMS_URL@@', $Urls.Comms)
     [System.IO.File]::WriteAllText($ScriptPath, $stamped, (New-Object System.Text.UTF8Encoding($false)))
     return $original
 }
