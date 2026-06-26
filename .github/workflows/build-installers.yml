@@ -8,10 +8,10 @@
 # It can also be run manually (workflow_dispatch) with an optional explicit
 # version override and an environment selector (main / staging / both).
 #
-# Production assets are published to release  vX.Y.Z          (prerelease=false)
-# Staging assets are published to release      vX.Y.Z-staging  (prerelease=true)
-# The version detector strips the -staging suffix, so both tracks always share
-# the same incrementing version number.
+# Production and staging assets are published together into a SINGLE release
+# tagged vX.Y.Z (prerelease=false). Staging installers are distinguished only by
+# their -staging filename suffix, not by a separate tag -- this keeps the
+# "releases/latest/download/..." links stable for both consoles.
 
 name: Build Installers
 
@@ -236,42 +236,28 @@ jobs:
         with:
           path: artifacts
 
-      - name: Collect assets by environment
+      - name: Collect assets
         id: collect
         run: |
           set -euo pipefail
-          mkdir -p prod staging
+          # Flatten every per-platform/env artifact into one dir. Production and
+          # staging installers have distinct filenames (the latter carry a
+          # -staging suffix), so they coexist in a single release.
+          mkdir -p dist
           shopt -s nullglob
           for f in artifacts/*/*; do
-            base="$(basename "$f")"
-            case "$base" in
-              *-staging.*) cp "$f" staging/ ;;
-              *)           cp "$f" prod/ ;;
-            esac
+            cp "$f" dist/
           done
-          PROD_COUNT="$(find prod -type f | wc -l | tr -d ' ')"
-          STAGING_COUNT="$(find staging -type f | wc -l | tr -d ' ')"
-          echo "prod_count=$PROD_COUNT" >> "$GITHUB_OUTPUT"
-          echo "staging_count=$STAGING_COUNT" >> "$GITHUB_OUTPUT"
-          echo "Production assets ($PROD_COUNT): $(ls prod)"
-          echo "Staging assets ($STAGING_COUNT): $(ls staging)"
+          COUNT="$(find dist -type f | wc -l | tr -d ' ')"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Release assets ($COUNT): $(ls dist)"
 
-      - name: Create production release
-        if: steps.collect.outputs.prod_count != '0'
+      - name: Create release
+        if: steps.collect.outputs.count != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.resolve-version.outputs.version }}
           name: Unify Desktop Assistant ${{ needs.resolve-version.outputs.version }}
-          files: prod/*
+          files: dist/*
           prerelease: false
-          generate_release_notes: false
-
-      - name: Create staging release
-        if: steps.collect.outputs.staging_count != '0'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ needs.resolve-version.outputs.version }}-staging
-          name: Unify Desktop Assistant ${{ needs.resolve-version.outputs.version }} (staging)
-          files: staging/*
-          prerelease: true
           generate_release_notes: false
