@@ -3,7 +3,7 @@
 # Single script to install, configure, and start all services for localhost use.
 #
 # Usage:
-#   .\setup.ps1 -UnifyKey "your-key" -OrchestraUrl "https://api.unify.ai/v0" -DroidCommsUrl "https://service.a.run.app"
+#   .\setup.ps1 -UnifyKey "your-key" -OrchestraUrl "https://api.unify.ai/v0" -UnityCommsUrl "https://service.a.run.app"
 #   .\setup.ps1 -Start       # Start services only (no install/config, no admin needed)
 #   .\setup.ps1 -Stop
 #   .\setup.ps1 -Uninstall   # Stop services, remove scheduled tasks & firewall rules
@@ -12,18 +12,22 @@
 # Services started:
 #   - TightVNC Server (port 5900)
 #   - websockify + noVNC (port 6080)
-#   - Agent Service (port 3000 cloud SaaS, 13000 when ~/.droid compose self-host)
+#   - Agent Service (port 3000 cloud SaaS, 13000 when ~/.unity compose self-host)
 #
 # Access URLs:
 #   - Desktop: http://localhost:6080/custom.html?password=<vnc-password>
-#   - Agent API: http://localhost:3000 (or :13000 for Droid Docker self-host)
+#   - Agent API: http://localhost:3000 (or :13000 for Unity Docker self-host)
 
 param(
     [Parameter(Position = 0)]
     [string]$UnifyKey,
     
-    [string]$OrchestraUrl = "https://api.unify.ai/v0",
-    [string]$DroidCommsUrl = "https://service.a.run.app",
+    # No production default: an unspecified backend URL must fail loudly rather
+    # than silently configuring a device against production. The packaged
+    # installer always passes these explicitly; -Reconfigure/-Start read them
+    # back from .env.
+    [string]$OrchestraUrl = "",
+    [string]$UnityCommsUrl = "",
     [string]$DeviceName,
     
     [switch]$Start,
@@ -46,6 +50,16 @@ $script:CoordinatorAgentId = $CoordinatorAgentId
 $script:SelfHostAgentPort = 13000
 $script:ComposeSelfHostOrchestraUrl = 'http://127.0.0.1:8000/v0'
 $script:ComposeSelfHostCommsUrl = 'http://127.0.0.1:8001'
+
+# Per-build backend URL defaults. build.ps1 stamps these for the target
+# environment (-Staging/main) at package time. In-repo they stay as the
+# @@...@@ sentinels, which we neutralize to '' so a dev run can't silently
+# register against the wrong backend (it must pass -OrchestraUrl/-UnityCommsUrl
+# or hit the loud check in the full-install path).
+$script:BuildOrchestraUrl = '@@ORCHESTRA_URL@@'
+$script:BuildUnityCommsUrl = '@@UNITY_COMMS_URL@@'
+if ($script:BuildOrchestraUrl -like '@@*@@') { $script:BuildOrchestraUrl = '' }
+if ($script:BuildUnityCommsUrl -like '@@*@@') { $script:BuildUnityCommsUrl = '' }
 
 $script:StartTime = Get-Date
 $script:ToolsDir = $PSScriptRoot
@@ -325,7 +339,7 @@ function Uninstall-All {
     # 2. Unregister desktop and tunnel from server
     $unifyKey = Get-EnvValue -Key "UNIFY_KEY"
     $orchestraUrl = Get-EnvValue -Key "ORCHESTRA_URL"
-    $commsUrl = Get-EnvValue -Key "DROID_COMMS_URL"
+    $commsUrl = Get-EnvValue -Key "UNITY_COMMS_URL"
     
     if ($unifyKey) {
         Write-Host ""
@@ -389,7 +403,11 @@ function Install-Chocolatey {
     Write-Host ""
     Write-Host "=== Installing Chocolatey ===" -ForegroundColor Cyan
     
-    Set-ExecutionPolicy Bypass -Scope Process -Force
+    # Equivalent to Set-ExecutionPolicy Bypass -Scope Process, but without loading
+    # Microsoft.PowerShell.Security (which can fail to autoload when PSModulePath is
+    # clobbered on some Windows images). The process is already launched with
+    # -ExecutionPolicy Bypass, so this is belt-and-suspenders.
+    $env:PSExecutionPolicyPreference = 'Bypass'
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
     Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
     
@@ -1035,9 +1053,17 @@ function Setup-SFTPServer {
         if ($sshKeygen) {
             # Invoke via cmd so the empty passphrase (-N "") is parsed reliably;
             # PowerShell 5.1 can drop an empty-string argument to a native exe.
+            # Wrap the whole command and use /s so cmd strips only the outer
+            # quotes and runs the inner (multi-quoted) command verbatim - a plain
+            # "/c <multi-quote>" mangles the exe path ("filename ... syntax is
+            # incorrect").
             $keygenInner = "`"$sshKeygen`" -t ed25519 -f `"$($script:SshHostKey)`" -N `"`" -q -C unify-desktop-sftp-host"
-            Start-Process cmd.exe -ArgumentList "/c $keygenInner" -NoNewWindow -Wait
-            Write-Host "  Generated SFTP host key" -ForegroundColor Green
+            Start-Process cmd.exe -ArgumentList "/s /c `"$keygenInner`"" -NoNewWindow -Wait
+            if (Test-Path $script:SshHostKey) {
+                Write-Host "  Generated SFTP host key" -ForegroundColor Green
+            } else {
+                Write-Host "  WARNING: ssh-keygen produced no host key; rclone will generate one on first run" -ForegroundColor Yellow
+            }
         } else {
             Write-Host "  WARNING: ssh-keygen unavailable; rclone will generate a host key on first run" -ForegroundColor Yellow
         }
@@ -1052,9 +1078,10 @@ function Setup-SFTPServer {
 
 # Reconcile per-link SFTP state with Orchestra:
 #   1. find this device's assistant links (GET /desktop -> assigned_to_assistant_ids)
-#   2. fetch each filesys-sync link's client public key (GET /desktop/link/{aid}/pubkey)
-#   3. report this device's SFTP tunnel coords (POST /desktop/link/{aid}/sftp-tunnel)
-#   4. rewrite authorized_keys from the collected keys (prunes revoked links)
+#   2. report this device's SFTP tunnel id (POST /desktop/{device_id}/sftp-tunnel)
+#   3. fetch each filesys-sync link's client public key (GET /desktop/link/{aid}/pubkey)
+#   4. report this device's SFTP tunnel coords (POST /desktop/link/{aid}/sftp-tunnel)
+#   5. rewrite authorized_keys from the collected keys (prunes revoked links)
 # Client PRIVATE keys live in Orchestra; only public keys ever touch this machine.
 # Output is ASCII, no BOM, LF endings (rclone's authorized_keys parser is strict).
 function Sync-AuthorizedKeys {
@@ -1063,6 +1090,7 @@ function Sync-AuthorizedKeys {
     $deviceId = Get-EnvValue -Key 'DEVICE_ID'
     $sftpHost = Get-EnvValue -Key 'SFTP_TUNNEL_HOST'
     $sftpPort = Get-EnvValue -Key 'SFTP_TUNNEL_PORT'
+    $sftpId = Get-EnvValue -Key 'SFTP_TUNNEL_ID'
     if (-not $unifyKey -or -not $orchestraUrl -or -not $deviceId) { return }
 
     if (-not (Test-Path $script:SshDir)) {
@@ -1083,12 +1111,27 @@ function Sync-AuthorizedKeys {
 
     $desktopList = if (& $hasProp $desktops 'info') { @($desktops.info) } else { @() }
     $assistantIds = @()
+    $deviceFound = $false
     foreach ($d in $desktopList) {
         if ("$($d.id)" -eq "$deviceId") {
+            $deviceFound = $true
             if ((& $hasProp $d 'assigned_to_assistant_ids') -and $d.assigned_to_assistant_ids) {
                 $assistantIds = @($d.assigned_to_assistant_ids)
             }
             break
+        }
+    }
+
+    # Report this device's SFTP tunnel id once (per-device, used by Console to tear
+    # the tunnel down on desktop delete). Skips self-host (no tunnel id is set).
+    if ($deviceFound -and $sftpId -and $sftpHost -and $sftpPort) {
+        $dBody = @{ tunnel_id = $sftpId; host = $sftpHost; port = [int]$sftpPort } | ConvertTo-Json -Compress
+        try {
+            Invoke-RestMethod -Method POST -Uri "$base/desktop/$deviceId/sftp-tunnel" `
+                -Headers @{ Authorization = "Bearer $unifyKey"; 'Content-Type' = 'application/json' } `
+                -Body $dBody -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Host "  WARNING: desktop tunnel report failed: $_" -ForegroundColor Yellow
         }
     }
 
@@ -1129,8 +1172,62 @@ function Sync-AuthorizedKeys {
 }
 
 # Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its
-# client config. Self-host mode: bind on all interfaces so the local Droid stack
+# client config. Self-host mode: bind on all interfaces so the local Unity stack
 # reaches the SFTP server directly (no tunnel).
+# A stable, per-machine SFTP tunnel name so we can identify (and prune) the
+# tunnels this device created without touching another device's tunnels. The
+# computer name is always available (unlike DEVICE_ID, which isn't set yet the
+# first time we register an SFTP tunnel) and stable across upgrades.
+function Get-SFTPTunnelName {
+    $hn = $env:COMPUTERNAME
+    if (-not $hn) { $hn = [System.Net.Dns]::GetHostName() }
+    if (-not $hn) { $hn = 'unknown' }
+    $hn = ($hn -replace '[^A-Za-z0-9._-]', '')
+    if (-not $hn) { $hn = 'unknown' }
+    return "sftp-$hn"
+}
+
+# Best-effort: delete SFTP tunnels on the server that belong to THIS device
+# (matched by our device-scoped name) but aren't the one we're currently using.
+# Bounded by the exact name match so it never removes another device's tunnels.
+function Remove-StaleSFTPTunnels {
+    param(
+        [string]$UnifyKey,
+        [string]$CommsUrl,
+        [string]$Name,
+        [string]$KeepId
+    )
+
+    $headers = @{ Authorization = "Bearer $UnifyKey" }
+    try {
+        $list = Invoke-RestMethod -Method GET `
+            -Uri "$CommsUrl/infra/tunnels" `
+            -Headers $headers `
+            -ErrorAction Stop
+    } catch {
+        return
+    }
+
+    $tunnels = $null
+    if ($list -is [System.Array]) { $tunnels = $list }
+    elseif ($list.tunnels) { $tunnels = $list.tunnels }
+    if (-not $tunnels) { return }
+
+    foreach ($t in $tunnels) {
+        $tid = $t.tunnel_id
+        if (-not $tid) { $tid = $t.id }
+        if ($t.name -eq $Name -and $tid -and $tid -ne $KeepId) {
+            try {
+                Invoke-RestMethod -Method DELETE `
+                    -Uri "$CommsUrl/infra/tunnel/$tid" `
+                    -Headers $headers `
+                    -ErrorAction Stop | Out-Null
+                Write-Host "  Pruned stale SFTP tunnel $tid" -ForegroundColor Gray
+            } catch { }
+        }
+    }
+}
+
 function Register-SFTPTunnel {
     param(
         [string]$UnifyKey,
@@ -1149,6 +1246,9 @@ function Register-SFTPTunnel {
 
     Set-EnvValue -Key 'SFTP_BIND_ADDR' -Value '127.0.0.1'
 
+    $sftpName = Get-SFTPTunnelName
+    $activeId = ""
+
     $existingSftpId = Get-EnvValue -Key 'SFTP_TUNNEL_ID'
     if ($existingSftpId) {
         $status = Test-TunnelExists -UnifyKey $UnifyKey -CommsUrl $CommsUrl -TunnelId $existingSftpId
@@ -1166,42 +1266,50 @@ function Register-SFTPTunnel {
             if ($status -eq 'unknown') {
                 Write-Host "  (could not verify with server; keeping existing registration)" -ForegroundColor Gray
             }
-            return
+            $activeId = $existingSftpId
         }
     }
 
-    Write-Host ""
-    Write-Host "=== Registering SFTP Tunnel ===" -ForegroundColor Cyan
+    if (-not $activeId) {
+        Write-Host ""
+        Write-Host "=== Registering SFTP Tunnel ===" -ForegroundColor Cyan
 
-    $body = @{ local_port = $script:SftpLocalPort; protocol = 'tcp'; name = 'sftp' }
-    $headers = @{
-        Authorization = "Bearer $UnifyKey"
-        'Content-Type' = 'application/json'
+        $body = @{ local_port = $script:SftpLocalPort; protocol = 'tcp'; name = $sftpName }
+        $headers = @{
+            Authorization = "Bearer $UnifyKey"
+            'Content-Type' = 'application/json'
+        }
+
+        try {
+            $resp = Invoke-RestMethod -Method POST `
+                -Uri "$CommsUrl/infra/tunnel/register" `
+                -Headers $headers `
+                -Body ($body | ConvertTo-Json -Compress) `
+                -ErrorAction Stop
+        } catch {
+            Write-Host "  ERROR: SFTP tunnel registration failed: $_" -ForegroundColor Red
+            return
+        }
+
+        Set-EnvValue -Key 'SFTP_TUNNEL_ID' -Value $resp.tunnel_id
+        Set-EnvValue -Key 'SFTP_TUNNEL_HOST' -Value $resp.tcp_host
+        Set-EnvValue -Key 'SFTP_TUNNEL_PORT' -Value "$($resp.tcp_port)"
+
+        if (-not (Test-Path $script:RatholeDir)) {
+            New-Item -ItemType Directory -Force -Path $script:RatholeDir | Out-Null
+        }
+        if ($resp.client_config) {
+            $resp.client_config | Out-File -FilePath $script:SftpRatholeConfig -Encoding UTF8
+        }
+
+        $activeId = $resp.tunnel_id
+        Write-Host "  SFTP tunnel registered: $($resp.tcp_host):$($resp.tcp_port)" -ForegroundColor Green
     }
 
-    try {
-        $resp = Invoke-RestMethod -Method POST `
-            -Uri "$CommsUrl/infra/tunnel/register" `
-            -Headers $headers `
-            -Body ($body | ConvertTo-Json -Compress) `
-            -ErrorAction Stop
-    } catch {
-        Write-Host "  ERROR: SFTP tunnel registration failed: $_" -ForegroundColor Red
-        return
+    # Clean up any older SFTP tunnels this device left behind (best-effort).
+    if ($activeId) {
+        Remove-StaleSFTPTunnels -UnifyKey $UnifyKey -CommsUrl $CommsUrl -Name $sftpName -KeepId $activeId
     }
-
-    Set-EnvValue -Key 'SFTP_TUNNEL_ID' -Value $resp.tunnel_id
-    Set-EnvValue -Key 'SFTP_TUNNEL_HOST' -Value $resp.tcp_host
-    Set-EnvValue -Key 'SFTP_TUNNEL_PORT' -Value "$($resp.tcp_port)"
-
-    if (-not (Test-Path $script:RatholeDir)) {
-        New-Item -ItemType Directory -Force -Path $script:RatholeDir | Out-Null
-    }
-    if ($resp.client_config) {
-        $resp.client_config | Out-File -FilePath $script:SftpRatholeConfig -Encoding UTF8
-    }
-
-    Write-Host "  SFTP tunnel registered: $($resp.tcp_host):$($resp.tcp_port)" -ForegroundColor Green
 }
 
 function Unregister-SFTPTunnel {
@@ -1324,7 +1432,7 @@ function Set-EnvValue {
 }
 
 function Test-ComposeSelfHostPresent {
-    return Test-Path (Join-Path $env:USERPROFILE '.droid\docker-compose.yml')
+    return Test-Path (Join-Path $env:USERPROFILE '.unity\docker-compose.yml')
 }
 
 function Apply-ComposeSelfHostMode {
@@ -1333,7 +1441,7 @@ function Apply-ComposeSelfHostMode {
     }
     $script:SelfHostMode = $true
     Set-Variable -Name OrchestraUrl -Value $script:ComposeSelfHostOrchestraUrl -Scope Script
-    Set-Variable -Name DroidCommsUrl -Value $script:ComposeSelfHostCommsUrl -Scope Script
+    Set-Variable -Name UnityCommsUrl -Value $script:ComposeSelfHostCommsUrl -Scope Script
     $script:LinkCoordinator = $true
 }
 
@@ -1350,9 +1458,9 @@ function Explain-OrchestraConnectFailure {
 
     Write-Host "  ERROR: Could not connect to Orchestra at ${OrchestraUrl} while trying to ${ActionDescription}." -ForegroundColor Red
     if ((Test-ComposeSelfHostPresent) -or ($OrchestraUrl -match '127\.0\.0\.1|localhost')) {
-        Write-Host "  Orchestra is not reachable on this machine - the Droid Docker stack is probably stopped." -ForegroundColor Yellow
+        Write-Host "  Orchestra is not reachable on this machine - the Unity Docker stack is probably stopped." -ForegroundColor Yellow
         Write-Host "  Start it first:" -ForegroundColor Yellow
-        Write-Host "    droid stack up" -ForegroundColor Yellow
+        Write-Host "    unity stack up" -ForegroundColor Yellow
         Write-Host "  Wait until Orchestra responds on port 8000, then register again from tray Settings" -ForegroundColor Yellow
         Write-Host "  (paste your API key) or run:" -ForegroundColor Yellow
         Write-Host "    $($script:ToolsDir)\setup.ps1 -Reconfigure -UnifyKey YOUR_KEY" -ForegroundColor Yellow
@@ -1387,7 +1495,7 @@ function Resolve-CoordinatorAgentId {
         return $script:CoordinatorAgentId
     }
 
-    $runtimeFile = Join-Path $env:USERPROFILE '.droid\coordinator-runtime.json'
+    $runtimeFile = Join-Path $env:USERPROFILE '.unity\coordinator-runtime.json'
     if (Test-Path $runtimeFile) {
         try {
             $runtime = Get-Content $runtimeFile -Raw | ConvertFrom-Json
@@ -1463,7 +1571,7 @@ function Register-SelfHostDesktop {
     Write-Host ""
     Write-Host "=== Self-Host Desktop Registration ===" -ForegroundColor Cyan
     Write-Host "  Orchestra: $OrchestraUrl" -ForegroundColor Gray
-    Write-Host "  Agent URL for Droid CM: $regUrl" -ForegroundColor Gray
+    Write-Host "  Agent URL for Unity CM: $regUrl" -ForegroundColor Gray
 
     Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $regUrl
 
@@ -1477,8 +1585,8 @@ function Register-SelfHostDesktop {
         Link-DesktopToCoordinator -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl `
             -DesktopId $desktopId -CoordinatorId $coordinatorId
         Write-Host ""
-        Write-Host "  Restart the Droid stack so CM reloads linked desktops:" -ForegroundColor Yellow
-        Write-Host "    droid restart" -ForegroundColor Yellow
+        Write-Host "  Restart the Unity stack so CM reloads linked desktops:" -ForegroundColor Yellow
+        Write-Host "    unity restart" -ForegroundColor Yellow
     }
 }
 
@@ -1812,7 +1920,7 @@ function Register-Desktop {
 function Ensure-Registration {
     $unifyKey = Get-EnvValue -Key "UNIFY_KEY"
     $orchestraUrl = Get-EnvValue -Key "ORCHESTRA_URL"
-    $commsUrl = Get-EnvValue -Key "DROID_COMMS_URL"
+    $commsUrl = Get-EnvValue -Key "UNITY_COMMS_URL"
     if (-not $unifyKey -or -not $orchestraUrl) { return }
 
     if (-not (Test-Path $script:AgentServiceDir)) {
@@ -1883,12 +1991,17 @@ function Setup-AgentServiceEnv {
     param(
         [string]$UnifyKey,
         [string]$OrchestraUrl,
-        [string]$DroidCommsUrl
+        [string]$UnityCommsUrl
     )
     
     Write-Host ""
     Write-Host "=== Configuring Agent Service ===" -ForegroundColor Cyan
     
+    # This may run before Install-AgentService (we write the core config up front
+    # so a partial install still leaves a configured .env), so ensure the dir.
+    if (-not (Test-Path $script:AgentServiceDir)) {
+        New-Item -ItemType Directory -Force -Path $script:AgentServiceDir | Out-Null
+    }
     $envFile = Join-Path $script:AgentServiceDir '.env'
     
     # Preserve existing tunnel/device values if .env already exists
@@ -1914,7 +2027,7 @@ function Setup-AgentServiceEnv {
 PORT=$agentPort
 UNIFY_KEY=$UnifyKey
 ORCHESTRA_URL=$OrchestraUrl
-DROID_COMMS_URL=$DroidCommsUrl
+UNITY_COMMS_URL=$UnityCommsUrl
 SELF_HOST=$selfHostFlag
 PLAYWRIGHT_BROWSERS_PATH=C:\ms-playwright
 
@@ -1938,7 +2051,7 @@ SFTP_TUNNEL_PORT=$existingSftpPort
     Write-Host "  .env created" -ForegroundColor Green
     Write-Host "    UNIFY_KEY: $(if ($UnifyKey) { '(set)' } else { '(not set)' })" -ForegroundColor Gray
     Write-Host "    ORCHESTRA_URL: $OrchestraUrl" -ForegroundColor Gray
-    Write-Host "    DROID_COMMS_URL: $DroidCommsUrl" -ForegroundColor Gray
+    Write-Host "    UNITY_COMMS_URL: $UnityCommsUrl" -ForegroundColor Gray
     if ($existingDeviceId) {
         Write-Host "    DEVICE_ID: $existingDeviceId (preserved)" -ForegroundColor Gray
     }
@@ -2092,7 +2205,7 @@ function Configure-Firewall {
         @{ Name = 'Unify-noVNC'; Port = 6080; Description = 'noVNC WebSocket' },
         @{ Name = 'Unify-AgentService'; Port = $agentPort; Description = 'Agent Service API' }
     )
-    # Self-host binds SFTP on all interfaces for the local Droid containers; cloud
+    # Self-host binds SFTP on all interfaces for the local Unity containers; cloud
     # mode binds loopback only (tunnel), so no inbound rule is needed there.
     if ($script:SelfHostMode -or (Get-EnvValue -Key 'SELF_HOST') -eq '1') {
         $rules += @{ Name = 'Unify-SFTP'; Port = $script:SftpLocalPort; Description = 'SFTP server' }
@@ -2340,13 +2453,13 @@ if ($Reconfigure) {
     Apply-ComposeSelfHostMode
     if (-not (Test-ComposeSelfHostPresent)) {
         $existingOrch = Get-EnvValue -Key "ORCHESTRA_URL"
-        $existingComms = Get-EnvValue -Key "DROID_COMMS_URL"
+        $existingComms = Get-EnvValue -Key "UNITY_COMMS_URL"
         if ($existingOrch) { $OrchestraUrl = $existingOrch }
-        if ($existingComms) { $DroidCommsUrl = $existingComms }
+        if ($existingComms) { $UnityCommsUrl = $existingComms }
         if ((Get-EnvValue -Key 'SELF_HOST') -eq '1') {
             $script:SelfHostMode = $true
             if (-not $existingOrch) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
-            if (-not $existingComms) { $DroidCommsUrl = $script:ComposeSelfHostCommsUrl }
+            if (-not $existingComms) { $UnityCommsUrl = $script:ComposeSelfHostCommsUrl }
             $script:LinkCoordinator = $true
         }
     }
@@ -2354,7 +2467,7 @@ if ($Reconfigure) {
     # Rewrite .env (preserves TUNNEL_*/DEVICE_ID) and re-apply the VNC password
     # so the TightVNC server matches the new key (noVNC sends the key as the
     # VNC password). Without this the viewer would fail after a key change.
-    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DroidCommsUrl $DroidCommsUrl
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
     Set-TightVNCPassword -Plain $UnifyKey
 
     # Restart services so the agent picks up the new key (it reads UNIFY_KEY at
@@ -2365,7 +2478,7 @@ if ($Reconfigure) {
         if (-not $OrchestraUrl) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
         Register-SelfHostDesktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName
     } else {
-        Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $DroidCommsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
+        Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
         $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
         if ($tunnelUrl) {
             Register-Desktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName -TunnelUrl $tunnelUrl
@@ -2374,9 +2487,9 @@ if ($Reconfigure) {
 
     # Re-provision the SFTP server + tunnel and persist the SFTP_* values; the
     # subsequent Start-AllServices starts them.
-    Register-SFTPTunnel -UnifyKey $UnifyKey -CommsUrl $DroidCommsUrl
+    Register-SFTPTunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl
     Setup-SFTPServer
-    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DroidCommsUrl $DroidCommsUrl
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
 
     Start-AllServices
     exit 0
@@ -2387,7 +2500,7 @@ if (-not $UnifyKey) {
     Write-Host "ERROR: -UnifyKey is required" -ForegroundColor Red
     Write-Host ""
     Write-Host "Usage:" -ForegroundColor Cyan
-    Write-Host "  .\setup.ps1 -UnifyKey 'your-key' [-OrchestraUrl 'https://api.unify.ai/v0'] [-DroidCommsUrl 'https://...']"
+    Write-Host "  .\setup.ps1 -UnifyKey 'your-key' [-OrchestraUrl 'https://api.unify.ai/v0'] [-UnityCommsUrl 'https://...']"
     Write-Host "  .\setup.ps1 -Start"
     Write-Host "  .\setup.ps1 -Stop"
     Write-Host "  .\setup.ps1 -Uninstall"
@@ -2397,6 +2510,34 @@ if (-not $UnifyKey) {
 }
 
 try {
+    # Resolve backend URLs / self-host mode up front and write the core .env
+    # BEFORE any failure-prone install step. A partial install (e.g. a failed
+    # prerequisite) must still leave a configured .env rather than an empty one
+    # that the GUI would disguise as a production install.
+    Apply-ComposeSelfHostMode
+    if ($script:SelfHostMode) {
+        if (-not $OrchestraUrl) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
+        if (-not $UnityCommsUrl) { $UnityCommsUrl = $script:ComposeSelfHostCommsUrl }
+        $script:LinkCoordinator = $true
+    } else {
+        # Fall back to this build's stamped backend URLs when not passed explicitly.
+        if (-not $OrchestraUrl) { $OrchestraUrl = $script:BuildOrchestraUrl }
+        if (-not $UnityCommsUrl) { $UnityCommsUrl = $script:BuildUnityCommsUrl }
+    }
+
+    # Fail loudly (and early, before the long install) rather than silently
+    # writing a production default into .env.
+    if (-not $script:SelfHostMode -and (-not $OrchestraUrl -or -not $UnityCommsUrl)) {
+        Write-Host ""
+        Write-Host "ERROR: No backend URL configured (ORCHESTRA_URL / UNITY_COMMS_URL)." -ForegroundColor Red
+        Write-Host "  Pass -OrchestraUrl and -UnityCommsUrl, or install via the packaged installer." -ForegroundColor Yellow
+        exit 1
+    }
+
+    # Persist the core config now; later Setup-AgentServiceEnv calls are
+    # idempotent and refresh it with registration/SFTP results.
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
+
     # Detect fast mode
     $fastMode = (Test-FastMode) -and -not $Force
 
@@ -2429,15 +2570,11 @@ try {
         Install-Rclone
     }
 
-    # Always run configuration
-    Apply-ComposeSelfHostMode
-    if ($script:SelfHostMode) {
-        if (-not $OrchestraUrl) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
-        if (-not $DroidCommsUrl) { $DroidCommsUrl = $script:ComposeSelfHostCommsUrl }
-        $script:LinkCoordinator = $true
-    }
+    # Backend URLs / self-host mode and the core .env were resolved and written
+    # up front (before the install block) so a partial install still leaves a
+    # configured .env. Registration/SFTP results are persisted by the
+    # idempotent Setup-AgentServiceEnv call after Register-SFTPTunnel below.
     Configure-TightVNC -Password $UnifyKey
-    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DroidCommsUrl $DroidCommsUrl
     Setup-TightVNCStartup
     Setup-WebsockifyStartup
     Setup-AgentServiceStartup
@@ -2450,7 +2587,7 @@ try {
     if ($script:SelfHostMode) {
         Register-SelfHostDesktop -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DeviceName $DeviceName
     } else {
-        Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $DroidCommsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
+        Register-Tunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl -LocalPort (Get-AgentServicePort) -TunnelName $DeviceName
         
         $tunnelUrl = Get-EnvValue -Key "TUNNEL_URL"
         if ($tunnelUrl) {
@@ -2462,9 +2599,9 @@ try {
 
     # Provision the app-owned SFTP server + (cloud) its raw-TCP tunnel, then
     # re-write .env so the resolved SFTP_* values are persisted, and start them.
-    Register-SFTPTunnel -UnifyKey $UnifyKey -CommsUrl $DroidCommsUrl
+    Register-SFTPTunnel -UnifyKey $UnifyKey -CommsUrl $UnityCommsUrl
     Setup-SFTPServer
-    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -DroidCommsUrl $DroidCommsUrl
+    Setup-AgentServiceEnv -UnifyKey $UnifyKey -OrchestraUrl $OrchestraUrl -UnityCommsUrl $UnityCommsUrl
     Start-SFTPServer
     if (-not $script:SelfHostMode -and (Get-EnvValue -Key 'SELF_HOST') -ne '1') {
         Start-SFTPTunnel

@@ -12,7 +12,12 @@
 ;   .\build.ps1
 
 #define AppName "Unify Desktop Assistant"
-#define AppVersion "1.0.0"
+; Version: overridable via ISCC /DAppVersion=... (build.ps1 -Version / CI input).
+; Must be guarded by #ifndef, otherwise an unconditional #define here would clobber
+; the command-line value and the built installer would always report 1.0.0.
+#ifndef AppVersion
+  #define AppVersion "1.0.0"
+#endif
 #define AppPublisher "Unify"
 #define AppURL "https://unify.ai"
 #define AppExeName "UnifyAssistant.vbs"
@@ -131,7 +136,7 @@ var
 
 function TestComposeSelfHostPresent: Boolean;
 begin
-  Result := FileExists(ExpandConstant('{%USERPROFILE}\.droid\docker-compose.yml'));
+  Result := FileExists(ExpandConstant('{%USERPROFILE}\.unity\docker-compose.yml'));
 end;
 
 function GetSetupRunParams(Param: String): String;
@@ -140,7 +145,7 @@ begin
   if TestComposeSelfHostPresent then
     Result := Result + ' -SelfHost -LinkCoordinator'
   else
-    Result := Result + ' -OrchestraUrl "{#OrchestraUrl}" -DroidCommsUrl "{#CommsUrl}"';
+    Result := Result + ' -OrchestraUrl "{#OrchestraUrl}" -UnityCommsUrl "{#CommsUrl}"';
 end;
 
 // =========================================================================
@@ -350,7 +355,7 @@ begin
     EnvContent := 'PORT=' + AgentPort + Chr(13) + Chr(10) +
                   'UNIFY_KEY=' + UnifyKeyEdit.Text + Chr(13) + Chr(10) +
                   'ORCHESTRA_URL=' + OrchestraUrl + Chr(13) + Chr(10) +
-                  'DROID_COMMS_URL=' + CommsUrl + Chr(13) + Chr(10) +
+                  'UNITY_COMMS_URL=' + CommsUrl + Chr(13) + Chr(10) +
                   'SELF_HOST=' + SelfHostFlag + Chr(13) + Chr(10) +
                   'PLAYWRIGHT_BROWSERS_PATH=C:\ms-playwright' + Chr(13) + Chr(10) +
                   Chr(13) + Chr(10) +

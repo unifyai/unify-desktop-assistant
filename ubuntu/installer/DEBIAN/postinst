@@ -23,11 +23,11 @@ case "$1" in
         COMPOSE_SELF_HOST=0
         AGENT_PORT=3000
         SELF_HOST_FLAG=0
-        if [ -f "$TARGET_HOME/.droid/docker-compose.yml" ]; then
+        if [ -f "$TARGET_HOME/.unity/docker-compose.yml" ]; then
             COMPOSE_SELF_HOST=1
             AGENT_PORT=$SELF_HOST_AGENT_PORT
             SELF_HOST_FLAG=1
-            echo "Droid compose self-host detected at $TARGET_HOME/.droid — agent port ${AGENT_PORT}"
+            echo "Unity compose self-host detected at $TARGET_HOME/.unity — agent port ${AGENT_PORT}"
         fi
 
         chmod +x "$SETUP_SCRIPT"
@@ -44,12 +44,20 @@ case "$1" in
         EXISTING_TUNNEL_URL=""
         EXISTING_TUNNEL_TOKEN=""
         EXISTING_DEVICE_ID=""
+        EXISTING_SFTP_TUNNEL_ID=""
+        EXISTING_SFTP_TUNNEL_HOST=""
+        EXISTING_SFTP_TUNNEL_PORT=""
         if [ -f "$ENV_FILE" ]; then
             EXISTING_UNIFY_KEY=$(grep -oP '^UNIFY_KEY=\K.*' "$ENV_FILE" 2>/dev/null || true)
             EXISTING_TUNNEL_ID=$(grep -oP '^TUNNEL_ID=\K.*' "$ENV_FILE" 2>/dev/null || true)
             EXISTING_TUNNEL_URL=$(grep -oP '^TUNNEL_URL=\K.*' "$ENV_FILE" 2>/dev/null || true)
             EXISTING_TUNNEL_TOKEN=$(grep -oP '^TUNNEL_TOKEN=\K.*' "$ENV_FILE" 2>/dev/null || true)
             EXISTING_DEVICE_ID=$(grep -oP '^DEVICE_ID=\K.*' "$ENV_FILE" 2>/dev/null || true)
+            # Preserve the SFTP tunnel id/coords too — dropping them makes the next
+            # registration mint a fresh tunnel and orphan the old one on every upgrade.
+            EXISTING_SFTP_TUNNEL_ID=$(grep -oP '^SFTP_TUNNEL_ID=\K.*' "$ENV_FILE" 2>/dev/null || true)
+            EXISTING_SFTP_TUNNEL_HOST=$(grep -oP '^SFTP_TUNNEL_HOST=\K.*' "$ENV_FILE" 2>/dev/null || true)
+            EXISTING_SFTP_TUNNEL_PORT=$(grep -oP '^SFTP_TUNNEL_PORT=\K.*' "$ENV_FILE" 2>/dev/null || true)
         fi
 
         # URLs are baked at build time (main vs staging) in environment.conf
@@ -59,10 +67,10 @@ case "$1" in
         fi
         if [ "$COMPOSE_SELF_HOST" = "1" ]; then
             ORCHESTRA_URL="$COMPOSE_SELF_HOST_ORCHESTRA_URL"
-            DROID_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
+            UNITY_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
         else
             ORCHESTRA_URL="${ORCHESTRA_URL:-https://api.unify.ai/v0}"
-            DROID_COMMS_URL="${DROID_COMMS_URL:-https://service.a.run.app}"
+            UNITY_COMMS_URL="${UNITY_COMMS_URL:-https://service.a.run.app}"
         fi
 
         cat > "$ENV_FILE" <<ENVFILE
@@ -72,7 +80,7 @@ case "$1" in
 PORT=$AGENT_PORT
 UNIFY_KEY=$EXISTING_UNIFY_KEY
 ORCHESTRA_URL=$ORCHESTRA_URL
-DROID_COMMS_URL=$DROID_COMMS_URL
+UNITY_COMMS_URL=$UNITY_COMMS_URL
 SELF_HOST=$SELF_HOST_FLAG
 PLAYWRIGHT_BROWSERS_PATH=$APP_DIR/browsers
 
@@ -81,6 +89,11 @@ TUNNEL_ID=$EXISTING_TUNNEL_ID
 TUNNEL_URL=$EXISTING_TUNNEL_URL
 TUNNEL_TOKEN=$EXISTING_TUNNEL_TOKEN
 DEVICE_ID=$EXISTING_DEVICE_ID
+
+# SFTP tunnel (preserved across upgrades so we reuse it instead of orphaning it)
+SFTP_TUNNEL_ID=$EXISTING_SFTP_TUNNEL_ID
+SFTP_TUNNEL_HOST=$EXISTING_SFTP_TUNNEL_HOST
+SFTP_TUNNEL_PORT=$EXISTING_SFTP_TUNNEL_PORT
 ENVFILE
         echo "Agent Service .env written."
 

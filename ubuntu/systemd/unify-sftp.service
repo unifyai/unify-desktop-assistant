@@ -8,6 +8,13 @@ ConditionPathExists=%INSTALL_DIR%/ssh/authorized_keys
 
 [Service]
 Type=simple
+# Hard defaults so a stale/incomplete .env (older installs that predate the
+# SFTP_* keys written by setup.sh) can't crash-loop the unit. EnvironmentFile is
+# applied after these, so a value present in .env still wins; a key missing from
+# .env falls back to the default here instead of expanding to an empty string.
+Environment=SFTP_BIND_ADDR=127.0.0.1
+Environment=SFTP_LOCAL_PORT=2222
+Environment=SFTP_USER=unity
 EnvironmentFile=%AGENT_SERVICE_DIR%/.env
 ExecStart=%INSTALL_DIR%/rclone/rclone serve sftp %h --addr ${SFTP_BIND_ADDR}:${SFTP_LOCAL_PORT} --user ${SFTP_USER} --authorized-keys %INSTALL_DIR%/ssh/authorized_keys --key %INSTALL_DIR%/ssh/host_ed25519
 Restart=on-failure

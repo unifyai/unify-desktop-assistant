@@ -1,0 +1,277 @@
+# Build Installers (macOS .pkg / Windows .exe / Ubuntu .deb)
+#
+# On every push to main, this resolves the next version automatically by
+# inspecting existing GitHub Releases (including pre-releases), incrementing the
+# patch component, and then building + publishing all three platform installers
+# for BOTH the production and staging environments.
+#
+# It can also be run manually (workflow_dispatch) with an optional explicit
+# version override and an environment selector (main / staging / both).
+#
+# Production assets are published to release  vX.Y.Z          (prerelease=false)
+# Staging assets are published to release      vX.Y.Z-staging  (prerelease=true)
+# The version detector strips the -staging suffix, so both tracks always share
+# the same incrementing version number.
+
+name: Build Installers
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Explicit version (e.g. 1.2.0). Leave empty to auto-increment from latest release.'
+        required: false
+        type: string
+      environment:
+        description: 'Which environment(s) to build'
+        required: true
+        type: choice
+        options:
+          - both
+          - main
+          - staging
+        default: both
+
+# Serialize runs so two pushes can't resolve the same version number.
+# Do NOT cancel in progress: an in-flight release must finish before the next
+# run reads the latest version.
+concurrency:
+  group: build-installers
+  cancel-in-progress: false
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      environments: ${{ steps.v.outputs.environments }}
+    steps:
+      - name: Resolve version and environments
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # --- Determine which environments to build -------------------------
+          # Pushes always build both. Manual runs honour the selector.
+          if [ "$EVENT_NAME" = "push" ]; then
+            ENVIRONMENT="both"
+          else
+            ENVIRONMENT="${INPUT_ENVIRONMENT:-both}"
+          fi
+          case "$ENVIRONMENT" in
+            main)    ENVS='["main"]' ;;
+            staging) ENVS='["staging"]' ;;
+            both|"") ENVS='["main","staging"]' ;;
+            *) echo "::error::Unknown environment '$ENVIRONMENT'"; exit 1 ;;
+          esac
+          echo "environments=$ENVS" >> "$GITHUB_OUTPUT"
+          echo "Environments to build: $ENVS"
+
+          # --- Determine the version ----------------------------------------
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="$INPUT_VERSION"
+            echo "Using explicit version override: $VERSION"
+          else
+            # List every release tag (stable + prerelease), keep only well-formed
+            # vMAJOR.MINOR.PATCH cores (this ignores malformed tags like vv1.0.0),
+            # and take the highest by semver ordering.
+            LATEST="$(
+              gh api "repos/$GH_REPO/releases" --paginate --jq '.[].tag_name' \
+                | sed -nE 's/^v([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' \
+                | sort -V | tail -1 || true
+            )"
+            if [ -z "$LATEST" ]; then
+              VERSION="1.0.0"
+              echo "No existing releases found; seeding version $VERSION"
+            else
+              IFS='.' read -r MAJ MIN PATCH <<< "$LATEST"
+              PATCH=$((PATCH + 1))
+              VERSION="${MAJ}.${MIN}.${PATCH}"
+              echo "Latest release version $LATEST -> next $VERSION"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve-version
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: macos, os: macos-latest }
+          - { name: windows, os: windows-latest }
+          - { name: ubuntu, os: ubuntu-latest }
+        environment: ${{ fromJSON(needs.resolve-version.outputs.environments) }}
+    runs-on: ${{ matrix.platform.os }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Inno Setup (Windows)
+        if: matrix.platform.name == 'windows'
+        run: choco install innosetup -y --no-progress
+
+      - name: Build (macOS / Ubuntu)
+        if: matrix.platform.name != 'windows'
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.platform.name }}" = "macos" ]; then
+            cd macos/installer
+          else
+            cd ubuntu/installer
+          fi
+          ARGS=("--clean" "--version" "$VERSION")
+          if [ "$ENVIRONMENT" = "staging" ]; then
+            ARGS+=("--staging")
+            echo "Building STAGING for ${{ matrix.platform.name }}"
+          else
+            echo "Building PRODUCTION for ${{ matrix.platform.name }}"
+          fi
+          chmod +x build.sh
+          echo "Running: ./build.sh ${ARGS[*]}"
+          ./build.sh "${ARGS[@]}"
+
+      - name: Build (Windows)
+        if: matrix.platform.name == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          # Use HASHTABLE splatting, not an array. Array splatting passes elements
+          # positionally, so '-Clean'/'-Staging' would NOT bind to the switches.
+          $buildArgs = @{ Clean = $true; Version = $env:VERSION }
+          if ($env:ENVIRONMENT -eq 'staging') {
+            $buildArgs['Staging'] = $true
+            Write-Host "Building STAGING for windows"
+          } else {
+            Write-Host "Building PRODUCTION for windows"
+          }
+          Write-Host "Running build.ps1 with: $(($buildArgs.GetEnumerator() | ForEach-Object { "-$($_.Key) $($_.Value)" }) -join ' ')"
+          & .\windows\installer\build.ps1 @buildArgs
+
+      - name: Stage asset (macOS / Ubuntu)
+        if: matrix.platform.name != 'windows'
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.platform.name }}" in
+            macos)  DIR=macos/installer/output;  EXT=pkg ;;
+            ubuntu) DIR=ubuntu/installer/output; EXT=deb ;;
+          esac
+          SRC="$(ls "$DIR"/*."$EXT" | head -1)"
+          if [ -z "$SRC" ]; then
+            echo "::error::No .$EXT produced in $DIR"; exit 1
+          fi
+          mkdir -p dist
+          if [ "$ENVIRONMENT" = "staging" ]; then
+            cp "$SRC" "dist/unify-desktop-assistant-staging.$EXT"
+          else
+            cp "$SRC" "dist/unify-desktop-assistant.$EXT"
+          fi
+          echo "Staged: $(ls dist)"
+
+      - name: Stage asset (Windows)
+        if: matrix.platform.name == 'windows'
+        shell: pwsh
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          $exe = Get-ChildItem windows/installer/output/*.exe | Select-Object -First 1
+          if (-not $exe) { throw "No installer was produced by build.ps1" }
+          Write-Host "Compiled artifact: $($exe.Name)"
+
+          # The compiled OutputBaseFilename carries the -staging suffix only when
+          # the installer was actually built for staging; treat it as the source
+          # of truth and fail loudly if it disagrees with the requested env. This
+          # catches the class of bug where the staging flag is silently dropped.
+          $isStagingBuild = $exe.Name -like '*-staging.exe'
+          if ($env:ENVIRONMENT -eq 'staging' -and -not $isStagingBuild) {
+            throw "Requested 'staging' but compiled '$($exe.Name)' has no -staging suffix => PRODUCTION was built. Aborting."
+          }
+          if ($env:ENVIRONMENT -ne 'staging' -and $isStagingBuild) {
+            throw "Requested 'main' but compiled '$($exe.Name)' has a -staging suffix => STAGING was built. Aborting."
+          }
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          if ($env:ENVIRONMENT -eq 'staging') {
+            $dest = 'dist/unify-desktop-assistant-staging.exe'
+          } else {
+            $dest = 'dist/unify-desktop-assistant.exe'
+          }
+          Copy-Item $exe.FullName $dest -Force
+          Write-Host "Staged -> $dest"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.platform.name }}-${{ matrix.environment }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [resolve-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets by environment
+        id: collect
+        run: |
+          set -euo pipefail
+          mkdir -p prod staging
+          shopt -s nullglob
+          for f in artifacts/*/*; do
+            base="$(basename "$f")"
+            case "$base" in
+              *-staging.*) cp "$f" staging/ ;;
+              *)           cp "$f" prod/ ;;
+            esac
+          done
+          PROD_COUNT="$(find prod -type f | wc -l | tr -d ' ')"
+          STAGING_COUNT="$(find staging -type f | wc -l | tr -d ' ')"
+          echo "prod_count=$PROD_COUNT" >> "$GITHUB_OUTPUT"
+          echo "staging_count=$STAGING_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Production assets ($PROD_COUNT): $(ls prod)"
+          echo "Staging assets ($STAGING_COUNT): $(ls staging)"
+
+      - name: Create production release
+        if: steps.collect.outputs.prod_count != '0'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.resolve-version.outputs.version }}
+          name: Unify Desktop Assistant ${{ needs.resolve-version.outputs.version }}
+          files: prod/*
+          prerelease: false
+          generate_release_notes: false
+
+      - name: Create staging release
+        if: steps.collect.outputs.staging_count != '0'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.resolve-version.outputs.version }}-staging
+          name: Unify Desktop Assistant ${{ needs.resolve-version.outputs.version }} (staging)
+          files: staging/*
+          prerelease: true
+          generate_release_notes: false
