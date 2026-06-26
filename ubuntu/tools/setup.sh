@@ -1164,9 +1164,15 @@ reconcile_sftp_links() {
     mkdir -p "$SSH_DIR"
     chmod 700 "$SSH_DIR"
 
+    # Pre-clear the change marker; the reconcile below recreates it only when it
+    # actually rewrites authorized_keys, so we can restart the SFTP unit on a real
+    # key change without bouncing it (and any live transfer) on every sync tick.
+    local changed_flag="$SSH_DIR/.authorized_keys_changed"
+    rm -f "$changed_flag" 2>/dev/null || true
+
     UNIFY_KEY="$unify_key" ORCHESTRA_URL="$orchestra_url" DEVICE_ID="$device_id" \
     SFTP_TUNNEL_HOST="$sftp_host" SFTP_TUNNEL_PORT="$sftp_port" SFTP_TUNNEL_ID="$sftp_id" \
-    SSH_AUTH_KEYS="$SSH_AUTH_KEYS" python3 - <<'PY'
+    SSH_AUTH_KEYS="$SSH_AUTH_KEYS" CHANGED_FLAG="$changed_flag" python3 - <<'PY'
 import json, os, sys, tempfile, urllib.error, urllib.request
 
 base = os.environ["ORCHESTRA_URL"].rstrip("/")
@@ -1239,13 +1245,47 @@ for aid in assistant_ids:
                 print(f"  WARNING: tunnel report failed for {aid}: {e}", file=sys.stderr)
 
 body = "".join(k + "\n" for k in pubkeys)
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(auth_keys) or ".")
-with os.fdopen(fd, "w", encoding="utf-8") as fh:
-    fh.write(body)
-os.chmod(tmp, 0o600)
-os.replace(tmp, auth_keys)
+try:
+    with open(auth_keys, encoding="utf-8") as fh:
+        old_body = fh.read()
+except FileNotFoundError:
+    old_body = None
+if old_body != body:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(auth_keys) or ".")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, auth_keys)
+    flag = os.environ.get("CHANGED_FLAG")
+    if flag:
+        try:
+            open(flag, "w").close()
+        except OSError:
+            pass
 print(f"  authorized_keys synced ({len(pubkeys)} key(s) across {len(assistant_ids)} link(s))")
 PY
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$changed_flag" 2>/dev/null || true
+        return "$rc"
+    fi
+
+    # Bring the managed SFTP unit in line with the keys we just synced. Only acts
+    # in a user session: the sync timer, --reconfigure and --start all run as the
+    # user, while a root install has no user bus (the unit starts at next login).
+    # The unit's ConditionPathExists gate keeps start/restart a no-op until
+    # authorized_keys exists. Start it if it is down (e.g. first key arrival or a
+    # prior crash); restart it only when the key set actually changed, so live
+    # SFTP sessions aren't dropped on an unchanged 5-minute reconcile tick.
+    if [[ "$EUID" -ne 0 ]] && systemctl --user cat unify-sftp.service >/dev/null 2>&1; then
+        systemctl --user reset-failed unify-sftp.service 2>/dev/null || true
+        if ! systemctl --user is-active --quiet unify-sftp.service; then
+            systemctl --user start unify-sftp.service 2>/dev/null || true
+        elif [[ -f "$changed_flag" ]]; then
+            systemctl --user restart unify-sftp.service 2>/dev/null || true
+        fi
+    fi
+    rm -f "$changed_flag" 2>/dev/null || true
 }
 
 # Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its
@@ -1804,9 +1844,16 @@ setup_systemd_services() {
     if [[ -n "${SUDO_USER:-}" ]]; then
         su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user daemon-reload" 2>/dev/null || true
         su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service unify-sftp.service unify-sftp-sync.timer" 2>/dev/null || true
+        # Apply the (possibly corrected) sftp unit immediately on upgrade: clear a
+        # prior crash-loop and restart. ConditionPathExists keeps this a no-op
+        # until authorized_keys exists, so it never force-runs a keyless server.
+        su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user reset-failed unify-sftp.service" 2>/dev/null || true
+        su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user restart unify-sftp.service" 2>/dev/null || true
     else
         systemctl --user daemon-reload 2>/dev/null || true
         systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service unify-sftp.service unify-sftp-sync.timer 2>/dev/null || true
+        systemctl --user reset-failed unify-sftp.service 2>/dev/null || true
+        systemctl --user restart unify-sftp.service 2>/dev/null || true
     fi
 
     echo "  systemd user services configured"
