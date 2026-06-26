@@ -1174,6 +1174,60 @@ function Sync-AuthorizedKeys {
 # Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its
 # client config. Self-host mode: bind on all interfaces so the local Unity stack
 # reaches the SFTP server directly (no tunnel).
+# A stable, per-machine SFTP tunnel name so we can identify (and prune) the
+# tunnels this device created without touching another device's tunnels. The
+# computer name is always available (unlike DEVICE_ID, which isn't set yet the
+# first time we register an SFTP tunnel) and stable across upgrades.
+function Get-SFTPTunnelName {
+    $hn = $env:COMPUTERNAME
+    if (-not $hn) { $hn = [System.Net.Dns]::GetHostName() }
+    if (-not $hn) { $hn = 'unknown' }
+    $hn = ($hn -replace '[^A-Za-z0-9._-]', '')
+    if (-not $hn) { $hn = 'unknown' }
+    return "sftp-$hn"
+}
+
+# Best-effort: delete SFTP tunnels on the server that belong to THIS device
+# (matched by our device-scoped name) but aren't the one we're currently using.
+# Bounded by the exact name match so it never removes another device's tunnels.
+function Remove-StaleSFTPTunnels {
+    param(
+        [string]$UnifyKey,
+        [string]$CommsUrl,
+        [string]$Name,
+        [string]$KeepId
+    )
+
+    $headers = @{ Authorization = "Bearer $UnifyKey" }
+    try {
+        $list = Invoke-RestMethod -Method GET `
+            -Uri "$CommsUrl/infra/tunnels" `
+            -Headers $headers `
+            -ErrorAction Stop
+    } catch {
+        return
+    }
+
+    $tunnels = $null
+    if ($list -is [System.Array]) { $tunnels = $list }
+    elseif ($list.tunnels) { $tunnels = $list.tunnels }
+    if (-not $tunnels) { return }
+
+    foreach ($t in $tunnels) {
+        $tid = $t.tunnel_id
+        if (-not $tid) { $tid = $t.id }
+        if ($t.name -eq $Name -and $tid -and $tid -ne $KeepId) {
+            try {
+                Invoke-RestMethod -Method DELETE `
+                    -Uri "$CommsUrl/infra/tunnel/$tid" `
+                    -Headers $headers `
+                    -ErrorAction Stop | Out-Null
+                Write-Host "  Pruned stale SFTP tunnel $tid" -ForegroundColor Gray
+            } catch { }
+        }
+    }
+}
+
 function Register-SFTPTunnel {
     param(
         [string]$UnifyKey,
@@ -1192,6 +1246,9 @@ function Register-SFTPTunnel {
 
     Set-EnvValue -Key 'SFTP_BIND_ADDR' -Value '127.0.0.1'
 
+    $sftpName = Get-SFTPTunnelName
+    $activeId = ""
+
     $existingSftpId = Get-EnvValue -Key 'SFTP_TUNNEL_ID'
     if ($existingSftpId) {
         $status = Test-TunnelExists -UnifyKey $UnifyKey -CommsUrl $CommsUrl -TunnelId $existingSftpId
@@ -1209,42 +1266,50 @@ function Register-SFTPTunnel {
             if ($status -eq 'unknown') {
                 Write-Host "  (could not verify with server; keeping existing registration)" -ForegroundColor Gray
             }
-            return
+            $activeId = $existingSftpId
         }
     }
 
-    Write-Host ""
-    Write-Host "=== Registering SFTP Tunnel ===" -ForegroundColor Cyan
+    if (-not $activeId) {
+        Write-Host ""
+        Write-Host "=== Registering SFTP Tunnel ===" -ForegroundColor Cyan
 
-    $body = @{ local_port = $script:SftpLocalPort; protocol = 'tcp'; name = 'sftp' }
-    $headers = @{
-        Authorization = "Bearer $UnifyKey"
-        'Content-Type' = 'application/json'
+        $body = @{ local_port = $script:SftpLocalPort; protocol = 'tcp'; name = $sftpName }
+        $headers = @{
+            Authorization = "Bearer $UnifyKey"
+            'Content-Type' = 'application/json'
+        }
+
+        try {
+            $resp = Invoke-RestMethod -Method POST `
+                -Uri "$CommsUrl/infra/tunnel/register" `
+                -Headers $headers `
+                -Body ($body | ConvertTo-Json -Compress) `
+                -ErrorAction Stop
+        } catch {
+            Write-Host "  ERROR: SFTP tunnel registration failed: $_" -ForegroundColor Red
+            return
+        }
+
+        Set-EnvValue -Key 'SFTP_TUNNEL_ID' -Value $resp.tunnel_id
+        Set-EnvValue -Key 'SFTP_TUNNEL_HOST' -Value $resp.tcp_host
+        Set-EnvValue -Key 'SFTP_TUNNEL_PORT' -Value "$($resp.tcp_port)"
+
+        if (-not (Test-Path $script:RatholeDir)) {
+            New-Item -ItemType Directory -Force -Path $script:RatholeDir | Out-Null
+        }
+        if ($resp.client_config) {
+            $resp.client_config | Out-File -FilePath $script:SftpRatholeConfig -Encoding UTF8
+        }
+
+        $activeId = $resp.tunnel_id
+        Write-Host "  SFTP tunnel registered: $($resp.tcp_host):$($resp.tcp_port)" -ForegroundColor Green
     }
 
-    try {
-        $resp = Invoke-RestMethod -Method POST `
-            -Uri "$CommsUrl/infra/tunnel/register" `
-            -Headers $headers `
-            -Body ($body | ConvertTo-Json -Compress) `
-            -ErrorAction Stop
-    } catch {
-        Write-Host "  ERROR: SFTP tunnel registration failed: $_" -ForegroundColor Red
-        return
+    # Clean up any older SFTP tunnels this device left behind (best-effort).
+    if ($activeId) {
+        Remove-StaleSFTPTunnels -UnifyKey $UnifyKey -CommsUrl $CommsUrl -Name $sftpName -KeepId $activeId
     }
-
-    Set-EnvValue -Key 'SFTP_TUNNEL_ID' -Value $resp.tunnel_id
-    Set-EnvValue -Key 'SFTP_TUNNEL_HOST' -Value $resp.tcp_host
-    Set-EnvValue -Key 'SFTP_TUNNEL_PORT' -Value "$($resp.tcp_port)"
-
-    if (-not (Test-Path $script:RatholeDir)) {
-        New-Item -ItemType Directory -Force -Path $script:RatholeDir | Out-Null
-    }
-    if ($resp.client_config) {
-        $resp.client_config | Out-File -FilePath $script:SftpRatholeConfig -Encoding UTF8
-    }
-
-    Write-Host "  SFTP tunnel registered: $($resp.tcp_host):$($resp.tcp_port)" -ForegroundColor Green
 }
 
 function Unregister-SFTPTunnel {

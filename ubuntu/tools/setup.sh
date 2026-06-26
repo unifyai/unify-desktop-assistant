@@ -1291,6 +1291,63 @@ PY
 # Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its
 # client config. Self-host mode: bind on all interfaces so the local Unity stack
 # reaches the SFTP server directly (no tunnel).
+# A stable, per-machine SFTP tunnel name so we can identify (and prune) the
+# tunnels this device created without touching another device's tunnels. The
+# hostname is always available (unlike DEVICE_ID, which isn't set yet the first
+# time we register an SFTP tunnel) and stable across upgrades.
+sftp_tunnel_name() {
+    local hn
+    hn=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "unknown")
+    hn=$(printf '%s' "$hn" | tr -cd 'A-Za-z0-9._-')
+    [[ -z "$hn" ]] && hn="unknown"
+    printf 'sftp-%s' "$hn"
+}
+
+# Best-effort: delete SFTP tunnels on the server that belong to THIS device
+# (matched by our device-scoped name) but aren't the one we're currently using.
+# Bounded by the exact name match so it never removes another device's tunnels.
+prune_stale_sftp_tunnels() {
+    local unify_key=$1
+    local comms_url=$2
+    local name=$3
+    local keep_id=$4
+
+    local list
+    list=$(curl -sS --connect-timeout 5 --max-time 15 \
+        -H "Authorization: Bearer ${unify_key}" \
+        "${comms_url%/}/infra/tunnels" 2>/dev/null || true)
+    [[ -z "$list" ]] && return 0
+
+    local stale
+    stale=$(UNIFY_NAME="$name" KEEP_ID="$keep_id" python3 -c '
+import json, os, sys
+name = os.environ["UNIFY_NAME"]
+keep = os.environ["KEEP_ID"]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+tunnels = data.get("tunnels", data) if isinstance(data, dict) else data
+if not isinstance(tunnels, list):
+    sys.exit(0)
+for t in tunnels:
+    if not isinstance(t, dict):
+        continue
+    tid = t.get("tunnel_id") or t.get("id")
+    if t.get("name") == name and tid and tid != keep:
+        print(tid)
+' <<<"$list" 2>/dev/null || true)
+
+    local id
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+        curl -sS --max-time 15 -o /dev/null -X DELETE \
+            -H "Authorization: Bearer ${unify_key}" \
+            "${comms_url%/}/infra/tunnel/${id}" 2>/dev/null || true
+        echo "  Pruned stale SFTP tunnel $id"
+    done <<<"$stale"
+}
+
 register_sftp_tunnel() {
     local unify_key=$1
     local comms_url=$2
@@ -1306,6 +1363,9 @@ register_sftp_tunnel() {
     fi
 
     set_env_value "SFTP_BIND_ADDR" "127.0.0.1"
+
+    local sftp_name active_id=""
+    sftp_name=$(sftp_tunnel_name)
 
     local existing_sftp_id
     existing_sftp_id=$(get_env_value "SFTP_TUNNEL_ID")
@@ -1323,46 +1383,52 @@ register_sftp_tunnel() {
             echo ""
             echo "  SFTP tunnel already registered: $(get_env_value "SFTP_TUNNEL_HOST"):$(get_env_value "SFTP_TUNNEL_PORT")"
             [[ "$status" == "unknown" ]] && echo "  (could not verify with server; keeping existing registration)"
-            return 0
+            active_id="$existing_sftp_id"
         fi
     fi
 
-    echo ""
-    echo "=== Registering SFTP Tunnel ==="
+    if [[ -z "$active_id" ]]; then
+        echo ""
+        echo "=== Registering SFTP Tunnel ==="
 
-    local resp_file="/tmp/unify_sftp_tunnel.json"
-    local http_code
-    http_code=$(curl -sS -o "$resp_file" -w "%{http_code}" \
-        -X POST \
-        -H "Authorization: Bearer ${unify_key}" \
-        -H "Content-Type: application/json" \
-        -d "{\"local_port\": ${SFTP_LOCAL_PORT}, \"protocol\": \"tcp\", \"name\": \"sftp\"}" \
-        "${comms_url}/infra/tunnel/register" || true)
+        local resp_file="/tmp/unify_sftp_tunnel.json"
+        local http_code
+        http_code=$(curl -sS -o "$resp_file" -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${unify_key}" \
+            -H "Content-Type: application/json" \
+            -d "{\"local_port\": ${SFTP_LOCAL_PORT}, \"protocol\": \"tcp\", \"name\": \"${sftp_name}\"}" \
+            "${comms_url}/infra/tunnel/register" || true)
 
-    if [[ "$http_code" != "200" ]]; then
-        echo "  ERROR: SFTP tunnel registration failed (HTTP ${http_code})" >&2
-        [[ -f "$resp_file" ]] && cat "$resp_file" >&2
+        if [[ "$http_code" != "200" ]]; then
+            echo "  ERROR: SFTP tunnel registration failed (HTTP ${http_code})" >&2
+            [[ -f "$resp_file" ]] && cat "$resp_file" >&2
+            rm -f "$resp_file"
+            return 1
+        fi
+
+        local tunnel_id tcp_host tcp_port client_config
+        tunnel_id=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tunnel_id',''))" < "$resp_file" 2>/dev/null || true)
+        tcp_host=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tcp_host',''))" < "$resp_file" 2>/dev/null || true)
+        tcp_port=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tcp_port',''))" < "$resp_file" 2>/dev/null || true)
+        client_config=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('client_config',''))" < "$resp_file" 2>/dev/null || true)
         rm -f "$resp_file"
-        return 1
+
+        set_env_value "SFTP_TUNNEL_ID" "$tunnel_id"
+        set_env_value "SFTP_TUNNEL_HOST" "$tcp_host"
+        set_env_value "SFTP_TUNNEL_PORT" "$tcp_port"
+
+        mkdir -p "$RATHOLE_DIR"
+        if [[ -n "$client_config" ]]; then
+            printf '%s\n' "$client_config" > "$SFTP_RATHOLE_CONFIG"
+        fi
+
+        active_id="$tunnel_id"
+        echo "  SFTP tunnel registered: ${tcp_host}:${tcp_port}"
     fi
 
-    local tunnel_id tcp_host tcp_port client_config
-    tunnel_id=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tunnel_id',''))" < "$resp_file" 2>/dev/null || true)
-    tcp_host=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tcp_host',''))" < "$resp_file" 2>/dev/null || true)
-    tcp_port=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tcp_port',''))" < "$resp_file" 2>/dev/null || true)
-    client_config=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('client_config',''))" < "$resp_file" 2>/dev/null || true)
-    rm -f "$resp_file"
-
-    set_env_value "SFTP_TUNNEL_ID" "$tunnel_id"
-    set_env_value "SFTP_TUNNEL_HOST" "$tcp_host"
-    set_env_value "SFTP_TUNNEL_PORT" "$tcp_port"
-
-    mkdir -p "$RATHOLE_DIR"
-    if [[ -n "$client_config" ]]; then
-        printf '%s\n' "$client_config" > "$SFTP_RATHOLE_CONFIG"
-    fi
-
-    echo "  SFTP tunnel registered: ${tcp_host}:${tcp_port}"
+    # Clean up any older SFTP tunnels this device left behind (best-effort).
+    [[ -n "$active_id" ]] && prune_stale_sftp_tunnels "$unify_key" "$comms_url" "$sftp_name" "$active_id"
 }
 
 unregister_sftp_tunnel() {
