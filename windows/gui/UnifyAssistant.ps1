@@ -96,9 +96,7 @@ function Get-EnvValue {
 }
 
 function Test-ComposeSelfHostPresent {
-    # Prefer the new ~/.unity self-host dir; fall back to legacy ~/.droid.
-    return (Test-Path (Join-Path $env:USERPROFILE '.unity\docker-compose.yml')) -or `
-           (Test-Path (Join-Path $env:USERPROFILE '.droid\docker-compose.yml'))
+    return Test-Path (Join-Path $env:USERPROFILE '.unity\docker-compose.yml')
 }
 
 function Get-AgentPort {
@@ -439,7 +437,6 @@ function Show-SettingsDialog {
     $txtComms.Location = New-Object System.Drawing.Point(20, $yPos)
     $txtComms.Size = New-Object System.Drawing.Size(390, 25)
     $txtComms.Text = Get-EnvValue -Key "UNITY_COMMS_URL"
-    if (-not $txtComms.Text) { $txtComms.Text = Get-EnvValue -Key "DROID_COMMS_URL" }
     if (-not $txtComms.Text) { $txtComms.Text = "https://service.a.run.app" }
     $txtComms.ReadOnly = $true
     $txtComms.BackColor = [System.Drawing.SystemColors]::Control

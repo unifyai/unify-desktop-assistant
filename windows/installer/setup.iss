@@ -136,9 +136,7 @@ var
 
 function TestComposeSelfHostPresent: Boolean;
 begin
-  // Prefer the new ~/.unity self-host dir; fall back to legacy ~/.droid.
-  Result := FileExists(ExpandConstant('{%USERPROFILE}\.unity\docker-compose.yml')) or
-            FileExists(ExpandConstant('{%USERPROFILE}\.droid\docker-compose.yml'));
+  Result := FileExists(ExpandConstant('{%USERPROFILE}\.unity\docker-compose.yml'));
 end;
 
 function GetSetupRunParams(Param: String): String;
@@ -358,7 +356,6 @@ begin
                   'UNIFY_KEY=' + UnifyKeyEdit.Text + Chr(13) + Chr(10) +
                   'ORCHESTRA_URL=' + OrchestraUrl + Chr(13) + Chr(10) +
                   'UNITY_COMMS_URL=' + CommsUrl + Chr(13) + Chr(10) +
-                  'DROID_COMMS_URL=' + CommsUrl + Chr(13) + Chr(10) +
                   'SELF_HOST=' + SelfHostFlag + Chr(13) + Chr(10) +
                   'PLAYWRIGHT_BROWSERS_PATH=C:\ms-playwright' + Chr(13) + Chr(10) +
                   Chr(13) + Chr(10) +

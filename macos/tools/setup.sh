@@ -109,7 +109,7 @@ while [[ $# -gt 0 ]]; do
             UNIFY_KEY="$2"; shift 2 ;;
         --orchestra-url)
             ORCHESTRA_URL="$2"; shift 2 ;;
-        --unity-comms-url|--droid-comms-url)
+        --unity-comms-url)
             UNITY_COMMS_URL="$2"; shift 2 ;;
         --start)
             DO_START=true; shift ;;
@@ -396,8 +396,7 @@ set_env_value() {
 # =============================================================================
 
 compose_self_host_present() {
-    # Prefer the new ~/.unity self-host dir; fall back to legacy ~/.droid.
-    [[ -f "${HOME}/.unity/docker-compose.yml" || -f "${HOME}/.droid/docker-compose.yml" ]]
+    [[ -f "${HOME}/.unity/docker-compose.yml" ]]
 }
 
 apply_compose_self_host_mode() {
@@ -686,7 +685,6 @@ uninstall_all() {
     unify_key=$(get_env_value "UNIFY_KEY")
     orchestra_url=$(get_env_value "ORCHESTRA_URL")
     comms_url=$(get_env_value "UNITY_COMMS_URL")
-    [[ -z "$comms_url" ]] && comms_url=$(get_env_value "DROID_COMMS_URL")
 
     if [[ -n "$unify_key" ]]; then
         echo ""
@@ -1772,9 +1770,6 @@ resolve_coordinator_agent_id() {
     fi
 
     local runtime_file="$HOME/.unity/coordinator-runtime.json"
-    if [[ ! -f "$runtime_file" ]]; then
-        runtime_file="$HOME/.droid/coordinator-runtime.json"
-    fi
     if [[ -f "$runtime_file" ]]; then
         local from_file
         from_file="$(python3 - "$runtime_file" <<'PY'
@@ -1905,7 +1900,6 @@ ensure_registration() {
     unify_key=$(get_env_value "UNIFY_KEY")
     orchestra_url=$(get_env_value "ORCHESTRA_URL")
     comms_url=$(get_env_value "UNITY_COMMS_URL")
-    [[ -z "$comms_url" ]] && comms_url=$(get_env_value "DROID_COMMS_URL")
     [[ -z "$unify_key" || -z "$orchestra_url" ]] && return 0
 
     lock_dir="$AGENT_SERVICE_DIR/.recover.lock"
@@ -2020,9 +2014,6 @@ PORT=$agent_port
 UNIFY_KEY=$UNIFY_KEY
 ORCHESTRA_URL=$ORCHESTRA_URL
 UNITY_COMMS_URL=$UNITY_COMMS_URL
-# Legacy alias kept during the droid->unity sync transition; remove once the
-# synced agent-service reads UNITY_COMMS_URL on all branches.
-DROID_COMMS_URL=$UNITY_COMMS_URL
 SELF_HOST=$($SELF_HOST_MODE && echo 1 || echo 0)
 PLAYWRIGHT_BROWSERS_PATH=$INSTALL_DIR/browsers
 
@@ -2443,7 +2434,6 @@ if $RECONFIGURE; then
     if ! compose_self_host_present; then
         existing_orch="$(get_env_value "ORCHESTRA_URL")"
         existing_comms="$(get_env_value "UNITY_COMMS_URL")"
-        [[ -z "$existing_comms" ]] && existing_comms="$(get_env_value "DROID_COMMS_URL")"
         [[ -n "$existing_orch" ]]  && ORCHESTRA_URL="$existing_orch"
         [[ -n "$existing_comms" ]] && UNITY_COMMS_URL="$existing_comms"
         if [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then

@@ -340,7 +340,6 @@ function Uninstall-All {
     $unifyKey = Get-EnvValue -Key "UNIFY_KEY"
     $orchestraUrl = Get-EnvValue -Key "ORCHESTRA_URL"
     $commsUrl = Get-EnvValue -Key "UNITY_COMMS_URL"
-    if (-not $commsUrl) { $commsUrl = Get-EnvValue -Key "DROID_COMMS_URL" }
     
     if ($unifyKey) {
         Write-Host ""
@@ -1368,10 +1367,7 @@ function Set-EnvValue {
 }
 
 function Test-ComposeSelfHostPresent {
-    # Prefer the new ~/.unity self-host dir; fall back to legacy ~/.droid so
-    # machines provisioned before the droid->unity rename keep self-hosting.
-    return (Test-Path (Join-Path $env:USERPROFILE '.unity\docker-compose.yml')) -or `
-           (Test-Path (Join-Path $env:USERPROFILE '.droid\docker-compose.yml'))
+    return Test-Path (Join-Path $env:USERPROFILE '.unity\docker-compose.yml')
 }
 
 function Apply-ComposeSelfHostMode {
@@ -1435,9 +1431,6 @@ function Resolve-CoordinatorAgentId {
     }
 
     $runtimeFile = Join-Path $env:USERPROFILE '.unity\coordinator-runtime.json'
-    if (-not (Test-Path $runtimeFile)) {
-        $runtimeFile = Join-Path $env:USERPROFILE '.droid\coordinator-runtime.json'
-    }
     if (Test-Path $runtimeFile) {
         try {
             $runtime = Get-Content $runtimeFile -Raw | ConvertFrom-Json
@@ -1863,7 +1856,6 @@ function Ensure-Registration {
     $unifyKey = Get-EnvValue -Key "UNIFY_KEY"
     $orchestraUrl = Get-EnvValue -Key "ORCHESTRA_URL"
     $commsUrl = Get-EnvValue -Key "UNITY_COMMS_URL"
-    if (-not $commsUrl) { $commsUrl = Get-EnvValue -Key "DROID_COMMS_URL" }
     if (-not $unifyKey -or -not $orchestraUrl) { return }
 
     if (-not (Test-Path $script:AgentServiceDir)) {
@@ -1971,9 +1963,6 @@ PORT=$agentPort
 UNIFY_KEY=$UnifyKey
 ORCHESTRA_URL=$OrchestraUrl
 UNITY_COMMS_URL=$UnityCommsUrl
-# Legacy alias kept during the droid->unity sync transition; remove once the
-# synced agent-service reads UNITY_COMMS_URL on all branches.
-DROID_COMMS_URL=$UnityCommsUrl
 SELF_HOST=$selfHostFlag
 PLAYWRIGHT_BROWSERS_PATH=C:\ms-playwright
 
@@ -2400,7 +2389,6 @@ if ($Reconfigure) {
     if (-not (Test-ComposeSelfHostPresent)) {
         $existingOrch = Get-EnvValue -Key "ORCHESTRA_URL"
         $existingComms = Get-EnvValue -Key "UNITY_COMMS_URL"
-        if (-not $existingComms) { $existingComms = Get-EnvValue -Key "DROID_COMMS_URL" }
         if ($existingOrch) { $OrchestraUrl = $existingOrch }
         if ($existingComms) { $UnityCommsUrl = $existingComms }
         if ((Get-EnvValue -Key 'SELF_HOST') -eq '1') {
