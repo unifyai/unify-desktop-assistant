@@ -1228,6 +1228,24 @@ function Remove-StaleSFTPTunnels {
     }
 }
 
+# Periodic, no-restart cleanup driven by the UnifySftpSync scheduled task: prune
+# this device's leftover SFTP tunnels without waiting for a service restart. Only
+# acts when it can confirm our active tunnel is live, so it never deletes the wrong one.
+function Invoke-SFTPTunnelAutoPrune {
+    if ((Get-EnvValue -Key 'SELF_HOST') -eq '1') { return }
+
+    $unifyKey = Get-EnvValue -Key 'UNIFY_KEY'
+    $commsUrl = Get-EnvValue -Key 'UNITY_COMMS_URL'
+    $activeId = Get-EnvValue -Key 'SFTP_TUNNEL_ID'
+    if (-not $unifyKey -or -not $commsUrl -or -not $activeId) { return }
+
+    # Only prune once we know which tunnel to keep; if it's missing/unreachable,
+    # leave well alone and let the next boot re-register + self-heal.
+    if ((Test-TunnelExists -UnifyKey $unifyKey -CommsUrl $commsUrl -TunnelId $activeId) -ne 'present') { return }
+
+    Remove-StaleSFTPTunnels -UnifyKey $unifyKey -CommsUrl $commsUrl -Name (Get-SFTPTunnelName) -KeepId $activeId
+}
+
 function Register-SFTPTunnel {
     param(
         [string]$UnifyKey,
@@ -2424,6 +2442,7 @@ if ($Stop) {
 # after install). No admin, no install, no registration.
 if ($SyncKeys) {
     Sync-AuthorizedKeys
+    try { Invoke-SFTPTunnelAutoPrune } catch { }
     exit 0
 }
 

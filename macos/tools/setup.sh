@@ -1449,6 +1449,25 @@ for t in tunnels:
     done <<<"$stale"
 }
 
+# Periodic, no-restart cleanup driven by the sftp-sync launchd job: prune this
+# device's leftover SFTP tunnels without waiting for a service restart. Only acts
+# when it can confirm our active tunnel is live, so it never deletes the wrong one.
+auto_prune_sftp_tunnels() {
+    [[ "$(get_env_value "SELF_HOST")" == "1" ]] && return 0
+
+    local unify_key comms_url active_id
+    unify_key=$(get_env_value "UNIFY_KEY")
+    comms_url=$(get_env_value "UNITY_COMMS_URL")
+    active_id=$(get_env_value "SFTP_TUNNEL_ID")
+    [[ -z "$unify_key" || -z "$comms_url" || -z "$active_id" ]] && return 0
+
+    # Only prune once we know which tunnel to keep; if it's missing/unreachable,
+    # leave well alone and let the next boot re-register + self-heal.
+    [[ "$(tunnel_exists "$unify_key" "$comms_url" "$active_id")" != "present" ]] && return 0
+
+    prune_stale_sftp_tunnels "$unify_key" "$comms_url" "$(sftp_tunnel_name)" "$active_id"
+}
+
 register_sftp_tunnel() {
     local unify_key=$1
     local comms_url=$2
@@ -2559,6 +2578,7 @@ fi
 # after install). Runs as the regular user; no root, no install, no registration.
 if $DO_SYNC_KEYS; then
     reconcile_sftp_links
+    auto_prune_sftp_tunnels || true
     exit 0
 fi
 
