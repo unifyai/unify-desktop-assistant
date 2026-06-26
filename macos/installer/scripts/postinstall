@@ -67,12 +67,20 @@ EXISTING_TUNNEL_ID=""
 EXISTING_TUNNEL_URL=""
 EXISTING_TUNNEL_TOKEN=""
 EXISTING_DEVICE_ID=""
+EXISTING_SFTP_TUNNEL_ID=""
+EXISTING_SFTP_TUNNEL_HOST=""
+EXISTING_SFTP_TUNNEL_PORT=""
 if [ -f "$ENV_FILE" ]; then
     EXISTING_UNIFY_KEY=$(grep -E '^UNIFY_KEY=' "$ENV_FILE" 2>/dev/null | sed 's/^UNIFY_KEY=//' || true)
     EXISTING_TUNNEL_ID=$(grep -E '^TUNNEL_ID=' "$ENV_FILE" 2>/dev/null | sed 's/^TUNNEL_ID=//' || true)
     EXISTING_TUNNEL_URL=$(grep -E '^TUNNEL_URL=' "$ENV_FILE" 2>/dev/null | sed 's/^TUNNEL_URL=//' || true)
     EXISTING_TUNNEL_TOKEN=$(grep -E '^TUNNEL_TOKEN=' "$ENV_FILE" 2>/dev/null | sed 's/^TUNNEL_TOKEN=//' || true)
     EXISTING_DEVICE_ID=$(grep -E '^DEVICE_ID=' "$ENV_FILE" 2>/dev/null | sed 's/^DEVICE_ID=//' || true)
+    # Preserve the SFTP tunnel id/coords too — dropping them makes the next
+    # registration mint a fresh tunnel and orphan the old one on every upgrade.
+    EXISTING_SFTP_TUNNEL_ID=$(grep -E '^SFTP_TUNNEL_ID=' "$ENV_FILE" 2>/dev/null | sed 's/^SFTP_TUNNEL_ID=//' || true)
+    EXISTING_SFTP_TUNNEL_HOST=$(grep -E '^SFTP_TUNNEL_HOST=' "$ENV_FILE" 2>/dev/null | sed 's/^SFTP_TUNNEL_HOST=//' || true)
+    EXISTING_SFTP_TUNNEL_PORT=$(grep -E '^SFTP_TUNNEL_PORT=' "$ENV_FILE" 2>/dev/null | sed 's/^SFTP_TUNNEL_PORT=//' || true)
 fi
 
 # Use existing key if present (upgrade), otherwise leave blank (first-run dialog will prompt)
@@ -122,6 +130,11 @@ TUNNEL_ID=$EXISTING_TUNNEL_ID
 TUNNEL_URL=$EXISTING_TUNNEL_URL
 TUNNEL_TOKEN=$EXISTING_TUNNEL_TOKEN
 DEVICE_ID=$EXISTING_DEVICE_ID
+
+# SFTP tunnel (preserved across upgrades so we reuse it instead of orphaning it)
+SFTP_TUNNEL_ID=$EXISTING_SFTP_TUNNEL_ID
+SFTP_TUNNEL_HOST=$EXISTING_SFTP_TUNNEL_HOST
+SFTP_TUNNEL_PORT=$EXISTING_SFTP_TUNNEL_PORT
 ENVFILE
 echo "[postinstall] Agent Service .env configured."
 
