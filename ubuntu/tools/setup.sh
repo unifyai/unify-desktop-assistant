@@ -1262,7 +1262,8 @@ if old_body != body:
             open(flag, "w").close()
         except OSError:
             pass
-print(f"  authorized_keys synced ({len(pubkeys)} key(s) across {len(assistant_ids)} link(s))")
+    # Only log on change — at a 1-minute cadence an unconditional line floods the log.
+    print(f"  authorized_keys synced ({len(pubkeys)} key(s) across {len(assistant_ids)} link(s))")
 PY
     local rc=$?
     if [[ $rc -ne 0 ]]; then
@@ -1934,11 +1935,17 @@ setup_systemd_services() {
         # until authorized_keys exists, so it never force-runs a keyless server.
         su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user reset-failed unify-sftp.service" 2>/dev/null || true
         su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user restart unify-sftp.service" 2>/dev/null || true
+        # Restart the timer so an upgrade picks up a changed interval immediately
+        # (daemon-reload + start is a no-op on an already-running timer).
+        su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user restart unify-sftp-sync.timer" 2>/dev/null || true
     else
         systemctl --user daemon-reload 2>/dev/null || true
         systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service unify-sftp.service unify-sftp-sync.timer 2>/dev/null || true
         systemctl --user reset-failed unify-sftp.service 2>/dev/null || true
         systemctl --user restart unify-sftp.service 2>/dev/null || true
+        # Restart the timer so an upgrade picks up a changed interval immediately
+        # (daemon-reload + start is a no-op on an already-running timer).
+        systemctl --user restart unify-sftp-sync.timer 2>/dev/null || true
     fi
 
     echo "  systemd user services configured"

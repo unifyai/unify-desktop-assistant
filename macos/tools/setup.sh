@@ -1305,9 +1305,16 @@ reconcile_sftp_links() {
     mkdir -p "$SSH_DIR"
     chmod 700 "$SSH_DIR"
 
+    # Pre-clear the change marker; the reconcile below recreates it only when it
+    # actually rewrites authorized_keys, so we can kickstart the SFTP agent on a
+    # real key change (rclone only loads keys at startup) without bouncing it on
+    # every unchanged sync tick.
+    local changed_flag="$SSH_DIR/.authorized_keys_changed"
+    rm -f "$changed_flag" 2>/dev/null || true
+
     UNIFY_KEY="$unify_key" ORCHESTRA_URL="$orchestra_url" DEVICE_ID="$device_id" \
     SFTP_TUNNEL_HOST="$sftp_host" SFTP_TUNNEL_PORT="$sftp_port" SFTP_TUNNEL_ID="$sftp_id" \
-    SSH_AUTH_KEYS="$SSH_AUTH_KEYS" python3 - <<'PY'
+    SSH_AUTH_KEYS="$SSH_AUTH_KEYS" CHANGED_FLAG="$changed_flag" python3 - <<'PY'
 import json, os, sys, tempfile, urllib.error, urllib.request
 
 base = os.environ["ORCHESTRA_URL"].rstrip("/")
@@ -1380,13 +1387,41 @@ for aid in assistant_ids:
                 print(f"  WARNING: tunnel report failed for {aid}: {e}", file=sys.stderr)
 
 body = "".join(k + "\n" for k in pubkeys)
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(auth_keys) or ".")
-with os.fdopen(fd, "w", encoding="utf-8") as fh:
-    fh.write(body)
-os.chmod(tmp, 0o600)
-os.replace(tmp, auth_keys)
-print(f"  authorized_keys synced ({len(pubkeys)} key(s) across {len(assistant_ids)} link(s))")
+try:
+    with open(auth_keys, encoding="utf-8") as fh:
+        old_body = fh.read()
+except FileNotFoundError:
+    old_body = None
+if old_body != body:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(auth_keys) or ".")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, auth_keys)
+    flag = os.environ.get("CHANGED_FLAG")
+    if flag:
+        try:
+            open(flag, "w").close()
+        except OSError:
+            pass
+    # Only log on change — at a 1-minute cadence an unconditional line floods the log.
+    print(f"  authorized_keys synced ({len(pubkeys)} key(s) across {len(assistant_ids)} link(s))")
 PY
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$changed_flag" 2>/dev/null || true
+        return "$rc"
+    fi
+
+    # rclone loads --authorized-keys only at startup, so a key change needs a
+    # restart to take effect. Only act in a user session (the sync timer and
+    # --reconfigure run as the user; a root install has no GUI domain and the
+    # agent loads at next login) and only when the key set actually changed, so
+    # live SFTP sessions aren't dropped on an unchanged tick.
+    if [[ "$EUID" -ne 0 && -f "$changed_flag" ]]; then
+        launchctl kickstart -k "gui/$(id -u)/com.unify.sftp" 2>/dev/null || true
+    fi
+    rm -f "$changed_flag" 2>/dev/null || true
 }
 
 # Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its

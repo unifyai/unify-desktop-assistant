@@ -1167,8 +1167,18 @@ function Sync-AuthorizedKeys {
     $body = ($pubkeys -join "`n")
     if ($body) { $body += "`n" }
 
-    [System.IO.File]::WriteAllText($script:SshAuthKeys, $body, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Host "  authorized_keys synced ($($pubkeys.Count) key(s) across $($assistantIds.Count) link(s))" -ForegroundColor Green
+    $old = $null
+    if (Test-Path $script:SshAuthKeys) {
+        try { $old = [System.IO.File]::ReadAllText($script:SshAuthKeys) } catch { $old = $null }
+    }
+    if ($old -ne $body) {
+        [System.IO.File]::WriteAllText($script:SshAuthKeys, $body, (New-Object System.Text.UTF8Encoding($false)))
+        # Only log on change — at a 1-minute cadence an unconditional line floods the log.
+        Write-Host "  authorized_keys synced ($($pubkeys.Count) key(s) across $($assistantIds.Count) link(s))" -ForegroundColor Green
+        # Restart the server only when keys actually changed, so live SFTP
+        # sessions aren't dropped on an unchanged tick.
+        Restart-SFTPServerForKeyChange
+    }
 }
 
 # Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its
@@ -1384,6 +1394,19 @@ function Start-SFTPServer {
 
     Write-Host "  Starting SFTP server (rclone)..." -ForegroundColor Gray
     Start-Process cmd.exe -ArgumentList "/c `"`"$($script:RcloneExe)`" serve sftp `"$($env:USERPROFILE)`" --addr $addr --user `"$user`" --authorized-keys `"$($script:SshAuthKeys)`"$keyArg > `"$log`" 2>&1`"" -WindowStyle Hidden
+}
+
+# rclone loads --authorized-keys only at startup, so a key change needs a restart
+# to take effect. Stop any running SFTP server and relaunch it with the refreshed
+# keys (Start-SFTPServer starts fresh if it wasn't running).
+function Restart-SFTPServerForKeyChange {
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name = 'rclone.exe' AND CommandLine LIKE '%serve sftp%'" -ErrorAction SilentlyContinue
+        foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch { }
+    # Give the listener a moment to release the port before relaunching.
+    Start-Sleep -Milliseconds 500
+    Start-SFTPServer
 }
 
 function Start-SFTPTunnel {
@@ -2196,7 +2219,7 @@ function Setup-SFTPSyncStartup {
 
     # Periodic reconcile of authorized_keys + tunnel coords so links enabled later
     # in the console are picked up without a reinstall. Runs setup.ps1 -SyncKeys
-    # hidden, at logon and every 5 minutes.
+    # hidden, at logon and every minute.
     $setupScript = Join-Path $script:ToolsDir 'setup.ps1'
 
     $taskName = "UnifySftpSync"
@@ -2206,12 +2229,12 @@ function Setup-SFTPSyncStartup {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument -WorkingDirectory $script:ToolsDir
     $triggerLogon = New-ScheduledTaskTrigger -AtLogOn
     $triggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
-        -RepetitionInterval (New-TimeSpan -Minutes 5) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) `
         -RepetitionDuration (New-TimeSpan -Days 3650)
     $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($triggerLogon, $triggerRepeat) -Principal $principal -Settings $settings | Out-Null
-    Write-Host "  Scheduled task created: $taskName (hidden, every 5 min)" -ForegroundColor Green
+    Write-Host "  Scheduled task created: $taskName (hidden, every 1 min)" -ForegroundColor Green
 }
 
 function Configure-Firewall {

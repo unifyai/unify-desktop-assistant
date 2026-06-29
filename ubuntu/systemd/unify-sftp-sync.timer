@@ -4,7 +4,9 @@ Documentation=https://unify.ai
 
 [Timer]
 OnBootSec=1min
-OnUnitActiveSec=5min
+OnUnitActiveSec=1min
+# Spread fire times across a fleet so reconciles don't stampede Orchestra/Comms.
+RandomizedDelaySec=10s
 Persistent=true
 Unit=unify-sftp-sync.service
 
