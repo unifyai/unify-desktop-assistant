@@ -1262,7 +1262,8 @@ if old_body != body:
             open(flag, "w").close()
         except OSError:
             pass
-print(f"  authorized_keys synced ({len(pubkeys)} key(s) across {len(assistant_ids)} link(s))")
+    # Only log on change — at a 1-minute cadence an unconditional line floods the log.
+    print(f"  authorized_keys synced ({len(pubkeys)} key(s) across {len(assistant_ids)} link(s))")
 PY
     local rc=$?
     if [[ $rc -ne 0 ]]; then
@@ -1346,6 +1347,25 @@ for t in tunnels:
             "${comms_url%/}/infra/tunnel/${id}" 2>/dev/null || true
         echo "  Pruned stale SFTP tunnel $id"
     done <<<"$stale"
+}
+
+# Periodic, no-restart cleanup driven by the sftp-sync timer: prune this device's
+# leftover SFTP tunnels without waiting for a service restart. Only acts when it
+# can confirm our active tunnel is live, so it never deletes the wrong one.
+auto_prune_sftp_tunnels() {
+    [[ "$(get_env_value "SELF_HOST")" == "1" ]] && return 0
+
+    local unify_key comms_url active_id
+    unify_key=$(get_env_value "UNIFY_KEY")
+    comms_url=$(get_env_value "UNITY_COMMS_URL")
+    active_id=$(get_env_value "SFTP_TUNNEL_ID")
+    [[ -z "$unify_key" || -z "$comms_url" || -z "$active_id" ]] && return 0
+
+    # Only prune once we know which tunnel to keep; if it's missing/unreachable,
+    # leave well alone and let the next boot re-register + self-heal.
+    [[ "$(tunnel_exists "$unify_key" "$comms_url" "$active_id")" != "present" ]] && return 0
+
+    prune_stale_sftp_tunnels "$unify_key" "$comms_url" "$(sftp_tunnel_name)" "$active_id"
 }
 
 register_sftp_tunnel() {
@@ -1915,11 +1935,17 @@ setup_systemd_services() {
         # until authorized_keys exists, so it never force-runs a keyless server.
         su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user reset-failed unify-sftp.service" 2>/dev/null || true
         su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user restart unify-sftp.service" 2>/dev/null || true
+        # Restart the timer so an upgrade picks up a changed interval immediately
+        # (daemon-reload + start is a no-op on an already-running timer).
+        su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user restart unify-sftp-sync.timer" 2>/dev/null || true
     else
         systemctl --user daemon-reload 2>/dev/null || true
         systemctl --user enable unify-vnc.service unify-websockify.service unify-agent.service unify-sftp.service unify-sftp-sync.timer 2>/dev/null || true
         systemctl --user reset-failed unify-sftp.service 2>/dev/null || true
         systemctl --user restart unify-sftp.service 2>/dev/null || true
+        # Restart the timer so an upgrade picks up a changed interval immediately
+        # (daemon-reload + start is a no-op on an already-running timer).
+        systemctl --user restart unify-sftp-sync.timer 2>/dev/null || true
     fi
 
     echo "  systemd user services configured"
@@ -2214,6 +2240,7 @@ fi
 # after install). Runs as the regular user; no root, no install, no registration.
 if $DO_SYNC_KEYS; then
     reconcile_sftp_links
+    auto_prune_sftp_tunnels || true
     exit 0
 fi
 

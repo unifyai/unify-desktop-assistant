@@ -830,19 +830,78 @@ function Install-Magnitude {
     }
 }
 
+function Install-PlaywrightBuild {
+    # Manually provision one Playwright/patchright browser build: download the zip
+    # and extract it with native Expand-Archive into the exact dir Playwright
+    # expects, then drop the INSTALLATION_COMPLETE marker so patchright treats it
+    # as already installed and never runs its (on some Windows VMs) broken
+    # extractor. The marker is ONLY written after the expected executable is
+    # confirmed on disk, so we never lie to patchright about a half-extracted
+    # build. Returns $true on success, $false otherwise (caller decides whether
+    # to fall back to `patchright install`).
+    param(
+        [Parameter(Mandatory)][string]$BrowsersRoot,
+        [Parameter(Mandatory)][string]$DirName,
+        [Parameter(Mandatory)][string]$Rev,
+        [Parameter(Mandatory)][string]$ZipName,
+        [Parameter(Mandatory)][string]$RelExe,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    $browserDir = Join-Path $BrowsersRoot $DirName
+    $exe = Join-Path $browserDir $RelExe
+    $marker = Join-Path $browserDir 'INSTALLATION_COMPLETE'
+
+    if ((Test-Path $exe) -and (Test-Path $marker)) {
+        Write-Host "  $Label already installed (revision $Rev)" -ForegroundColor Green
+        return $true
+    }
+
+    $url = "https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/$Rev/$ZipName"
+    $zip = Join-Path $env:TEMP "$DirName.zip"
+    $ok = $false
+    $prevProgress = $ProgressPreference
+    try {
+        Write-Host "  Downloading $Label (revision $Rev)..."
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
+
+        Write-Host "  Extracting $Label (native unzip)..."
+        New-Item -ItemType Directory -Force -Path $browserDir | Out-Null
+        Expand-Archive -Path $zip -DestinationPath $browserDir -Force -ErrorAction Stop
+
+        if (Test-Path $exe) {
+            New-Item -ItemType File -Force -Path $marker | Out-Null
+            $ok = $true
+            Write-Host "  $Label installed (revision $Rev)" -ForegroundColor Green
+        } else {
+            Write-Host "  WARNING: expected executable not found after extraction ($RelExe)." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  WARNING: Manual $Label provisioning failed: $_" -ForegroundColor Yellow
+    } finally {
+        $ProgressPreference = $prevProgress
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    }
+
+    return $ok
+}
+
 function Install-Chromium {
-    # patchright/Playwright's own (node) archive extractor hangs on some Windows
-    # VMs right at "extracting archive" (download succeeds, extraction never
-    # writes a byte; not Defender/disk - native Expand-Archive of the same zip is
-    # instant). Provision Chromium ourselves: download the zip and extract it with
-    # Expand-Archive into the exact dir Playwright expects, then drop the
-    # INSTALLATION_COMPLETE marker so patchright treats it as already installed
-    # and never runs its broken extractor. Falls back to `patchright install` if
-    # anything here fails, so we're never worse off than before.
+    # Provision BOTH browser builds patchright needs:
+    #   * full Chromium (chrome.exe)             - headed browser automation
+    #   * Chromium headless-shell (headless_shell.exe) - headless: true sessions,
+    #     e.g. the desktop noVNC screenshot path. Without it, headless launches
+    #     fail with "Executable doesn't exist ... chromium_headless_shell-<rev>".
+    #
+    # We download + extract each ourselves (see Install-PlaywrightBuild for why)
+    # and fall back to `patchright install chromium` (which fetches BOTH builds)
+    # if anything fails, so we're never worse off than before.
     $browsersRoot = 'C:\ms-playwright'
     $coreDir = Join-Path $script:MagnitudeDir 'packages\magnitude-core'
 
-    $rev = $null
+    $chromiumRev = $null
+    $headlessRev = $null
     try {
         $browsersJson = Get-ChildItem -Path $script:MagnitudeDir -Recurse -Filter 'browsers.json' -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match 'patchright-core' } | Select-Object -First 1
@@ -853,13 +912,15 @@ function Install-Chromium {
         if ($browsersJson) {
             $data = Get-Content $browsersJson.FullName -Raw | ConvertFrom-Json
             $chromium = $data.browsers | Where-Object { $_.name -eq 'chromium' } | Select-Object -First 1
-            if ($chromium) { $rev = $chromium.revision }
+            if ($chromium) { $chromiumRev = $chromium.revision }
+            $headless = $data.browsers | Where-Object { $_.name -eq 'chromium-headless-shell' } | Select-Object -First 1
+            if ($headless) { $headlessRev = $headless.revision }
         }
     } catch {
         Write-Host "  WARNING: Could not read Chromium revision: $_" -ForegroundColor Yellow
     }
 
-    if (-not $rev) {
+    if (-not $chromiumRev) {
         Write-Host "  Could not determine Chromium revision; falling back to patchright install..." -ForegroundColor Yellow
         Push-Location $coreDir
         Invoke-NativeCommand { npx --yes patchright install chromium }
@@ -867,44 +928,21 @@ function Install-Chromium {
         return
     }
 
-    $browserDir = Join-Path $browsersRoot "chromium-$rev"
-    $chromeExe = Join-Path $browserDir 'chrome-win\chrome.exe'
-    $marker = Join-Path $browserDir 'INSTALLATION_COMPLETE'
+    $chromiumOk = Install-PlaywrightBuild -BrowsersRoot $browsersRoot `
+        -DirName "chromium-$chromiumRev" -Rev $chromiumRev `
+        -ZipName 'chromium-win64.zip' -RelExe 'chrome-win\chrome.exe' -Label 'Chromium'
 
-    if ((Test-Path $chromeExe) -and (Test-Path $marker)) {
-        Write-Host "  Chromium already installed (revision $rev)" -ForegroundColor Green
-        return
+    $headlessOk = $false
+    if ($headlessRev) {
+        $headlessOk = Install-PlaywrightBuild -BrowsersRoot $browsersRoot `
+            -DirName "chromium_headless_shell-$headlessRev" -Rev $headlessRev `
+            -ZipName 'chromium-headless-shell-win64.zip' -RelExe 'chrome-win\headless_shell.exe' -Label 'Chromium headless-shell'
+    } else {
+        Write-Host "  WARNING: Could not determine Chromium headless-shell revision; relying on patchright fallback." -ForegroundColor Yellow
     }
 
-    $url = "https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/$rev/chromium-win64.zip"
-    $zip = Join-Path $env:TEMP "chromium-$rev.zip"
-    $ok = $false
-    $prevProgress = $ProgressPreference
-    try {
-        Write-Host "  Downloading Chromium (revision $rev)..."
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
-
-        Write-Host "  Extracting Chromium (native unzip)..."
-        New-Item -ItemType Directory -Force -Path $browserDir | Out-Null
-        Expand-Archive -Path $zip -DestinationPath $browserDir -Force -ErrorAction Stop
-
-        if (Test-Path $chromeExe) {
-            New-Item -ItemType File -Force -Path $marker | Out-Null
-            $ok = $true
-            Write-Host "  Chromium installed (revision $rev)" -ForegroundColor Green
-        } else {
-            Write-Host "  WARNING: chrome.exe not found after extraction." -ForegroundColor Yellow
-        }
-    } catch {
-        Write-Host "  WARNING: Manual Chromium provisioning failed: $_" -ForegroundColor Yellow
-    } finally {
-        $ProgressPreference = $prevProgress
-        Remove-Item $zip -Force -ErrorAction SilentlyContinue
-    }
-
-    if (-not $ok) {
-        Write-Host "  Falling back to patchright install..." -ForegroundColor Yellow
+    if (-not $chromiumOk -or -not $headlessOk) {
+        Write-Host "  Falling back to patchright install (fetches both Chromium and headless-shell)..." -ForegroundColor Yellow
         Push-Location $coreDir
         Invoke-NativeCommand { npx --yes patchright install chromium }
         Pop-Location
@@ -1167,8 +1205,18 @@ function Sync-AuthorizedKeys {
     $body = ($pubkeys -join "`n")
     if ($body) { $body += "`n" }
 
-    [System.IO.File]::WriteAllText($script:SshAuthKeys, $body, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Host "  authorized_keys synced ($($pubkeys.Count) key(s) across $($assistantIds.Count) link(s))" -ForegroundColor Green
+    $old = $null
+    if (Test-Path $script:SshAuthKeys) {
+        try { $old = [System.IO.File]::ReadAllText($script:SshAuthKeys) } catch { $old = $null }
+    }
+    if ($old -ne $body) {
+        [System.IO.File]::WriteAllText($script:SshAuthKeys, $body, (New-Object System.Text.UTF8Encoding($false)))
+        # Only log on change — at a 1-minute cadence an unconditional line floods the log.
+        Write-Host "  authorized_keys synced ($($pubkeys.Count) key(s) across $($assistantIds.Count) link(s))" -ForegroundColor Green
+        # Restart the server only when keys actually changed, so live SFTP
+        # sessions aren't dropped on an unchanged tick.
+        Restart-SFTPServerForKeyChange
+    }
 }
 
 # Cloud mode: register a raw-TCP rathole tunnel for the SFTP port and write its
@@ -1226,6 +1274,24 @@ function Remove-StaleSFTPTunnels {
             } catch { }
         }
     }
+}
+
+# Periodic, no-restart cleanup driven by the UnifySftpSync scheduled task: prune
+# this device's leftover SFTP tunnels without waiting for a service restart. Only
+# acts when it can confirm our active tunnel is live, so it never deletes the wrong one.
+function Invoke-SFTPTunnelAutoPrune {
+    if ((Get-EnvValue -Key 'SELF_HOST') -eq '1') { return }
+
+    $unifyKey = Get-EnvValue -Key 'UNIFY_KEY'
+    $commsUrl = Get-EnvValue -Key 'UNITY_COMMS_URL'
+    $activeId = Get-EnvValue -Key 'SFTP_TUNNEL_ID'
+    if (-not $unifyKey -or -not $commsUrl -or -not $activeId) { return }
+
+    # Only prune once we know which tunnel to keep; if it's missing/unreachable,
+    # leave well alone and let the next boot re-register + self-heal.
+    if ((Test-TunnelExists -UnifyKey $unifyKey -CommsUrl $commsUrl -TunnelId $activeId) -ne 'present') { return }
+
+    Remove-StaleSFTPTunnels -UnifyKey $unifyKey -CommsUrl $commsUrl -Name (Get-SFTPTunnelName) -KeepId $activeId
 }
 
 function Register-SFTPTunnel {
@@ -1366,6 +1432,19 @@ function Start-SFTPServer {
 
     Write-Host "  Starting SFTP server (rclone)..." -ForegroundColor Gray
     Start-Process cmd.exe -ArgumentList "/c `"`"$($script:RcloneExe)`" serve sftp `"$($env:USERPROFILE)`" --addr $addr --user `"$user`" --authorized-keys `"$($script:SshAuthKeys)`"$keyArg > `"$log`" 2>&1`"" -WindowStyle Hidden
+}
+
+# rclone loads --authorized-keys only at startup, so a key change needs a restart
+# to take effect. Stop any running SFTP server and relaunch it with the refreshed
+# keys (Start-SFTPServer starts fresh if it wasn't running).
+function Restart-SFTPServerForKeyChange {
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name = 'rclone.exe' AND CommandLine LIKE '%serve sftp%'" -ErrorAction SilentlyContinue
+        foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch { }
+    # Give the listener a moment to release the port before relaunching.
+    Start-Sleep -Milliseconds 500
+    Start-SFTPServer
 }
 
 function Start-SFTPTunnel {
@@ -2178,7 +2257,7 @@ function Setup-SFTPSyncStartup {
 
     # Periodic reconcile of authorized_keys + tunnel coords so links enabled later
     # in the console are picked up without a reinstall. Runs setup.ps1 -SyncKeys
-    # hidden, at logon and every 5 minutes.
+    # hidden, at logon and every minute.
     $setupScript = Join-Path $script:ToolsDir 'setup.ps1'
 
     $taskName = "UnifySftpSync"
@@ -2188,12 +2267,12 @@ function Setup-SFTPSyncStartup {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument -WorkingDirectory $script:ToolsDir
     $triggerLogon = New-ScheduledTaskTrigger -AtLogOn
     $triggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
-        -RepetitionInterval (New-TimeSpan -Minutes 5) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) `
         -RepetitionDuration (New-TimeSpan -Days 3650)
     $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($triggerLogon, $triggerRepeat) -Principal $principal -Settings $settings | Out-Null
-    Write-Host "  Scheduled task created: $taskName (hidden, every 5 min)" -ForegroundColor Green
+    Write-Host "  Scheduled task created: $taskName (hidden, every 1 min)" -ForegroundColor Green
 }
 
 function Configure-Firewall {
@@ -2424,6 +2503,7 @@ if ($Stop) {
 # after install). No admin, no install, no registration.
 if ($SyncKeys) {
     Sync-AuthorizedKeys
+    try { Invoke-SFTPTunnelAutoPrune } catch { }
     exit 0
 }
 
