@@ -1,0 +1,38 @@
+# Pull-request gate for Vanta automated-checks compliance.
+#
+# Installer builds and component sync run on workflow_dispatch or schedule,
+# not on pull_request. This workflow reports a PR status check so staging→main
+# promotion PRs satisfy Vanta without duplicating the full installer pipeline.
+
+name: PR gate
+
+on:
+  pull_request:
+    branches:
+      - main
+      - staging
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate main promotion PRs
+        if: github.base_ref == 'main'
+        run: |
+          set -euo pipefail
+          if [ "${{ github.head_ref }}" != "staging" ]; then
+            echo "PRs targeting main must promote from the staging branch."
+            exit 1
+          fi
+          echo "Validated staging→main promotion PR."
+
+      - name: Validate repository layout
+        run: |
+          set -euo pipefail
+          for platform in macos ubuntu windows; do
+            test -d "$platform"
+          done
+          test -d .github/workflows
