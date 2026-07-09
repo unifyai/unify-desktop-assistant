@@ -4,6 +4,7 @@ import { PageStabilityAnalyzer } from "./stability";
 import { parseTypeContent } from "./util";
 import { ActionVisualizer, ActionVisualizerOptions } from "./visualizer";
 import logger from "@/logger";
+import { formatLastBrowserLifecycleHint } from "./browserLifecycleDiagnostics";
 import { TabManager, TabState } from "./tabs";
 import { DOMTransformer } from "./transformer";
 import { Image } from '@/memory/image';
@@ -30,6 +31,8 @@ export interface WebHarnessOptions {
     // Some LLM operate best on certain screen dims
     virtualScreenDimensions?: { width: number, height: number }
     visuals?: ActionVisualizerOptions
+    sessionId?: string
+    sessionLabel?: string
 }
 
 export interface WebHarnessEvents {
@@ -57,7 +60,10 @@ export class WebHarness { // implements StateComponent
         this.stability = new PageStabilityAnalyzer({ disableVisualStability: true });
         this.visualizer = new ActionVisualizer(this.context, this.options.visuals ?? {});
         this.transformer = new DOMTransformer();
-        this.tabs = new TabManager(context);
+        this.tabs = new TabManager(context, {
+            sessionId: options.sessionId,
+            sessionLabel: options.sessionLabel,
+        });
 
         // this.context.on('page', (page: Page) => {
         //     this.setActivePage(page);
@@ -93,7 +99,8 @@ export class WebHarness { // implements StateComponent
     async start() {
         if (this.context.pages().length > 0) {
             // If context already contains a page, set it as active
-            this.tabs.setActivePage(this.context.pages()[0]);
+            this.tabs.registerExistingPages();
+            this.tabs.setActivePage(this.context.pages()[0], "harness_start_existing_page");
         } else {
             await this.context.newPage();
             // Other logic for page tracking is automatically handled by TabManager
@@ -118,7 +125,12 @@ export class WebHarness { // implements StateComponent
             } catch (err) {
                 const error = err as Error;
                 if (error.message.includes('Target page, context or browser has been closed')) {
-                    throw new Error("Attempted to take screenshot but page, context or browser is closed");
+                    const hint = formatLastBrowserLifecycleHint();
+                    throw new Error(
+                        hint
+                            ? `Attempted to take screenshot but page, context or browser is closed. ${hint}`
+                            : "Attempted to take screenshot but page, context or browser is closed",
+                    );
                 }
                 if (attempt >= retries) {
                     throw new Error(`Unable to capture screenshot after retries, error: ${error.message}`);
@@ -257,7 +269,11 @@ export class WebHarness { // implements StateComponent
         // await this.visualizer.moveVirtualCursor(x, y);
         // await this.page.mouse.move(x, y, { steps: 20 });
         await this.visualizer.hideAll(); // hide / show pointer because no-pointer is not always consistent and visualizer can block click
-        await this.page.mouse.click(x, y);
+        await this.page.mouse.click(x, y, {
+            button: options?.button ?? "left",
+            clickCount: options?.clickCount,
+            delay: options?.delay,
+        });
         await this.visualizer.showAll();
     }
 
@@ -309,6 +325,69 @@ export class WebHarness { // implements StateComponent
         logger.debug({ phase: 'mouseup', ms: Date.now() - t0 }, "drag mouseup");
 
         await this.waitForStability();
+    }
+
+    /**
+     * Move the cursor to (x, y) along a randomized cubic-bezier path with
+     * ease-in-out timing, emitting many small mouse.move events (like a human
+     * hand) instead of a single teleport. Intended for anti-bot pacing on
+     * scripted trajectories — `click`/`scroll` still snap for speed.
+     *
+     * The start point is the last known cursor position (falling back to the
+     * viewport centre). Two control points are offset from the straight line
+     * by a random fraction of the travel distance, so the arc bows gently and
+     * never repeats. Step count and per-step delay scale with distance.
+     */
+    async moveHumanlike(
+        { x, y }: { x: number, y: number },
+        options?: { transform?: boolean, steps?: number }
+    ) {
+        const rawX = x, rawY = y;
+        if (options?.transform ?? true) ({ x, y } = await this.transformCoordinates({ x, y }));
+
+        const vp = this.page.viewportSize() ?? { width: 1024, height: 768 };
+        const start = this.getCursorPosition() ?? {
+            x: Math.round(vp.width / 2),
+            y: Math.round(vp.height / 2),
+        };
+
+        const dist = Math.hypot(x - start.x, y - start.y);
+        const steps = Math.max(
+            12,
+            Math.min(60, options?.steps ?? Math.round(dist / 8) + 12)
+        );
+
+        const jitter = () => (Math.random() - 0.5) * 2; // [-1, 1]
+        const bow = Math.min(120, dist * 0.2);
+        const c1 = {
+            x: start.x + (x - start.x) * 0.33 + jitter() * bow,
+            y: start.y + (y - start.y) * 0.33 + jitter() * bow,
+        };
+        const c2 = {
+            x: start.x + (x - start.x) * 0.66 + jitter() * bow,
+            y: start.y + (y - start.y) * 0.66 + jitter() * bow,
+        };
+
+        for (let i = 1; i <= steps; i++) {
+            const t = i / steps;
+            // ease-in-out cubic: accelerate away, decelerate into the target
+            const e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+            const m = 1 - e;
+            const px = m*m*m*start.x + 3*m*m*e*c1.x + 3*m*e*e*c2.x + e*e*e*x;
+            const py = m*m*m*start.y + 3*m*m*e*c1.y + 3*m*e*e*c2.y + e*e*e*y;
+            await this.page.mouse.move(px, py);
+            await this.page.waitForTimeout(4 + Math.random() * 12);
+        }
+
+        // Land exactly on target and keep the visual cursor in sync.
+        await Promise.all([
+            this.page.mouse.move(x, y),
+            this.visualizer.moveVirtualCursor(x, y),
+        ]);
+        logger.debug(
+            { rawX, rawY, finalX: Math.round(x), finalY: Math.round(y), steps },
+            "moveHumanlike"
+        );
     }
 
     async type({ content }: { content: string }) {

@@ -81,6 +81,10 @@ export class BrowserProvider {
             browser.on('disconnected', () => {
                 delete this.activeBrowsers[hash];
                 this.events.emit('browserDisconnected', { browser });
+                this.logger.warn(
+                    { launchOptionsHash: hash.slice(0, 8) },
+                    "[browser-lifecycle] browser_disconnected (BrowserProvider)",
+                );
             });
 
             return activeBrowser;
@@ -114,6 +118,13 @@ export class BrowserProvider {
 
         context.on('close', async () => {
             activeBrowserEntry.activeContextsCount--;
+            this.logger.warn(
+                {
+                    activeContextsCount: activeBrowserEntry.activeContextsCount,
+                    browserConnected: browser.isConnected(),
+                },
+                "[browser-lifecycle] context_closed (BrowserProvider)",
+            );
             if (activeBrowserEntry.activeContextsCount <= 0 && browser.isConnected()) {
                 await browser.close();
             }

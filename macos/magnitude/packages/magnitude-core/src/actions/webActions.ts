@@ -119,6 +119,21 @@ export const keyboardKeyAction = createAction({
     render: ({ key }) => key.includes('+') ? `⌨ hotkey ${key}` : `⌨ key '${key}'`
 });
 
+export const mouseMoveAction = createAction({
+    name: 'mouse:move',
+    description: "Move the mouse to a location with a natural, curved (bezier) motion",
+    schema: z.object({
+        x: z.number().int(),
+        y: z.number().int(),
+        steps: z.number().int().optional().describe("Override the interpolation step count"),
+    }),
+    resolver: async ({ input: { x, y, steps }, agent }) => {
+        const harness = agent.require(BrowserConnector).getHarness();
+        await harness.moveHumanlike({ x, y }, { steps });
+    },
+    render: ({ x, y }) => `➤ move (${x}, ${y})`
+});
+
 export const scrollCoordAction = createAction({
     name: 'mouse:scroll',
     description: "Hover mouse over target and scroll",
@@ -234,6 +249,7 @@ export const webActions = [
     clickCoordAction,
     mouseDoubleClickAction,
     mouseRightClickAction,
+    mouseMoveAction,
     scrollCoordAction,
     mouseDragAction,
     newTabAction,
