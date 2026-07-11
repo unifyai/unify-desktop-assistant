@@ -7,15 +7,24 @@ import { Logger } from 'pino';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import {
+    applyStealthToContext,
+    stealthContextOptions,
+    stealthEnabled,
+    STEALTH_IGNORE_DEFAULT_ARGS,
+    STEALTH_LAUNCH_ARGS,
+} from "@/web/stealth";
 
 const DEFAULT_BROWSER_OPTIONS: LaunchOptions = {
     headless: false,
     args: ["--disable-gpu", "--disable-blink-features=AutomationControlled"],
 };
 
-export type BrowserOptions = { instance: Browser; contextOptions?: BrowserContextOptions; storageStateName?: string; }
-    | { cdp: string; contextOptions?: BrowserContextOptions; storageStateName?: string; }
-    | { launchOptions?: LaunchOptions; contextOptions?: BrowserContextOptions; storageStateName?: string; }
+// `stealth` is opt-in anti-automation hardening (see web/stealth.ts). It can be
+// set per-session here or globally via the MAGNITUDE_STEALTH env var.
+export type BrowserOptions = { instance: Browser; contextOptions?: BrowserContextOptions; storageStateName?: string; stealth?: boolean; }
+    | { cdp: string; contextOptions?: BrowserContextOptions; storageStateName?: string; stealth?: boolean; }
+    | { launchOptions?: LaunchOptions; contextOptions?: BrowserContextOptions; storageStateName?: string; stealth?: boolean; }
     | { context: BrowserContext };
 
 interface ActiveBrowser {
@@ -138,6 +147,10 @@ export class BrowserProvider {
             return options.context;
         }
 
+        // Opt-in anti-automation hardening: per-session flag OR global env var.
+        const useStealth = stealthEnabled()
+            || (!!options && 'stealth' in options && (options as any).stealth === true);
+
         const dpr = process.env.DEVICE_PIXEL_RATIO ?
             parseInt(process.env.DEVICE_PIXEL_RATIO) :
             process.platform === 'darwin' ? 2 : 1;
@@ -145,6 +158,9 @@ export class BrowserProvider {
         let contextOptions: BrowserContextOptions = {
             ...DEFAULT_BROWSER_CONTEXT_OPTIONS,
             deviceScaleFactor: dpr,
+            // Stealth fills realistic defaults (locale/timezone/UA); explicit
+            // contextOptions still win.
+            ...(useStealth ? stealthContextOptions() : {}),
             ...(options && 'contextOptions' in options && options.contextOptions ? options.contextOptions : {})
         };
 
@@ -187,28 +203,42 @@ export class BrowserProvider {
             };
         }
         
+        // Merge stealth launch args + drop the automation switch (managed
+        // browsers only — cdp/instance browsers are launched externally).
+        if (useStealth && !('cdp' in options) && !('instance' in options)) {
+            const lo = ('launchOptions' in options ? options.launchOptions : undefined) ?? {};
+            const args = Array.from(new Set([...(lo.args ?? []), ...STEALTH_LAUNCH_ARGS]));
+            const ignoreDefaultArgs = Array.from(new Set([
+                ...(Array.isArray(lo.ignoreDefaultArgs) ? lo.ignoreDefaultArgs : []),
+                ...STEALTH_IGNORE_DEFAULT_ARGS,
+            ]));
+            options = { ...options, launchOptions: { ...lo, args, ignoreDefaultArgs } };
+        }
+
+        let context: BrowserContext;
         if ('cdp' in options) {
             const browser = await chromium.connectOverCDP(options.cdp);
-            if (browser.contexts().length > 0) {
-                return browser.contexts()[0];
-            } else {
-                return browser.newContext(options.contextOptions);
-            }
+            context = browser.contexts().length > 0
+                ? browser.contexts()[0]
+                : await browser.newContext(options.contextOptions);
         } else if ('instance' in options) {
             const browser = options.instance;
-            if (browser.contexts().length > 0) {
-                return browser.contexts()[0];
-            } else {
-                return browser.newContext(options.contextOptions);
-            }
+            context = browser.contexts().length > 0
+                ? browser.contexts()[0]
+                : await browser.newContext(options.contextOptions);
         } else if ('launchOptions' in options) {
             this.logger.trace('Creating context with custom launch options');
-            return await this._createAndTrackContext(options);
+            context = await this._createAndTrackContext(options);
         } else {
             // contextOptions might be passed but no instance | cdp | launchOptions
             this.logger.trace('Creating context for default browser options');
-            return await this._createAndTrackContext(options);
+            context = await this._createAndTrackContext(options);
         }
+
+        if (useStealth) {
+            await applyStealthToContext(context);
+        }
+        return context;
     }
 
     private async _applyEmulationSettings(cdpSession: CDPSession, width: number, height: number, deviceScaleFactor: number) {

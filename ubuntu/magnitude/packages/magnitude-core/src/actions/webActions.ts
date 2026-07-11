@@ -151,6 +151,23 @@ export const scrollCoordAction = createAction({
     render: ({ x, y, deltaX, deltaY }) => `↕ scroll (${deltaX}px, ${deltaY}px)`
 });
 
+export const scrollHumanlikeAction = createAction({
+    name: 'mouse:scroll_humanlike',
+    description: "Scroll over (x, y) as a sequence of eased wheel notches with human-like timing",
+    schema: z.object({
+        x: z.number().int(),
+        y: z.number().int(),
+        notches: z.array(z.number().int()).describe("Per-tick deltaY notches (sign = direction)"),
+        gapMinMs: z.number().optional().describe("Min ms between wheel notches"),
+        gapMaxMs: z.number().optional().describe("Max ms between wheel notches"),
+    }),
+    resolver: async ({ input: { x, y, notches, gapMinMs, gapMaxMs }, agent }) => {
+        const harness = agent.require(BrowserConnector).getHarness();
+        await harness.scrollHumanlike({ x, y, notches, gapMinMs, gapMaxMs });
+    },
+    render: ({ notches }) => `↕ scroll (${notches.length} notches)`
+});
+
 // Grounding agnostic
 export const switchTabAction = createAction({
     name: 'browser:tab:switch',
@@ -251,6 +268,7 @@ export const webActions = [
     mouseRightClickAction,
     mouseMoveAction,
     scrollCoordAction,
+    scrollHumanlikeAction,
     mouseDragAction,
     newTabAction,
     switchTabAction,

@@ -416,6 +416,46 @@ export class WebHarness { // implements StateComponent
         await this.waitForStability();
     }
 
+    /**
+     * Scroll by a sequence of wheel "notches" over (x, y), dispatched inside
+     * the browser with small local delays between them, so it reads like a
+     * real mouse wheel / trackpad flick instead of one snap. This is the scroll
+     * analogue of `moveHumanlike`: the fidelity comes from emitting the notches
+     * *here* (browser-local millisecond timing) rather than as many separate
+     * round-trips from the caller, and we pay `waitForStability()` **once** at
+     * the end instead of per notch.
+     *
+     * The `notches` (per-tick `deltaY`, sign = direction) are computed by the
+     * caller (unify's `kinetic_deltas`), so the ease-in-out *shape* stays owned
+     * by one place; this method only plays them back. The cursor is parked over
+     * (x, y) — a neutral gutter — so a hovered `<video>`/embed can't swallow the
+     * wheel.
+     */
+    async scrollHumanlike(
+        { x, y, notches, gapMinMs, gapMaxMs }: {
+            x: number, y: number, notches: number[],
+            gapMinMs?: number, gapMaxMs?: number,
+        },
+        options?: { transform?: boolean }
+    ) {
+        const rawX = x, rawY = y;
+        if (options?.transform ?? true) ({ x, y } = await this.transformCoordinates({ x, y }));
+        const lo = gapMinMs ?? 12;
+        const hi = Math.max(lo, gapMaxMs ?? 50);
+        logger.debug(
+            { rawX, rawY, finalX: Math.round(x), finalY: Math.round(y), ticks: notches.length },
+            "scrollHumanlike"
+        );
+        await this.visualizer.moveVirtualCursor(x, y);
+        await this.page.mouse.move(x, y);
+        for (const dy of notches) {
+            if (!dy) continue;
+            await this.page.mouse.wheel(0, dy);
+            await this.page.waitForTimeout(lo + Math.random() * (hi - lo));
+        }
+        await this.waitForStability();
+    }
+
     async switchTab({ index }: { index: number }) {
         await this.tabs.switchTab(index);
         await this.waitForStability();
