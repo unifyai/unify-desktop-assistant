@@ -245,6 +245,16 @@ const app = express();
 const wsInstance = expressWs(app);
 app.use(express.json({ limit: '100mb' }));
 
+const BROWSER_STATE_DIR = path.join(os.homedir(), '.magnitude', 'browser_states');
+const BROWSER_STATE_NAME_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+function browserStatePath(name: string): string | null {
+  if (!BROWSER_STATE_NAME_RE.test(name)) {
+    return null;
+  }
+  return path.join(BROWSER_STATE_DIR, `${name}.json`);
+}
+
 const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || '').split(',').filter(Boolean);
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -1064,11 +1074,6 @@ async function openMeetSettings(page: any): Promise<boolean> {
   }
 }
 
-const MEET_AUDIO_TAB_TASK =
-  `You are in the Google Meet Settings dialog.\n` +
-  `Click the "Audio" tab on the left side of the dialog.\n` +
-  `Do NOT close the dialog.`;
-
 const MEET_SELECT_MIC_TASK = (micLabel: string) =>
   `You are in the Google Meet Settings dialog, on the Audio tab.\n` +
   `Click the Microphone dropdown and select the option containing "${micLabel}".\n` +
@@ -1096,13 +1101,10 @@ async function googleMeetJoinFlow(agent: BrowserAgent, displayName: string): Pro
   console.log('[googlemeet/join] Phase 1b: opening Settings for audio device selection...');
   const settingsOpened = await openMeetSettings(page);
   if (settingsOpened) {
-    console.log('[googlemeet/join] Phase 1b-i: navigating to Audio tab...');
-    await runMagnitudeLoop(agent, MEET_AUDIO_TAB_TASK, MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/audio-tab');
-
-    console.log('[googlemeet/join] Phase 1b-ii: selecting microphone...');
+    console.log('[googlemeet/join] Phase 1b-i: selecting microphone...');
     await runMagnitudeLoop(agent, MEET_SELECT_MIC_TASK('agent_sink'), MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/select-mic');
 
-    console.log('[googlemeet/join] Phase 1b-iii: selecting speaker + closing...');
+    console.log('[googlemeet/join] Phase 1b-ii: selecting speaker + closing...');
     await runMagnitudeLoop(agent, MEET_SELECT_SPEAKER_TASK('meet_sink'), MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/select-speaker');
   } else {
     console.log('[googlemeet/join] Phase 1b: Could not open Settings — using default devices');
@@ -1230,6 +1232,90 @@ async function googleMeetPollState(sessionId: string): Promise<void> {
 }
 
 // --- API Endpoints ---
+// Named browser-state transport is intentionally narrow: callers can only
+// transfer a validated state name, never address arbitrary files or execute
+// commands on the VM. The global Bearer middleware above protects all routes.
+app.get('/browser-states/:name', (req: Request, res: Response) => {
+  const stateName = Array.isArray(req.params.name) ? '' : req.params.name;
+  const statePath = browserStatePath(stateName);
+  if (!statePath) {
+    return res.status(400).json({ error: 'bad_request', message: 'Invalid browser state name' });
+  }
+  if (!fs.existsSync(statePath)) {
+    return res.status(404).json({ error: 'not_found', message: 'Browser state does not exist' });
+  }
+  try {
+    return res.json({ state: fs.readFileSync(statePath, 'utf8') });
+  } catch (err) {
+    console.error(`[browser-states] read failed for ${stateName}:`, err);
+    return res.status(500).json({ error: 'read_failed', message: 'Could not read browser state' });
+  }
+});
+
+app.head('/browser-states/:name', (req: Request, res: Response) => {
+  const stateName = Array.isArray(req.params.name) ? '' : req.params.name;
+  const statePath = browserStatePath(stateName);
+  if (!statePath) {
+    return res.sendStatus(400);
+  }
+  return res.sendStatus(fs.existsSync(statePath) ? 200 : 404);
+});
+
+app.put('/browser-states/:name', (req: Request, res: Response) => {
+  const stateName = Array.isArray(req.params.name) ? '' : req.params.name;
+  const statePath = browserStatePath(stateName);
+  const state = req.body?.state;
+  if (!statePath || typeof state !== 'string') {
+    return res.status(400).json({
+      error: 'bad_request',
+      message: 'A valid browser state name and string state are required',
+    });
+  }
+  try {
+    const parsed = JSON.parse(state);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('state must be a JSON object');
+    }
+  } catch {
+    return res.status(400).json({
+      error: 'bad_request',
+      message: 'Browser state must be a JSON object',
+    });
+  }
+  try {
+    fs.mkdirSync(BROWSER_STATE_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(statePath, state, { encoding: 'utf8', mode: 0o600 });
+    return res.status(204).end();
+  } catch (err) {
+    console.error(`[browser-states] write failed for ${stateName}:`, err);
+    return res.status(500).json({ error: 'write_failed', message: 'Could not write browser state' });
+  }
+});
+
+app.post('/browser-states/:name/save', async (req: Request, res: Response) => {
+  const stateName = Array.isArray(req.params.name) ? '' : req.params.name;
+  const statePath = browserStatePath(stateName);
+  const sessionId = req.body?.sessionId;
+  if (!statePath || typeof sessionId !== 'string') {
+    return res.status(400).json({
+      error: 'bad_request',
+      message: 'A valid browser state name and sessionId are required',
+    });
+  }
+  const session = activeSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'session_not_found', message: 'Browser session does not exist' });
+  }
+  try {
+    fs.mkdirSync(BROWSER_STATE_DIR, { recursive: true, mode: 0o700 });
+    await session.agent.context.storageState({ path: statePath });
+    return res.status(204).end();
+  } catch (err) {
+    console.error(`[browser-states] save failed for ${stateName}:`, err);
+    return res.status(500).json({ error: 'save_failed', message: 'Could not save browser state' });
+  }
+});
+
 app.post('/start', async (req: Request, res: Response) => {
   // ``storageStateName`` is optional. When set, the magnitude
   // BrowserProvider loads ~/.magnitude/browser_states/<safeName>.json
