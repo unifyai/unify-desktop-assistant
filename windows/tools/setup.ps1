@@ -2541,14 +2541,18 @@ if ($Reconfigure) {
 
     # Settings only changes the API key - preserve the URLs baked at install,
     # otherwise Setup-AgentServiceEnv would reset them to the script defaults
-    # and break a staging/custom install.
+    # and break a staging/custom install. An explicit -OrchestraUrl/-UnityCommsUrl
+    # on this invocation always wins over both the local-stack auto-detect and
+    # the .env fallback below - otherwise a stale 127.0.0.1/SELF_HOST=1 .env
+    # from a prior run would keep winning on every later -Reconfigure regardless
+    # of the flags passed in.
     Apply-ComposeSelfHostMode
     if (-not (Test-ComposeSelfHostPresent)) {
         $existingOrch = Get-EnvValue -Key "ORCHESTRA_URL"
         $existingComms = Get-EnvValue -Key "UNITY_COMMS_URL"
-        if ($existingOrch) { $OrchestraUrl = $existingOrch }
-        if ($existingComms) { $UnityCommsUrl = $existingComms }
-        if ((Get-EnvValue -Key 'SELF_HOST') -eq '1') {
+        if (-not $script:OrchestraUrlExplicit -and $existingOrch) { $OrchestraUrl = $existingOrch }
+        if (-not $script:UnityCommsUrlExplicit -and $existingComms) { $UnityCommsUrl = $existingComms }
+        if ((Get-EnvValue -Key 'SELF_HOST') -eq '1' -and -not $script:OrchestraUrlExplicit -and -not $script:UnityCommsUrlExplicit) {
             $script:SelfHostMode = $true
             if (-not $existingOrch) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
             if (-not $existingComms) { $UnityCommsUrl = $script:ComposeSelfHostCommsUrl }

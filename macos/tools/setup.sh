@@ -2562,13 +2562,21 @@ if $RECONFIGURE; then
 
     # Settings changes the API key. For cloud installs, preserve URLs baked at
     # install so staging/custom Orchestra/Comms endpoints are not overwritten.
+    # An explicit --orchestra-url/--unity-comms-url on this invocation always
+    # wins over both the local-stack auto-detect and the .env fallback below —
+    # otherwise a stale 127.0.0.1/SELF_HOST=1 .env from a prior run would keep
+    # winning on every later --reconfigure regardless of the flags passed in.
     apply_compose_self_host_mode
     if ! compose_self_host_present; then
         existing_orch="$(get_env_value "ORCHESTRA_URL")"
         existing_comms="$(get_env_value "UNITY_COMMS_URL")"
-        [[ -n "$existing_orch" ]]  && ORCHESTRA_URL="$existing_orch"
-        [[ -n "$existing_comms" ]] && UNITY_COMMS_URL="$existing_comms"
-        if [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
+        if ! $ORCHESTRA_URL_EXPLICIT && [[ -n "$existing_orch" ]]; then
+            ORCHESTRA_URL="$existing_orch"
+        fi
+        if ! $UNITY_COMMS_URL_EXPLICIT && [[ -n "$existing_comms" ]]; then
+            UNITY_COMMS_URL="$existing_comms"
+        fi
+        if [[ "$(get_env_value "SELF_HOST")" == "1" ]] && ! $ORCHESTRA_URL_EXPLICIT && ! $UNITY_COMMS_URL_EXPLICIT; then
             SELF_HOST_MODE=true
             ORCHESTRA_URL="${ORCHESTRA_URL:-http://127.0.0.1:8000/v0}"
             UNITY_COMMS_URL="${UNITY_COMMS_URL:-http://127.0.0.1:8001}"
