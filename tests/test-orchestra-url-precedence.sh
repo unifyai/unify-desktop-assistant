@@ -136,11 +136,166 @@ EOF
     " | tail -1)
     check "$platform: no-flag reconfigure still auto-applies a legit self-host .env" "$out" "http://127.0.0.1:8000/v0|true"
 
+    echo "== $platform: agent_service_port() PORT precedence =="
+
+    # A stale PORT=13000 left over from a prior self-host run must not
+    # outrank the mode actually in effect (SELF_HOST=0 -> cloud -> 3000).
+    cat > "$envdir/.env" <<EOF
+PORT=13000
+SELF_HOST=0
+EOF
+    out=$(HOME="$home_dir" bash -c "source '$lib'; $source_env_shim AGENT_SERVICE_DIR='$envdir'; agent_service_port" | tail -1)
+    check "$platform: stale PORT=13000 does not outrank SELF_HOST=0" "$out" "3000"
+
+    # And the reverse: a stale PORT=3000 must not stop a legit self-host .env
+    # from resolving to 13000.
+    cat > "$envdir/.env" <<EOF
+PORT=3000
+SELF_HOST=1
+EOF
+    out=$(HOME="$home_dir" bash -c "source '$lib'; $source_env_shim AGENT_SERVICE_DIR='$envdir'; agent_service_port" | tail -1)
+    check "$platform: stale PORT=3000 does not outrank SELF_HOST=1" "$out" "13000"
+
     rm -rf "$tmpdir"
 }
 
 test_bash_platform macos
 test_bash_platform ubuntu
+
+# ---------------------------------------------------------------------------
+# Installer layer (postinstall/postinst): a build-stamped environment.conf
+# must win over a stray ~/.unity compose file, the same principle as
+# apply_compose_self_host_mode above. windows/installer/setup.iss has no
+# available interpreter to test here (Inno Setup Pascal script, Windows-only
+# ISCC compiler) - it was verified by manual review + a begin/end balance
+# check instead.
+# ---------------------------------------------------------------------------
+test_macos_postinstall() {
+    local script="$REPO_ROOT/macos/installer/scripts/postinstall"
+    local tmpdir app_dir target_home snippet out rc
+
+    tmpdir="$(mktemp -d)"
+    app_dir="$tmpdir/app"
+    target_home="$tmpdir/home"
+    mkdir -p "$app_dir" "$target_home"
+
+    # The environment.conf-load + compose-detect + fail-loud block, without
+    # the TARGET_USER resolution or the rest of the install flow.
+    snippet="$tmpdir/url-resolution.sh"
+    awk '/^ENV_CONF="\$APP_DIR\/environment.conf"$/{p=1} p{print; if (/^fi$/) { n++; if (n==3) exit } }' "$script" > "$snippet"
+
+    echo "== macos postinstall: stamped-vs-compose precedence =="
+
+    cat > "$app_dir/environment.conf" <<EOF
+ORCHESTRA_URL=https://staging.example/v0
+UNITY_COMMS_URL=https://staging-comms.example
+EOF
+    mkdir -p "$target_home/.unity"
+    : > "$target_home/.unity/docker-compose.yml"
+    out=$(bash -c "
+        APP_DIR='$app_dir'; TARGET_HOME='$target_home'
+        SELF_HOST_AGENT_PORT=13000
+        COMPOSE_SELF_HOST_ORCHESTRA_URL='http://127.0.0.1:8000/v0'
+        COMPOSE_SELF_HOST_COMMS_URL='http://127.0.0.1:8001'
+        source '$snippet'
+        echo \"\$ORCHESTRA_URL|\$COMPOSE_SELF_HOST\"
+    " | tail -1)
+    check "macos postinstall: stamped build ignores a stray compose file" "$out" "https://staging.example/v0|0"
+
+    rm -f "$app_dir/environment.conf"
+    out=$(bash -c "
+        APP_DIR='$app_dir'; TARGET_HOME='$target_home'
+        SELF_HOST_AGENT_PORT=13000
+        COMPOSE_SELF_HOST_ORCHESTRA_URL='http://127.0.0.1:8000/v0'
+        COMPOSE_SELF_HOST_COMMS_URL='http://127.0.0.1:8001'
+        source '$snippet'
+        echo \"\$ORCHESTRA_URL|\$COMPOSE_SELF_HOST\"
+    " | tail -1)
+    check "macos postinstall: unstamped build still auto-detects local compose" "$out" "http://127.0.0.1:8000/v0|1"
+
+    rm -rf "$target_home/.unity"
+    set +e
+    bash -c "
+        APP_DIR='$app_dir'; TARGET_HOME='$target_home'
+        SELF_HOST_AGENT_PORT=13000
+        COMPOSE_SELF_HOST_ORCHESTRA_URL='http://127.0.0.1:8000/v0'
+        COMPOSE_SELF_HOST_COMMS_URL='http://127.0.0.1:8001'
+        source '$snippet'
+    " >/dev/null 2>&1
+    rc=$?
+    set -e
+    check "macos postinstall: fails loudly with no stamped URL and no compose file" "$rc" "1"
+
+    rm -rf "$tmpdir"
+}
+
+test_ubuntu_postinst() {
+    local script="$REPO_ROOT/ubuntu/installer/DEBIAN/postinst"
+    local tmpdir app_dir target_home block_a block_b out rc
+
+    tmpdir="$(mktemp -d)"
+    app_dir="$tmpdir/app"
+    target_home="$tmpdir/home"
+    mkdir -p "$app_dir" "$target_home"
+
+    # Same block as macos, but split across two non-contiguous ranges in
+    # this script (the .env-preservation code sits between them, and isn't
+    # needed to exercise the precedence logic itself).
+    block_a="$tmpdir/block-a.sh"
+    awk '/^        ENV_CONF="\$APP_DIR\/environment.conf"$/{p=1} p{print; if (/^        fi$/) { n++; if (n==2) exit } }' "$script" > "$block_a"
+    block_b="$tmpdir/block-b.sh"
+    awk '/^        if \[ "\$COMPOSE_SELF_HOST" = "1" \]; then$/{p=1} p{print; if (/^        fi$/) exit}' "$script" > "$block_b"
+
+    echo "== ubuntu postinst: stamped-vs-compose precedence =="
+
+    cat > "$app_dir/environment.conf" <<EOF
+ORCHESTRA_URL=https://staging.example/v0
+UNITY_COMMS_URL=https://staging-comms.example
+EOF
+    mkdir -p "$target_home/.unity"
+    : > "$target_home/.unity/docker-compose.yml"
+    out=$(bash -c "
+        APP_DIR='$app_dir'; TARGET_HOME='$target_home'
+        SELF_HOST_AGENT_PORT=13000
+        COMPOSE_SELF_HOST_ORCHESTRA_URL='http://127.0.0.1:8000/v0'
+        COMPOSE_SELF_HOST_COMMS_URL='http://127.0.0.1:8001'
+        source '$block_a'
+        source '$block_b'
+        echo \"\$ORCHESTRA_URL|\$COMPOSE_SELF_HOST\"
+    " | tail -1)
+    check "ubuntu postinst: stamped build ignores a stray compose file" "$out" "https://staging.example/v0|0"
+
+    rm -f "$app_dir/environment.conf"
+    out=$(bash -c "
+        APP_DIR='$app_dir'; TARGET_HOME='$target_home'
+        SELF_HOST_AGENT_PORT=13000
+        COMPOSE_SELF_HOST_ORCHESTRA_URL='http://127.0.0.1:8000/v0'
+        COMPOSE_SELF_HOST_COMMS_URL='http://127.0.0.1:8001'
+        source '$block_a'
+        source '$block_b'
+        echo \"\$ORCHESTRA_URL|\$COMPOSE_SELF_HOST\"
+    " | tail -1)
+    check "ubuntu postinst: unstamped build still auto-detects local compose" "$out" "http://127.0.0.1:8000/v0|1"
+
+    rm -rf "$target_home/.unity"
+    set +e
+    bash -c "
+        APP_DIR='$app_dir'; TARGET_HOME='$target_home'
+        SELF_HOST_AGENT_PORT=13000
+        COMPOSE_SELF_HOST_ORCHESTRA_URL='http://127.0.0.1:8000/v0'
+        COMPOSE_SELF_HOST_COMMS_URL='http://127.0.0.1:8001'
+        source '$block_a'
+        source '$block_b'
+    " >/dev/null 2>&1
+    rc=$?
+    set -e
+    check "ubuntu postinst: fails loudly with no stamped URL and no compose file" "$rc" "1"
+
+    rm -rf "$tmpdir"
+}
+
+test_macos_postinstall
+test_ubuntu_postinst
 
 # ---------------------------------------------------------------------------
 # Windows (PowerShell) — skipped if pwsh isn't installed
@@ -210,6 +365,22 @@ EOF
         Write-Output \"\$OrchestraUrl|\$(\$script:SelfHostMode)\"
     " | tail -1)
     check "windows: no-param reconfigure still auto-applies a legit self-host .env" "$out" "http://127.0.0.1:8000/v0|True"
+
+    echo "== windows: Get-AgentServicePort PORT precedence =="
+
+    cat > "$envdir/.env" <<EOF
+PORT=13000
+SELF_HOST=0
+EOF
+    out=$(USERPROFILE="$home_dir" pwsh -NoProfile -Command ". '$lib' -UnifyKey 'x'; \$script:AgentServiceDir = '$envdir'; Write-Output (Get-AgentServicePort)" | tail -1)
+    check "windows: stale PORT=13000 does not outrank SELF_HOST=0" "$out" "3000"
+
+    cat > "$envdir/.env" <<EOF
+PORT=3000
+SELF_HOST=1
+EOF
+    out=$(USERPROFILE="$home_dir" pwsh -NoProfile -Command ". '$lib' -UnifyKey 'x'; \$script:AgentServiceDir = '$envdir'; Write-Output (Get-AgentServicePort)" | tail -1)
+    check "windows: stale PORT=3000 does not outrank SELF_HOST=1" "$out" "13000"
 
     rm -rf "$tmpdir"
 else
