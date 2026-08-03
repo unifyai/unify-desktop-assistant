@@ -134,18 +134,16 @@ var
   UpgradeNote: TNewStaticText;
   ConfigPagePrefilled: Boolean;
 
-function TestComposeSelfHostPresent: Boolean;
-begin
-  Result := FileExists(ExpandConstant('{%USERPROFILE}\.unity\docker-compose.yml'));
-end;
-
+// Every installer build stamps {#OrchestraUrl}/{#CommsUrl} at compile time
+// (main or staging - see the #if Environment block above); there is no
+// unstamped build for this installer. So the stamped constants always win
+// here, rather than being overridden by a stray ~/.unity compose file, which
+// would otherwise silently register a staging/production install against
+// localhost. Self-host remains reachable by running setup.ps1 -SelfHost
+// directly after install.
 function GetSetupRunParams(Param: String): String;
 begin
-  Result := '-UnifyKey "' + UnifyKeyEdit.Text + '" -Force';
-  if TestComposeSelfHostPresent then
-    Result := Result + ' -SelfHost -LinkCoordinator'
-  else
-    Result := Result + ' -OrchestraUrl "{#OrchestraUrl}" -UnityCommsUrl "{#CommsUrl}"';
+  Result := '-UnifyKey "' + UnifyKeyEdit.Text + '" -Force -OrchestraUrl "{#OrchestraUrl}" -UnityCommsUrl "{#CommsUrl}"';
 end;
 
 // =========================================================================
@@ -336,20 +334,12 @@ begin
     ExistingTunnelToken := ReadEnvValue(EnvFile, 'TUNNEL_TOKEN');
     ExistingDeviceId := ReadEnvValue(EnvFile, 'DEVICE_ID');
 
-    if TestComposeSelfHostPresent then
-    begin
-      AgentPort := '13000';
-      OrchestraUrl := 'http://127.0.0.1:8000/v0';
-      CommsUrl := 'http://127.0.0.1:8001';
-      SelfHostFlag := '1';
-    end
-    else
-    begin
-      AgentPort := '3000';
-      OrchestraUrl := '{#OrchestraUrl}';
-      CommsUrl := '{#CommsUrl}';
-      SelfHostFlag := '0';
-    end;
+    // Stamped constants always win over a stray ~/.unity compose file - see
+    // GetSetupRunParams above.
+    AgentPort := '3000';
+    OrchestraUrl := '{#OrchestraUrl}';
+    CommsUrl := '{#CommsUrl}';
+    SelfHostFlag := '0';
 
     // Always write .env (fresh install or upgrade)
     EnvContent := 'PORT=' + AgentPort + Chr(13) + Chr(10) +

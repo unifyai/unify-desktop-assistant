@@ -35,24 +35,35 @@ fi
 TARGET_HOME="$(eval echo "~$TARGET_USER")"
 TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || echo "")"
 
-# Load baked URLs from environment.conf (cloud SaaS defaults)
+# Load baked URLs from environment.conf. Its presence means a stamped build
+# (main or staging); its absence means an unstamped/dev build. A stamped
+# build's baked URL always wins over a stray ~/.unity compose file below —
+# otherwise a staging/production install would silently register against
+# localhost. Local-stack auto-detect only applies to an unstamped build.
 ENV_CONF="$APP_DIR/environment.conf"
+STAMPED=0
 if [ -f "$ENV_CONF" ]; then
+    STAMPED=1
     . "$ENV_CONF"
 fi
-ORCHESTRA_URL="${ORCHESTRA_URL:-https://api.unify.ai/v0}"
-UNITY_COMMS_URL="${UNITY_COMMS_URL:-https://service.a.run.app}"
 
 COMPOSE_SELF_HOST=0
 AGENT_PORT=3000
 SELF_HOST_FLAG=0
-if [ -f "$TARGET_HOME/.unity/docker-compose.yml" ]; then
+if [ "$STAMPED" != "1" ] && [ -f "$TARGET_HOME/.unity/docker-compose.yml" ]; then
     COMPOSE_SELF_HOST=1
     AGENT_PORT=$SELF_HOST_AGENT_PORT
     SELF_HOST_FLAG=1
     ORCHESTRA_URL="$COMPOSE_SELF_HOST_ORCHESTRA_URL"
     UNITY_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
     echo "[postinstall] Unity compose self-host detected at $TARGET_HOME/.unity — agent port ${AGENT_PORT}"
+fi
+
+# Fail loudly rather than silently registering against production when no
+# backend URL resolved (a stamped build with a missing/corrupt environment.conf).
+if [ "$COMPOSE_SELF_HOST" != "1" ] && { [ -z "${ORCHESTRA_URL:-}" ] || [ -z "${UNITY_COMMS_URL:-}" ]; }; then
+    echo "[postinstall] ERROR: No backend URL configured (missing or empty $ENV_CONF)." >&2
+    exit 1
 fi
 
 chmod +x "$SETUP_SCRIPT"
