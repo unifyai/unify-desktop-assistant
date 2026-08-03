@@ -1562,10 +1562,12 @@ function Explain-OrchestraConnectFailure {
 }
 
 function Get-AgentServicePort {
-    $port = Get-EnvValue -Key 'PORT'
-    if ($port -match '^\d+$') {
-        return [int]$port
-    }
+    # Derive from the mode actually in effect ($script:SelfHostMode for this
+    # run, falling back to the persisted .env SELF_HOST flag for -Start/-Stop).
+    # Do not read .env's PORT directly - it's a stale copy of whatever mode
+    # was in effect on a PREVIOUS run, so if the mode is later corrected
+    # (e.g. self-host -> cloud) a leftover PORT=13000 would keep outranking
+    # the mode actually in effect and desync from Register-Tunnel's port.
     if ($script:SelfHostMode -or (Get-EnvValue -Key 'SELF_HOST') -eq '1') {
         return $script:SelfHostAgentPort
     }

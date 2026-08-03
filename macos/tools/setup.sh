@@ -1872,15 +1872,12 @@ register_desktop() {
 }
 
 agent_service_port() {
-    local env_file="$AGENT_SERVICE_DIR/.env"
-    if [[ -f "$env_file" ]]; then
-        local port
-        port="$(grep -E '^PORT=' "$env_file" 2>/dev/null | sed 's/^PORT=//' || true)"
-        if [[ -n "$port" ]]; then
-            echo "$port"
-            return 0
-        fi
-    fi
+    # Derive from the mode actually in effect (SELF_HOST_MODE for this run,
+    # falling back to the persisted .env SELF_HOST flag for --start/--stop).
+    # Do not read .env's PORT directly - it's a stale copy of whatever mode
+    # was in effect on a PREVIOUS run, so if the mode is later corrected
+    # (e.g. self-host -> cloud) a leftover PORT=13000 would keep outranking
+    # the mode actually in effect and desync from register_tunnel's port.
     if $SELF_HOST_MODE || [[ "$(get_env_value "SELF_HOST")" == "1" ]]; then
         echo "$SELF_HOST_AGENT_PORT"
     else
