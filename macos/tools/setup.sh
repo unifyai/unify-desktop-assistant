@@ -46,8 +46,14 @@ KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/R
 
 # Default configuration
 UNIFY_KEY=""
-ORCHESTRA_URL="https://api.unify.ai/v0"
-UNITY_COMMS_URL="https://service.a.run.app"
+# No production default: an unspecified backend URL must fail loudly rather
+# than silently registering a device against production. The packaged
+# installer always passes these explicitly; --reconfigure/--start read them
+# back from .env.
+ORCHESTRA_URL=""
+UNITY_COMMS_URL=""
+ORCHESTRA_URL_EXPLICIT=false
+UNITY_COMMS_URL_EXPLICIT=false
 DO_START=false
 DO_STOP=false
 DO_UNINSTALL=false
@@ -76,7 +82,7 @@ Usage: $(basename "$0") [OPTIONS]
 
 Options:
   --unify-key KEY       Unify API key (required for install)
-  --orchestra-url URL   Orchestra URL (default: https://api.unify.ai/v0)
+  --orchestra-url URL   Orchestra URL (required unless --self-host or a packaged build)
   --unity-comms-url URL Unity Comms URL
   --start               Start services only (no install/config, no root needed)
   --stop                Stop all services
@@ -108,9 +114,9 @@ while [[ $# -gt 0 ]]; do
         --unify-key)
             UNIFY_KEY="$2"; shift 2 ;;
         --orchestra-url)
-            ORCHESTRA_URL="$2"; shift 2 ;;
+            ORCHESTRA_URL="$2"; ORCHESTRA_URL_EXPLICIT=true; shift 2 ;;
         --unity-comms-url)
-            UNITY_COMMS_URL="$2"; shift 2 ;;
+            UNITY_COMMS_URL="$2"; UNITY_COMMS_URL_EXPLICIT=true; shift 2 ;;
         --start)
             DO_START=true; shift ;;
         --stop)
@@ -401,6 +407,12 @@ compose_self_host_present() {
 
 apply_compose_self_host_mode() {
     if ! compose_self_host_present; then
+        return 0
+    fi
+    # An explicit --orchestra-url/--unity-comms-url always wins over local-stack
+    # auto-detect — otherwise a stamped staging/production build with a stray
+    # ~/.unity compose file would silently register against localhost.
+    if $ORCHESTRA_URL_EXPLICIT || $UNITY_COMMS_URL_EXPLICIT; then
         return 0
     fi
     SELF_HOST_MODE=true
@@ -2710,6 +2722,16 @@ if $SELF_HOST_MODE; then
     UNITY_COMMS_URL="${UNITY_COMMS_URL:-http://127.0.0.1:8001}"
     LINK_COORDINATOR=true
 fi
+
+# Fail loudly (and early, before the long install) rather than silently
+# writing a production default into .env.
+if ! $SELF_HOST_MODE && [[ -z "$ORCHESTRA_URL" || -z "$UNITY_COMMS_URL" ]]; then
+    echo "" >&2
+    echo "ERROR: No backend URL configured (ORCHESTRA_URL / UNITY_COMMS_URL)." >&2
+    echo "  Pass --orchestra-url and --unity-comms-url, or install via the packaged installer." >&2
+    exit 1
+fi
+
 setup_agent_service_env
 setup_autostart
 

@@ -51,6 +51,12 @@ $script:SelfHostAgentPort = 13000
 $script:ComposeSelfHostOrchestraUrl = 'http://127.0.0.1:8000/v0'
 $script:ComposeSelfHostCommsUrl = 'http://127.0.0.1:8001'
 
+# Whether -OrchestraUrl/-UnityCommsUrl were passed explicitly on this
+# invocation, as opposed to being empty defaults. An explicit flag always
+# wins over local-stack auto-detect and the .env fallback further below.
+$script:OrchestraUrlExplicit = $PSBoundParameters.ContainsKey('OrchestraUrl')
+$script:UnityCommsUrlExplicit = $PSBoundParameters.ContainsKey('UnityCommsUrl')
+
 # Per-build backend URL defaults. build.ps1 stamps these for the target
 # environment (-Staging/main) at package time. In-repo they stay as the
 # @@...@@ sentinels, which we neutralize to '' so a dev run can't silently
@@ -1516,6 +1522,12 @@ function Test-ComposeSelfHostPresent {
 
 function Apply-ComposeSelfHostMode {
     if (-not (Test-ComposeSelfHostPresent)) {
+        return
+    }
+    # An explicit -OrchestraUrl/-UnityCommsUrl always wins over local-stack
+    # auto-detect - otherwise a stamped staging/production build with a stray
+    # ~/.unity compose file would silently register against localhost.
+    if ($script:OrchestraUrlExplicit -or $script:UnityCommsUrlExplicit) {
         return
     }
     $script:SelfHostMode = $true
