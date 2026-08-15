@@ -11,6 +11,7 @@ import { TabState } from '@/web/tabs';
 import { Observation } from "@/memory/observation";
 import { Image } from "@/memory/image";
 import { ActionVisualizerOptions } from "@/web/visualizer";
+import { BrowserLifecycleObserver } from "@/web/browserLifecycleDiagnostics";
 
 // export type BrowserOptions = ({ instance: Browser } | { launchOptions?: LaunchOptions }) & {
 //     contextOptions?: BrowserContextOptions;
@@ -36,6 +37,8 @@ export interface BrowserConnectorOptions {
     minScreenshots?: number,
     visuals?: ActionVisualizerOptions,
     urlMappings?: Record<string, string>
+    sessionId?: string
+    sessionLabel?: string
 }
 
 export interface BrowserConnectorStateData {
@@ -118,9 +121,17 @@ export class BrowserConnector implements AgentConnector {
         this.harness = new WebHarness(this.context, {
             //fallbackViewportDimensions: contextOptions?.viewport ?? { width: 1024, height: 768 },
             virtualScreenDimensions: this.options.virtualScreenDimensions,
-            visuals: this.options.visuals
+            visuals: this.options.visuals,
+            sessionId: this.options.sessionId,
+            sessionLabel: this.options.sessionLabel,
         });
         await this.harness.start();
+
+        new BrowserLifecycleObserver(this.context, {
+            sessionId: this.options.sessionId,
+            sessionLabel: this.options.sessionLabel,
+            getActivePage: () => this.harness.page,
+        }).attach();
         this.logger.info("WebHarness started.");
 
         if (this.options.url) {

@@ -119,6 +119,21 @@ export const keyboardKeyAction = createAction({
     render: ({ key }) => key.includes('+') ? `⌨ hotkey ${key}` : `⌨ key '${key}'`
 });
 
+export const mouseMoveAction = createAction({
+    name: 'mouse:move',
+    description: "Move the mouse to a location with a natural, curved (bezier) motion",
+    schema: z.object({
+        x: z.number().int(),
+        y: z.number().int(),
+        steps: z.number().int().optional().describe("Override the interpolation step count"),
+    }),
+    resolver: async ({ input: { x, y, steps }, agent }) => {
+        const harness = agent.require(BrowserConnector).getHarness();
+        await harness.moveHumanlike({ x, y }, { steps });
+    },
+    render: ({ x, y }) => `➤ move (${x}, ${y})`
+});
+
 export const scrollCoordAction = createAction({
     name: 'mouse:scroll',
     description: "Hover mouse over target and scroll",
@@ -134,6 +149,23 @@ export const scrollCoordAction = createAction({
         await harness.scroll({ x, y, deltaX, deltaY });
     },
     render: ({ x, y, deltaX, deltaY }) => `↕ scroll (${deltaX}px, ${deltaY}px)`
+});
+
+export const scrollHumanlikeAction = createAction({
+    name: 'mouse:scroll_humanlike',
+    description: "Scroll over (x, y) as a sequence of eased wheel notches with human-like timing",
+    schema: z.object({
+        x: z.number().int(),
+        y: z.number().int(),
+        notches: z.array(z.number().int()).describe("Per-tick deltaY notches (sign = direction)"),
+        gapMinMs: z.number().optional().describe("Min ms between wheel notches"),
+        gapMaxMs: z.number().optional().describe("Max ms between wheel notches"),
+    }),
+    resolver: async ({ input: { x, y, notches, gapMinMs, gapMaxMs }, agent }) => {
+        const harness = agent.require(BrowserConnector).getHarness();
+        await harness.scrollHumanlike({ x, y, notches, gapMinMs, gapMaxMs });
+    },
+    render: ({ notches }) => `↕ scroll (${notches.length} notches)`
 });
 
 // Grounding agnostic
@@ -234,7 +266,9 @@ export const webActions = [
     clickCoordAction,
     mouseDoubleClickAction,
     mouseRightClickAction,
+    mouseMoveAction,
     scrollCoordAction,
+    scrollHumanlikeAction,
     mouseDragAction,
     newTabAction,
     switchTabAction,

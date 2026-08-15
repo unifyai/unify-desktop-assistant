@@ -4,10 +4,11 @@ import http from 'http';
 import expressWs from 'express-ws';
 import WebSocket from 'ws';
 import util from 'util';
-import { startBrowserAgent, BrowserAgent, BrowserConnector, AgentError, BrowserOptions, AgentMemory, Observation } from 'magnitude-core';
+import { startBrowserAgent, BrowserAgent, BrowserConnector, AgentError, BrowserOptions, AgentMemory, Observation, Image, formatLastBrowserLifecycleHint } from 'magnitude-core';
 import { z, ZodTypeAny, ZodAny, ZodType } from 'zod';
 import { partitionHtml, serializeToMarkdown, PartitionOptions, MarkdownSerializerOptions } from 'magnitude-extract';
 import dotenv from 'dotenv';
+import { EgressPolicyError, parseEgressPolicy, resolveEgress, type ResolvedEgress } from './egressPolicy';
 dotenv.config();
 import os from 'os';
 import path from 'path';
@@ -15,18 +16,27 @@ import fs from 'fs';
 import net from 'net';
 import { randomUUID } from 'crypto';
 import { ChildProcess, spawn, execSync } from 'child_process';
+import { registerExec, signalExec } from './execControl';
+import { isExecDisabled } from './execGuard';
 import multer from 'multer';
 import { jsonSchemaToZod } from './jsonSchemaToZod';
-import { getLlmConfig } from './llmConfig';
+import { getLlmConfig, resolveAgentServiceModel } from './llmConfig';
+import {
+  computeNativeObservationScale,
+  NativeObservationScale,
+  ObservationScalingPolicy,
+  resolveObservationScalingPolicy,
+  scaleObservationCoordsToDisplay,
+} from './observationScaling';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const DESKTOP_NOVNC_HOST = process.env.DESKTOP_NOVNC_HOST || '127.0.0.1';
 const DESKTOP_NOVNC_PORT = Number(process.env.DESKTOP_NOVNC_PORT || 6080);
 
-/** VNC password matches setup.sh (first 8 chars of UNIFY_KEY). */
+/** VNC password is the per-binding desktop secret; falls back to setup.sh's convention (first 8 chars of UNIFY_KEY). */
 function buildDesktopNoVncUrl(): string {
-  const password = (process.env.UNIFY_KEY || '').slice(0, 8);
+  const password = process.env.VNC_PASSWORD || (process.env.UNIFY_KEY || '').slice(0, 8);
   const params = new URLSearchParams({
     password,
     autoconnect: '1',
@@ -185,18 +195,30 @@ function getShellConfig(shellMode: ShellMode): string | boolean {
   return 'powershell.exe';
 }
 
-function executeCommand(command: string, cwd: string, timeout: number, shellMode: ShellMode = 'powershell'): Promise<ExecResult> {
+function executeCommand(
+  command: string,
+  cwd: string,
+  timeout: number,
+  shellMode: ShellMode = 'powershell',
+  onSpawn?: (proc: ChildProcess) => void,
+): Promise<ExecResult> {
   return new Promise((resolve) => {
     const startTime = Date.now();
     let stdout = '';
     let stderr = '';
     let killed = false;
 
+    // Detached on POSIX so the shell leads its own process group: steering
+    // signals (see execControl) and the post-exit sweep reach the whole
+    // pipeline, not just the shell.
+    const detached = process.platform !== 'win32';
     const proc = spawn(command, [], {
       shell: getShellConfig(shellMode),
       cwd,
       timeout,
+      detached,
     });
+    onSpawn?.(proc);
 
     proc.stdout.on('data', (data) => {
       stdout += data.toString();
@@ -215,6 +237,14 @@ function executeCommand(command: string, cwd: string, timeout: number, shellMode
       if (signal === 'SIGTERM') {
         killed = true;
         stderr += `\nProcess killed after ${timeout}ms timeout`;
+      }
+      if (detached && proc.pid != null) {
+        // The shell is gone; sweep any group members it left behind.
+        try {
+          process.kill(-proc.pid, 'SIGKILL');
+        } catch {
+          // No survivors — the common case.
+        }
       }
       resolve({
         exitCode: code ?? (killed ? 124 : 1),
@@ -310,6 +340,19 @@ async function auth(req: Request, res: Response, next: Function) {
   next();
 }
 
+// The pod sets AGENT_SERVICE_DISABLE_EXEC to refuse `/exec` here without
+// affecting the remote desktop surfaces, which leave it unset. See execGuard.
+const EXEC_DISABLED = isExecDisabled(process.env.AGENT_SERVICE_DISABLE_EXEC);
+
+function requireExecEnabled(req: Request, res: Response, next: Function) {
+  if (EXEC_DISABLED) {
+    return res
+      .status(403)
+      .json({ error: 'exec_disabled', message: 'Command execution is disabled on this deployment.' });
+  }
+  next();
+}
+
 app.use(auth);
 
 // --- CLI argument parsing ---
@@ -339,6 +382,13 @@ interface SessionInfo {
   actHistory: ActHistoryEntry[];
   latestScreenshot: string;
   latestCursorPosition: { x: number; y: number } | null;
+  /** Present for web-vm and desktop sessions; drives native X11 input/output. */
+  displayHarness?: DisplayHarness;
+  /** Maps LLM observation coordinates to full X11 display coordinates. */
+  nativeObservationScale?: NativeObservationScale;
+  /** Model/policy used to derive observation dimensions for this session. */
+  observationModel: string;
+  observationPolicy: ObservationScalingPolicy;
 }
 
 function cacheScreenshot(sessionId: string, screenshot: string, cursorPosition: { x: number; y: number } | null) {
@@ -357,12 +407,17 @@ function refreshDesktopCache(triggerSessionId: string) {
   const [deskId, deskSession] = desktopEntry;
   (async () => {
     try {
-      const connector = deskSession.agent.require(BrowserConnector);
-      const harness = connector.getHarness();
-      const rawImage = await harness.screenshot();
-      const image = await connector.transformScreenshot(rawImage);
-      const deskScreenshot = await image.toBase64();
-      cacheScreenshot(deskId, deskScreenshot, harness.getCursorPosition());
+      if (deskSession.displayHarness) {
+        const { observationB64 } = await captureNativeObservation(deskSession);
+        cacheScreenshot(deskId, observationB64, null);
+      } else {
+        const connector = deskSession.agent.require(BrowserConnector);
+        const harness = connector.getHarness();
+        const rawImage = await harness.screenshot();
+        const image = await connector.transformScreenshot(rawImage);
+        const deskScreenshot = await image.toBase64();
+        cacheScreenshot(deskId, deskScreenshot, harness.getCursorPosition());
+      }
     } catch (err) {
       console.warn(`[cache] Desktop screenshot refresh failed: ${err}`);
     }
@@ -657,6 +712,7 @@ root.use('/api', app);
 root.use(app);
 root.listen(port, () => {
   console.log(`🚀 BrowserAgent service listening on http://localhost:${port}`);
+  void probeNativeDisplayAtBoot();
 });
 
 const isAgentReady = (req: Request, res: Response, next: Function) => {
@@ -686,6 +742,8 @@ const getLaunchOptions = (
   downloadsPath: string | null = null,
   tracesDir: string | null = null,
   storageStateName: string | null = null,
+  stealth: boolean = false,
+  egress: ResolvedEgress | null = null,
 ) => {
   // ``storageStateName`` is forwarded to magnitude-core's BrowserProvider,
   // which loads ~/.magnitude/browser_states/<safeName>.json (cookies +
@@ -709,7 +767,31 @@ const getLaunchOptions = (
   if (storageStateName) {
     opts.storageStateName = storageStateName;
   }
+  // Opt-in anti-automation hardening (magnitude-core BrowserProvider applies
+  // it; see web/stealth.ts). Off unless the caller asks or MAGNITUDE_STEALTH
+  // is set in the process env.
+  if (stealth) {
+    opts.stealth = true;
+  }
+  applyEgress(opts, egress);
   return opts;
+};
+
+/**
+ * Fold a resolved egress policy into magnitude's browser options.
+ *
+ * Proxy, WebRTC containment args and the region-derived context all come from
+ * one resolution so they cannot drift apart: a proxied session still reporting
+ * the host's timezone is a worse signal than an unproxied one.
+ */
+const applyEgress = (opts: any, egress: ResolvedEgress | null | undefined) => {
+  if (!egress || !egress.proxy) return;
+  opts.launchOptions = opts.launchOptions || {};
+  opts.launchOptions.proxy = egress.proxy;
+  opts.launchOptions.args = [...(opts.launchOptions.args || []), ...egress.args];
+  if (Object.keys(egress.contextOptions).length > 0) {
+    opts.contextOptions = { ...(opts.contextOptions || {}), ...egress.contextOptions };
+  }
 };
 
 const startDesktop = async (): Promise<BrowserAgent> => {
@@ -742,6 +824,9 @@ const startBrowser = async (
   headless: boolean,
   urlMappings?: Record<string, string>,
   storageStateName?: string,
+  sessionMeta?: { sessionId?: string; sessionLabel?: string },
+  stealth: boolean = false,
+  egress: ResolvedEgress | null = null,
 ): Promise<BrowserAgent> => {
   try {
     const agent = await startBrowserAgent({
@@ -751,9 +836,13 @@ const startBrowser = async (
         defaultBrowserPaths.downloadsPath,
         defaultBrowserPaths.tracesDir,
         storageStateName ?? null,
+        stealth,
+        egress,
       ),
       narrate: true,
       urlMappings,
+      sessionId: sessionMeta?.sessionId,
+      sessionLabel: sessionMeta?.sessionLabel,
       llm: getLlmConfig()
     });
     agent.context.setDefaultNavigationTimeout(90000);
@@ -765,11 +854,13 @@ const startBrowser = async (
   }
 }
 
-const startBrowserOnVm = async (urlMappings?: Record<string, string>): Promise<BrowserAgent> => {
+const startBrowserOnVm = async (
+  urlMappings?: Record<string, string>,
+  sessionMeta?: { sessionId?: string; sessionLabel?: string },
+  egress: ResolvedEgress | null = null,
+): Promise<BrowserAgent> => {
   try {
-    const agent = await startBrowserAgent({
-      url: "https://www.google.com/",
-      browser: {
+    const vmBrowserOptions: any = {
         launchOptions: {
           headless: false,
           args: [
@@ -781,9 +872,15 @@ const startBrowserOnVm = async (urlMappings?: Record<string, string>): Promise<B
           tracesDir: defaultBrowserPaths.tracesDir || undefined,
         },
         contextOptions: { viewport: null, ignoreHTTPSErrors: true },
-      },
+    };
+    applyEgress(vmBrowserOptions, egress);
+    const agent = await startBrowserAgent({
+      url: "https://www.google.com/",
+      browser: vmBrowserOptions,
       narrate: true,
       urlMappings,
+      sessionId: sessionMeta?.sessionId,
+      sessionLabel: sessionMeta?.sessionLabel,
       llm: getLlmConfig()
     });
     agent.context.setDefaultNavigationTimeout(90000);
@@ -796,400 +893,14 @@ const startBrowserOnVm = async (urlMappings?: Record<string, string>): Promise<B
 }
 
 // --- Google Meet browser launcher ---
-const startGoogleMeetBrowser = async (meetUrl: string): Promise<BrowserAgent> => {
-  try {
-    const agent = await startBrowserAgent({
-      url: meetUrl,
-      browser: {
-        launchOptions: {
-          headless: false,
-          args: [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-            '--auto-select-desktop-capture-source="Entire screen"',
-            '--auto-select-tab-capture-source-by-title=Desktop',
-          ],
-          env: {
-            ...process.env,
-            PULSE_SINK: "agent_sink",
-            PULSE_SOURCE: "meet_mic",
-          },
-          downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
-          tracesDir: defaultBrowserPaths.tracesDir || undefined,
-        },
-        contextOptions: {
-          viewport: null,
-          ignoreHTTPSErrors: true,
-          permissions: ['camera', 'microphone'],
-        },
-      },
-      narrate: true,
-      llm: getLlmConfig()
-    });
-    agent.context.setDefaultNavigationTimeout(90000);
-    console.log("✅ Google Meet BrowserAgent started successfully.");
-    return agent;
-  } catch (err) {
-    console.error("❌ Failed to start Google Meet BrowserAgent:", err);
-    throw err;
-  }
-};
 
-// --- Google Meet session management ---
-type GoogleMeetStatus = 'joining' | 'lobby' | 'active' | 'ended' | 'removed' | 'error';
-
-interface GoogleMeetParticipant {
-  name: string;
-  isSpeaking: boolean;
-}
-
-interface GoogleMeetSessionInfo {
-  agent: BrowserAgent;
-  status: GoogleMeetStatus;
-  meetUrl: string;
-  displayName: string;
-  createdAt: Date;
-  participants: GoogleMeetParticipant[];
-  activeSpeaker: string | null;
-  pollIntervalId: ReturnType<typeof setInterval> | null;
-  latestScreenshot: string | null;
-  presenting: boolean;
-  desktopTabPage: any | null;
-}
-
-const googleMeetSessions = new Map<string, GoogleMeetSessionInfo>();
-
-type GoogleMeetJoinResult =
-  | { status: 'active' | 'lobby' }
-  | { status: 'error'; reason: string };
-
-const MEET_PREPARE_TASK = (displayName: string) =>
-  `You are on a Google Meet pre-join screen. Complete these steps in order:\n` +
-  `1. Dismiss any popups, tooltips, or overlays (e.g. "Got it" button, cookie banners).\n` +
-  `2. If there is a "Your name" text input, clear it and type: ${displayName}\n` +
-  `3. Turn OFF the camera if it is on (click its toggle button). Leave the microphone ON.\n` +
-  `Do NOT change audio device selections — they are handled separately.\n` +
-  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
-  `If the page shows a fatal error like "invalid meeting link" or "this meeting has ended", do nothing — just stop.`;
-
-const MEET_CLICK_JOIN_TASK =
-  `You are on a Google Meet pre-join screen. The audio devices have already been configured.\n` +
-  `Click the "Ask to join" or "Join now" button to enter the meeting.\n` +
-  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
-  `If the page shows a fatal error like "invalid meeting link" or "this meeting has ended", do nothing — just stop.`;
-
-const MEET_PRESENT_TAB_TASK =
-  `You are in an active Google Meet call.\n` +
-  `Click the "Present now" button (screen share icon in the bottom toolbar).\n` +
-  `Then select "A tab" from the options that appear.\n` +
-  `A tab will be auto-selected — just confirm the selection if a dialog appears.\n` +
-  `Do NOT select "Your entire screen" or "A window".`;
-
-const MEET_STOP_PRESENT_TASK =
-  `You are in an active Google Meet call and currently presenting a tab.\n` +
-  `Click the "Stop presenting" or "Stop sharing" button to end the presentation.\n` +
-  `If there is no stop button visible, look for a "You are presenting" banner or bar and click stop there.`;
-
-const MEET_LEAVE_TASK =
-  `You are in an active Google Meet call.\n` +
-  `Click the red "Leave call" button (the phone-handset icon) in the bottom toolbar.\n` +
-  `If a confirmation dialog appears with options like "Just leave the call" and ` +
-  `"End the call for everyone", click "Just leave the call" — do NOT end for everyone.\n` +
-  `If the meeting has already ended (e.g. "You left the meeting" is visible), do nothing — just stop.`;
-
-const MEET_PREPARE_MAX_ITERATIONS = 3;
-const MEET_JOIN_MAX_ITERATIONS = 3;
-const MEET_PRESENT_MAX_ITERATIONS = 3;
-
-async function runMagnitudeLoop(
-  agent: BrowserAgent,
-  task: string,
-  maxIterations: number,
-  label: string,
-): Promise<void> {
-  const memory = new AgentMemory({ promptCaching: true });
-
-  for (let iteration = 0; iteration < maxIterations; iteration++) {
-    if (iteration > 0) {
-      console.log(`[${label}] Iteration ${iteration + 1}: re-observing...`);
-    }
-
-    await agent.recordConnectorObservations(memory);
-    const context = await agent.buildContext(memory);
-    const { reasoning, actions } = await agent.models.partialAct(context, task, [], agent.actions);
-
-    console.log(`[${label}] Iteration ${iteration + 1} reasoning: ${reasoning}`);
-    console.log(`[${label}] Planned ${actions.length} action(s): ${actions.map(a => a.variant).join(', ')}`);
-    memory.recordThought(reasoning);
-
-    if (actions.length === 0) {
-      console.log(`[${label}] LLM planned zero actions — stopping.`);
-      break;
-    }
-
-    const taskDone = actions.some(a => a.variant === 'task:done');
-
-    for (const action of actions) {
-      const actionDef = agent.identifyAction(action);
-      console.log(`[${label}] Executing: ${actionDef.render(action)}`);
-      await agent.exec(action, memory);
-    }
-
-    if (taskDone) {
-      console.log(`[${label}] LLM signalled task:done.`);
-      break;
-    }
-  }
-}
-
-/**
- * Best-effort: drive the LLM to click the in-meeting Leave button before
- * tearing down the browser session. A graceful click means the meeting
- * server records a clean exit (vs. the abrupt "connection lost" other
- * participants see when the browser process is killed mid-call).
- *
- * Always safe to call:
- *   - No-ops if the meeting is already ended / removed / errored.
- *   - Bounded by an outer timeout so a stuck Magnitude loop cannot block
- *     teardown.
- *   - Failures are logged and swallowed; the caller should still run the
- *     unconditional `agent.stop()` afterwards.
- */
-async function clickLeaveButton(
-  session: GoogleMeetSessionInfo | TeamsMeetSessionInfo,
-  channel: 'google_meet' | 'teams_meet',
-): Promise<void> {
-  if (
-    session.status === 'ended' ||
-    session.status === 'removed' ||
-    session.status === 'error'
-  ) {
-    return;
-  }
-
-  const isGoogle = channel === 'google_meet';
-  const task = isGoogle ? MEET_LEAVE_TASK : TEAMS_LEAVE_TASK;
-  const label = isGoogle ? 'googlemeet/leave-click' : 'teamsmeet/leave-click';
-  const maxIters = isGoogle ? MEET_PRESENT_MAX_ITERATIONS : TEAMS_PRESENT_MAX_ITERATIONS;
-
-  try {
-    await session.agent.page.bringToFront();
-    await Promise.race([
-      runMagnitudeLoop(session.agent, task, maxIters, label),
-      new Promise<void>((_, reject) =>
-        setTimeout(() => reject(new Error('leave_click_timeout')), 8000),
-      ),
-    ]);
-    // Brief grace so the meeting server registers the leave RPC before we
-    // kill the underlying socket via `agent.stop()`.
-    await sleep(500);
-  } catch (err) {
-    console.warn(`[${label}] best-effort leave click failed: ${err}`);
-  }
-}
-
-/**
- * Open Google Meet Settings dialog via Playwright (deterministic), then hand
- * off to the LLM to navigate the Audio tab and select devices (visual).
- */
-async function openMeetSettings(page: any): Promise<boolean> {
-  const tag = '[googlemeet/devices]';
-
-  try {
-    const moreBtn = page.locator(
-      'button[aria-label*="More options" i], button[aria-label*="more actions" i], button[aria-label*="More" i][aria-haspopup]'
-    ).first();
-    if (!await moreBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      console.log(`${tag} Triple-dots menu button not found`);
-      return false;
-    }
-    console.log(`${tag} Opening More options menu...`);
-    await moreBtn.click();
-    await page.waitForTimeout(500);
-
-    const settingsItem = page.locator(
-      'li:has-text("Settings"), [role="menuitem"]:has-text("Settings"), span:has-text("Settings")'
-    ).first();
-    if (!await settingsItem.isVisible({ timeout: 2000 }).catch(() => false)) {
-      console.log(`${tag} "Settings" menu item not found — closing menu`);
-      await page.keyboard.press('Escape');
-      return false;
-    }
-    console.log(`${tag} Clicking Settings...`);
-    await settingsItem.click();
-    await page.waitForTimeout(800);
-    console.log(`${tag} Settings dialog opened`);
-    return true;
-  } catch (err) {
-    console.log(`${tag} Error opening Settings: ${err}`);
-    await page.keyboard.press('Escape').catch(() => {});
-    return false;
-  }
-}
-
-const MEET_AUDIO_TAB_TASK =
-  `You are in the Google Meet Settings dialog.\n` +
-  `Click the "Audio" tab on the left side of the dialog.\n` +
-  `Do NOT close the dialog.`;
-
-const MEET_SELECT_MIC_TASK = (micLabel: string) =>
-  `You are in the Google Meet Settings dialog, on the Audio tab.\n` +
-  `Click the Microphone dropdown and select the option containing "${micLabel}".\n` +
-  `Do NOT close the dialog.`;
-
-const MEET_SELECT_SPEAKER_TASK = (speakerLabel: string) =>
-  `You are in the Google Meet Settings dialog, on the Audio tab.\n` +
-  `Click the Speakers dropdown and select the option containing "${speakerLabel}".\n` +
-  `Then close the settings dialog by clicking the X button.`;
-
-const MEET_AUDIO_MAX_ITERATIONS = 3;
-
-async function googleMeetJoinFlow(agent: BrowserAgent, displayName: string): Promise<GoogleMeetJoinResult> {
-  const page = agent.page;
-  await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
-
-  const pageUrl = page.url?.() ?? 'unknown';
-  console.log(`[googlemeet/join] Page loaded: url=${pageUrl}`);
-
-  // Phase 1: LLM handles variable UI (popups, name, camera)
-  console.log('[googlemeet/join] Phase 1: prepare...');
-  await runMagnitudeLoop(agent, MEET_PREPARE_TASK(displayName), MEET_PREPARE_MAX_ITERATIONS, 'googlemeet/prepare');
-
-  // Phase 1b: Audio device selection — Playwright opens Settings, LLM handles each step
-  console.log('[googlemeet/join] Phase 1b: opening Settings for audio device selection...');
-  const settingsOpened = await openMeetSettings(page);
-  if (settingsOpened) {
-    console.log('[googlemeet/join] Phase 1b-i: navigating to Audio tab...');
-    await runMagnitudeLoop(agent, MEET_AUDIO_TAB_TASK, MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/audio-tab');
-
-    console.log('[googlemeet/join] Phase 1b-ii: selecting microphone...');
-    await runMagnitudeLoop(agent, MEET_SELECT_MIC_TASK('agent_sink'), MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/select-mic');
-
-    console.log('[googlemeet/join] Phase 1b-iii: selecting speaker + closing...');
-    await runMagnitudeLoop(agent, MEET_SELECT_SPEAKER_TASK('meet_sink'), MEET_AUDIO_MAX_ITERATIONS, 'googlemeet/select-speaker');
-  } else {
-    console.log('[googlemeet/join] Phase 1b: Could not open Settings — using default devices');
-  }
-
-  // Phase 2: click join
-  console.log('[googlemeet/join] Phase 2: clicking join...');
-  await runMagnitudeLoop(agent, MEET_CLICK_JOIN_TASK, MEET_JOIN_MAX_ITERATIONS, 'googlemeet/click-join');
-
-  // Determine outcome by checking the page state after the agent finished
-  await sleep(2000);
-
-  const meetingActive = await page.locator(
-    '[data-meeting-title], [aria-label*="meeting details" i], [data-call-duration]'
-  ).first().isVisible({ timeout: 5000 }).catch(() => false);
-  if (meetingActive) return { status: 'active' };
-
-  const inLobby = await page.locator(
-    'text=/waiting|asking to join|let you in/i'
-  ).first().isVisible({ timeout: 3000 }).catch(() => false);
-  if (inLobby) return { status: 'lobby' };
-
-  const hasError = await page.locator(
-    'text=/invalid meeting|meeting has ended|no longer available|meeting not found/i'
-  ).first().isVisible({ timeout: 1000 }).catch(() => false);
-  if (hasError) {
-    const errorMsg = await page.locator('text=/invalid meeting|meeting has ended|no longer available|meeting not found/i').first().textContent().catch(() => 'unknown');
-    return { status: 'error', reason: `meet_page_error: "${errorMsg}" (url=${pageUrl})` };
-  }
-
-  const hasJoinBtn = await page.locator(
-    'button:has-text("Ask to join"), button:has-text("Join now"), button:has-text("Join")'
-  ).first().isVisible({ timeout: 1000 }).catch(() => false);
-  if (hasJoinBtn) {
-    return { status: 'error', reason: `join_button_still_visible: Agent completed but join button was not clicked (url=${pageUrl})` };
-  }
-
-  // No definitive signal — assume we're waiting for admission
-  return { status: 'lobby' };
-}
-
-async function googleMeetPollState(sessionId: string): Promise<void> {
-  const session = googleMeetSessions.get(sessionId);
-  if (!session || session.status === 'ended' || session.status === 'error') return;
-
-  try {
-    const page = session.agent.page;
-
-    // Detect if meeting has ended
-    const meetingEnded = await page.locator(
-      'text=/meeting has ended|you left the meeting|removed from the meeting|kicked/i'
-    ).first().isVisible({ timeout: 500 }).catch(() => false);
-
-    if (meetingEnded) {
-      session.status = 'ended';
-      return;
-    }
-
-    // If we were in the lobby, check if we're admitted now
-    if (session.status === 'lobby') {
-      const admitted = await page.locator(
-        '[data-meeting-title], [aria-label*="meeting details" i], [data-call-duration]'
-      ).first().isVisible({ timeout: 500 }).catch(() => false);
-      if (admitted) session.status = 'active';
-
-      // Check if denied
-      const denied = await page.locator(
-        'text=/denied|not allowed|can\'t join/i'
-      ).first().isVisible({ timeout: 500 }).catch(() => false);
-      if (denied) {
-        session.status = 'removed';
-        return;
-      }
-    }
-
-    // Scrape participants and active speaker from the DOM
-    const participants: GoogleMeetParticipant[] = [];
-    let activeSpeaker: string | null = null;
-
-    // Google Meet shows participant tiles; the active speaker has a highlighted border
-    const speakerElements = await page.locator(
-      '[data-self-name], [data-participant-id]'
-    ).all().catch(() => []);
-
-    for (const el of speakerElements) {
-      const name = await el.getAttribute('data-self-name').catch(() => null)
-        || await el.innerText().catch(() => null);
-      if (!name) continue;
-
-      const parentClasses = await el.evaluate(
-        (node: Element) => node.closest('[class]')?.className || ''
-      ).catch(() => '');
-      const isSpeaking = parentClasses.includes('speaking') ||
-        (await el.locator('[class*="speaking" i]').first().isVisible({ timeout: 100 }).catch(() => false));
-
-      const cleanName = name.split('\n')[0].trim();
-      participants.push({ name: cleanName, isSpeaking });
-      if (isSpeaking) activeSpeaker = cleanName;
-    }
-
-    session.participants = participants;
-    session.activeSpeaker = activeSpeaker;
-
-    // Cache a screenshot of the Meet tab for non-blocking reads
-    try {
-      const raw = await session.agent.page.screenshot({ type: 'jpeg', quality: 85 });
-      session.latestScreenshot = Buffer.from(raw).toString('base64');
-    } catch {
-      // Screenshot may fail transiently; keep the previous cached value
-    }
-  } catch {
-    // Browser may have disconnected
-    session.status = 'error';
-  }
-}
-
-// --- API Endpoints ---
 app.post('/start', async (req: Request, res: Response) => {
   // ``storageStateName`` is optional. When set, the magnitude
   // BrowserProvider loads ~/.magnitude/browser_states/<safeName>.json
   // (cookies + localStorage + sessionStorage) before any page renders so
   // the new session boots already-authenticated. Currently only honoured
   // for ``mode === 'web'``.
-  const { headless, mode, label, urlMappings, storageStateName } = req.body;
+  const { headless, mode, label, urlMappings, storageStateName, stealth, egress } = req.body;
   if (!mode || !['desktop', 'web', 'web-vm'].includes(mode)) {
     return res.status(400).json({
       error: 'bad_request',
@@ -1221,6 +932,26 @@ app.post('/start', async (req: Request, res: Response) => {
   }
 
   const sessionId = randomUUID();
+
+  // Resolve the egress policy before anything is launched. A policy that
+  // cannot be honoured must fail the request rather than silently egress from
+  // the host: a caller that asked for a specific exit and got the host's own
+  // address is worse off than one that got an error, because it cannot tell.
+  let resolvedEgress: ResolvedEgress | null = null;
+  try {
+    const policy = parseEgressPolicy(egress);
+    resolvedEgress = policy ? resolveEgress({ sessionKey: sessionId, ...policy }) : null;
+  } catch (err) {
+    if (err instanceof EgressPolicyError) {
+      console.error(`[start] egress policy rejected: ${err.message}`);
+      return res.status(400).json({ error: 'invalid_egress_policy', message: err.message });
+    }
+    throw err;
+  }
+  if (resolvedEgress) {
+    console.log(`[start] egress=${resolvedEgress.description}`);
+  }
+
   const t0 = Date.now();
   console.log(`[start] BEGIN mode=${mode} sessionId=${sessionId}`);
   try {
@@ -1232,12 +963,15 @@ app.post('/start', async (req: Request, res: Response) => {
     if (mode === "desktop") {
       agent = await startDesktop();
     } else if (mode === "web-vm") {
-      agent = await startBrowserOnVm(mappings);
+      agent = await startBrowserOnVm(mappings, { sessionId, sessionLabel: label }, resolvedEgress);
     } else {
       agent = await startBrowser(
         headless ?? false,
         mappings,
         typeof storageStateName === 'string' && storageStateName ? storageStateName : undefined,
+        { sessionId, sessionLabel: label },
+        stealth === true,
+        resolvedEgress,
       );
     }
     console.log(`[start] agent_created=${Date.now() - t0}ms mode=${mode}`);
@@ -1334,6 +1068,14 @@ app.post('/start', async (req: Request, res: Response) => {
       }
     }
 
+    let displayHarness: DisplayHarness | undefined;
+    if (mode === 'web-vm' || mode === 'desktop') {
+      displayHarness = new DisplayHarness();
+    }
+
+    const observationModel = resolveAgentServiceModel();
+    const observationPolicy = resolveObservationScalingPolicy(observationModel);
+
     activeSessions.set(sessionId, {
       agent,
       mode,
@@ -1342,6 +1084,9 @@ app.post('/start', async (req: Request, res: Response) => {
       actHistory: [],
       latestScreenshot: '',
       latestCursorPosition: null,
+      displayHarness,
+      observationModel,
+      observationPolicy,
     });
 
     console.log(`[start] DONE mode=${mode} sessionId=${sessionId} total=${Date.now() - t0}ms active_sessions=${activeSessions.size}`);
@@ -1429,16 +1174,26 @@ app.post('/act', isAgentReady, async (req: Request, res: Response) => {
         console.log(`${lineageLabel}🔄 Verify pass ${iteration + 1}: re-observing and re-planning...`);
       }
 
-      await agent.recordConnectorObservations(memory);
+      if (session.displayHarness) {
+        // Downscale to LLM observation space; scale coords back up before xdotool.
+        const { observation } = await captureNativeObservation(session);
+        memory.recordObservation(
+          Observation.fromConnector('web', observation, { type: 'screenshot', limit: 2, dedupe: true }),
+        );
+        console.log(`${lineageLabel}📸 native observation recorded`);
+      } else {
+        await agent.recordConnectorObservations(memory);
+      }
 
       if (MAGNITUDE_DEBUG) {
         try {
-          const harness = agent.require(BrowserConnector).getHarness();
-          const planImg = await harness.screenshot();
-          debugSaveImage(actId, iteration === 0 ? 'planning_screenshot' : `verify_${iteration}_screenshot`, await planImg.toBase64());
-
-          if (session.mode === 'desktop') {
-            debugSaveImage(actId, iteration === 0 ? 'native_screenshot' : `verify_${iteration}_native`, nativeScreenshot());
+          if (session.displayHarness) {
+            const b64 = await session.displayHarness.screenshot();
+            debugSaveImage(actId, iteration === 0 ? 'planning_screenshot' : `verify_${iteration}_screenshot`, b64);
+          } else {
+            const harness = agent.require(BrowserConnector).getHarness();
+            const planImg = await harness.screenshot();
+            debugSaveImage(actId, iteration === 0 ? 'planning_screenshot' : `verify_${iteration}_screenshot`, await planImg.toBase64());
           }
         } catch (debugErr) {
           console.warn(`[debug] Pre-plan screenshot capture failed: ${debugErr}`);
@@ -1456,6 +1211,7 @@ app.post('/act', isAgentReady, async (req: Request, res: Response) => {
       iterationPlannedActions.push(actions);
       memory.recordThought(reasoning);
 
+      let hadNativeActions = false;
       for (let i = 0; i < actions.length; i++) {
         const action = actions[i];
         const actionDef = agent.identifyAction(action);
@@ -1466,7 +1222,19 @@ app.post('/act', isAgentReady, async (req: Request, res: Response) => {
         const actionT0 = Date.now();
         let actionError: string | undefined;
         try {
-          await agent.exec(action, memory);
+          if (session.displayHarness && NATIVE_ACTION_VARIANTS.has(action.variant)) {
+            await dispatchNativeAction(
+              session.displayHarness,
+              action,
+              session.nativeObservationScale,
+            );
+            memory.recordObservation(
+              Observation.fromActionTaken(action.variant, JSON.stringify(action)),
+            );
+            hadNativeActions = true;
+          } else {
+            await agent.exec(action, memory);
+          }
         } catch (err) {
           actionError = err instanceof Error ? err.message : String(err);
           throw err;
@@ -1486,8 +1254,14 @@ app.post('/act', isAgentReady, async (req: Request, res: Response) => {
 
           if (MAGNITUDE_DEBUG) {
             try {
-              const harness = agent.require(BrowserConnector).getHarness();
-              const postImg = await harness.screenshot();
+              let postB64: string;
+              if (session.displayHarness) {
+                postB64 = await session.displayHarness.screenshot();
+              } else {
+                const harness = agent.require(BrowserConnector).getHarness();
+                const postImg = await harness.screenshot();
+                postB64 = await postImg.toBase64();
+              }
               const coordLabel = ('x' in action && 'y' in action)
                 ? `_${action.x}_${action.y}`
                 : ('from' in action && typeof action.from === 'object')
@@ -1497,7 +1271,7 @@ app.post('/act', isAgentReady, async (req: Request, res: Response) => {
               debugSaveImage(
                 actId,
                 `post_action/${padIdx}_${action.variant.replace(/:/g, '_')}${coordLabel}`,
-                await postImg.toBase64(),
+                postB64,
               );
             } catch (debugErr) {
               console.warn(`[debug] Post-action screenshot failed: ${debugErr}`);
@@ -1506,6 +1280,16 @@ app.post('/act', isAgentReady, async (req: Request, res: Response) => {
 
           actionTraces.push(actionTrace);
         }
+      }
+
+      // Inject one post-iteration screenshot into memory after all native
+      // actions have been dispatched so the next planning step sees the
+      // final display state without taking N screenshots per iteration.
+      if (hadNativeActions && session.displayHarness) {
+        const { observation } = await captureNativeObservation(session);
+        memory.recordObservation(
+          Observation.fromConnector('web', observation, { type: 'screenshot', limit: 2, dedupe: true }),
+        );
       }
 
       totalActionsExecuted += actions.length;
@@ -1553,12 +1337,18 @@ app.post('/act', isAgentReady, async (req: Request, res: Response) => {
 
     let screenshot = '';
     try {
-      const connector = session.agent.require(BrowserConnector);
-      const harness = connector.getHarness();
-      const rawImage = await harness.screenshot();
-      const image = await connector.transformScreenshot(rawImage);
-      screenshot = await image.toBase64();
-      cacheScreenshot(sessionId, screenshot, harness.getCursorPosition());
+      if (session.displayHarness) {
+        const { observationB64 } = await captureNativeObservation(session);
+        screenshot = observationB64;
+        cacheScreenshot(sessionId, screenshot, null);
+      } else {
+        const connector = session.agent.require(BrowserConnector);
+        const harness = connector.getHarness();
+        const rawImage = await harness.screenshot();
+        const image = await connector.transformScreenshot(rawImage);
+        screenshot = await image.toBase64();
+        cacheScreenshot(sessionId, screenshot, harness.getCursorPosition());
+      }
     } catch (screenshotErr) {
       console.warn(`[act] Post-act screenshot failed: ${screenshotErr}`);
     }
@@ -1587,7 +1377,29 @@ app.post('/execute-actions', isAgentReady, async (req: Request, res: Response) =
     const variants = actions.map((a: any) => a.variant).join(', ');
     console.log(`[execute-actions] Executing ${actions.length} action(s) [${variants}] for session ${sessionId}`);
 
-    await agent.executeTrajectory(actions, { memory: agent.memory, recordObservations: false });
+    if (session.displayHarness) {
+      // Ensure observation scale is current before translating LLM coords.
+      await captureNativeObservation(session);
+      const scale = session.nativeObservationScale;
+      const browserActions: any[] = [];
+      for (const action of actions) {
+        if (NATIVE_ACTION_VARIANTS.has(action.variant)) {
+          if (browserActions.length > 0) {
+            await agent.executeTrajectory(browserActions, { memory: agent.memory, recordObservations: false });
+            browserActions.length = 0;
+          }
+          console.log(`[execute-actions] native: ${action.variant}`);
+          await dispatchNativeAction(session.displayHarness, action, scale);
+        } else {
+          browserActions.push(action);
+        }
+      }
+      if (browserActions.length > 0) {
+        await agent.executeTrajectory(browserActions, { memory: agent.memory, recordObservations: false });
+      }
+    } else {
+      await agent.executeTrajectory(actions, { memory: agent.memory, recordObservations: false });
+    }
 
     const execMs = Date.now() - t0;
     console.log(`[execute-actions] ${actions.length} action(s) executed [${execMs}ms]`);
@@ -1595,13 +1407,19 @@ app.post('/execute-actions', isAgentReady, async (req: Request, res: Response) =
     let screenshot = '';
     let cursorPosition: { x: number; y: number } | null = null;
     try {
-      const connector = agent.require(BrowserConnector);
-      const harness = connector.getHarness();
-      const rawImage = await harness.screenshot();
-      const image = await connector.transformScreenshot(rawImage);
-      screenshot = await image.toBase64();
-      cursorPosition = harness.getCursorPosition();
-      cacheScreenshot(sessionId, screenshot, cursorPosition);
+      if (session.displayHarness) {
+        const { observationB64 } = await captureNativeObservation(session);
+        screenshot = observationB64;
+        cacheScreenshot(sessionId, screenshot, null);
+      } else {
+        const connector = agent.require(BrowserConnector);
+        const harness = connector.getHarness();
+        const rawImage = await harness.screenshot();
+        const image = await connector.transformScreenshot(rawImage);
+        screenshot = await image.toBase64();
+        cursorPosition = harness.getCursorPosition();
+        cacheScreenshot(sessionId, screenshot, cursorPosition);
+      }
     } catch (screenshotErr) {
       console.warn(`[execute-actions] Post-execution screenshot failed: ${screenshotErr}`);
     }
@@ -1628,11 +1446,17 @@ app.post('/extract', isAgentReady, async (req: Request, res: Response) => {
       const shouldBypassDomProcessing =
         bypassDomProcessing === true || session.mode === 'desktop';
 
-      // Desktop sessions are rendered through the live noVNC iframe, so DOM
-      // expansion is both meaningless and destructive. Always use screenshot-
-      // only extraction there, even if the caller forgets to request it.
-      if (shouldBypassDomProcessing) {
-        const screenshot = await session.agent.require(BrowserConnector).getHarness().screenshot();
+      // Desktop and web-vm sessions bypass DOM processing: DOM expansion is
+      // meaningless for a full-display screenshot and destructive for noVNC.
+      // Native sessions use a full-display screenshot for accurate extraction.
+      if (shouldBypassDomProcessing || session.displayHarness) {
+        let screenshot: Image;
+        if (session.displayHarness) {
+          const { observation } = await captureNativeObservation(session);
+          screenshot = observation;
+        } else {
+          screenshot = await session.agent.require(BrowserConnector).getHarness().screenshot();
+        }
         const data = await (session.agent.models as any).extract(instructions, zodSchema as ZodTypeAny, screenshot, '');
         return res.json({ data });
       } else {
@@ -1674,44 +1498,336 @@ app.post('/query', isAgentReady, async (req: Request, res: Response) => {
   }
 });
 
-// --- Native desktop screenshot via OS commands ---
+// --- DisplayHarness: native X11 input/output via xdotool + scrot ---
 
-function nativeScreenshotCommand(dest: string): string {
-  switch (process.platform) {
-    case 'win32':
-      // PowerShell: capture full primary screen using System.Drawing
-      return [
-        'powershell.exe -NoProfile -Command "',
-        'Add-Type -AssemblyName System.Windows.Forms;',
-        'Add-Type -AssemblyName System.Drawing;',
-        '$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds;',
-        '$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height);',
-        '$g = [System.Drawing.Graphics]::FromImage($bmp);',
-        '$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size);',
-        '$g.Dispose();',
-        `$bmp.Save('${dest.replace(/'/g, "''")}');`,
-        '$bmp.Dispose();"',
-      ].join(' ');
-    case 'darwin':
-      return `screencapture -x "${dest}"`;
-    default:
-      // Linux / other Unix — xfce4-screenshooter ships with xfce4-goodies
-      // (installed in the desktop Docker image). Falls back to scrot, then
-      // ImageMagick's import for non-XFCE environments.
-      return `xfce4-screenshooter -f -s "${dest}" 2>/dev/null || scrot "${dest}" 2>/dev/null || import -window root "${dest}"`;
+async function downscaleDisplayScreenshotForObservation(
+  displayB64: string,
+  session: SessionInfo,
+): Promise<{ observation: Image; observationB64: string }> {
+  const displayImage = Image.fromBase64(displayB64);
+  const { width, height } = await displayImage.getDimensions();
+  const scale = computeNativeObservationScale(width, height, session.observationPolicy);
+  session.nativeObservationScale = scale;
+
+  if (
+    scale.observationWidth === scale.displayWidth
+    && scale.observationHeight === scale.displayHeight
+  ) {
+    return { observation: displayImage, observationB64: displayB64 };
   }
+
+  const observation = await displayImage.resize(scale.observationWidth, scale.observationHeight);
+  const observationB64 = await observation.toBase64();
+  console.log(
+    `[native-scale] model=${scale.model} provider=${scale.provider} `
+    + `display=${scale.displayWidth}x${scale.displayHeight} `
+    + `observation=${scale.observationWidth}x${scale.observationHeight}`,
+  );
+  return { observation, observationB64 };
 }
 
-function nativeScreenshot(): string {
-  const dest = path.join(os.tmpdir(), `unity-screenshot-${randomUUID()}.png`);
+async function captureNativeObservation(session: SessionInfo): Promise<{
+  observation: Image;
+  observationB64: string;
+}> {
+  const displayB64 = await session.displayHarness!.screenshot();
+  const { observation, observationB64 } = await downscaleDisplayScreenshotForObservation(
+    displayB64,
+    session,
+  );
+  return { observation, observationB64 };
+}
+
+/**
+ * Maps Playwright-style key names to xdotool key names where they differ.
+ * Keys not listed here are passed through unchanged.
+ */
+const XDOTOOL_KEY_MAP: Record<string, string> = {
+  ArrowDown: 'Down',
+  ArrowUp: 'Up',
+  ArrowLeft: 'Left',
+  ArrowRight: 'Right',
+  Enter: 'Return',
+  Escape: 'Escape',
+  Backspace: 'BackSpace',
+  Delete: 'Delete',
+  Tab: 'Tab',
+  ' ': 'space',
+  PageDown: 'Next',
+  PageUp: 'Prior',
+  Home: 'Home',
+  End: 'End',
+};
+
+/**
+ * Maps Playwright modifier key names to xdotool modifier names.
+ */
+const XDOTOOL_MODIFIER_MAP: Record<string, string> = {
+  Control: 'ctrl',
+  Meta: 'super',
+  cmd: 'super',
+  Alt: 'alt',
+  Shift: 'shift',
+};
+
+/**
+ * Resolve the X11 display for native input/screenshots.
+ *
+ * Pool VMs set ``DISPLAY=:1`` (TigerVNC on 5901); the local desktop Docker
+ * image sets ``DISPLAY=:99``. Prefer the process env so both stacks work
+ * without hardcoding a display number.
+ */
+function resolveNativeDisplay(): string {
+  const raw = (process.env.DISPLAY || '').trim();
+  if (!raw) {
+    return ':99';
+  }
+  return raw.startsWith(':') ? raw : `:${raw}`;
+}
+
+/**
+ * Log whether the configured X11 display and DisplayHarness binaries are usable.
+ * Failures here are warnings only — sessions may still start before the desktop
+ * is fully up — but a wrong DISPLAY shows up immediately in boot logs.
+ */
+async function probeNativeDisplayAtBoot(): Promise<void> {
+  const display = resolveNativeDisplay();
+  console.log(`[display] Using DISPLAY=${display} (from ${process.env.DISPLAY ? 'env' : 'default'})`);
+
+  const required = ['xdotool', 'xdpyinfo'] as const;
+  const screenshotTools = ['xfce4-screenshooter', 'scrot'] as const;
+  const optional = ['wmctrl'] as const;
+
+  for (const bin of required) {
+    try {
+      execSync(`command -v ${bin}`, { stdio: 'ignore' });
+    } catch {
+      console.warn(`[display] Missing required binary: ${bin}`);
+    }
+  }
+  if (!screenshotTools.some((bin) => {
+    try {
+      execSync(`command -v ${bin}`, { stdio: 'ignore' });
+      return true;
+    } catch {
+      return false;
+    }
+  })) {
+    console.warn(
+      `[display] Missing screenshot binary (need one of: ${screenshotTools.join(', ')})`,
+    );
+  }
+  for (const bin of optional) {
+    try {
+      execSync(`command -v ${bin}`, { stdio: 'ignore' });
+    } catch {
+      console.warn(`[display] Missing optional binary: ${bin}`);
+    }
+  }
+
   try {
-    execSync(nativeScreenshotCommand(dest), { timeout: 10_000 });
-    const buf = fs.readFileSync(dest);
-    return buf.toString('base64');
-  } finally {
-    try { fs.unlinkSync(dest); } catch (_) { /* already cleaned or never created */ }
+    const result = await executeCommand(
+      `DISPLAY=${display} xdpyinfo >/dev/null`,
+      LOCAL_ROOT,
+      5_000,
+    );
+    if (result.exitCode === 0) {
+      console.log(`[display] xdpyinfo OK on ${display}`);
+    } else {
+      console.warn(
+        `[display] xdpyinfo failed on ${display} (exit ${result.exitCode}): ${result.stderr.trim()}`,
+      );
+    }
+  } catch (err) {
+    console.warn(`[display] xdpyinfo probe error on ${display}: ${err}`);
   }
 }
+
+/**
+ * Routes mouse and keyboard actions through the host X11 display using
+ * xdotool (input) and scrot/xfce4-screenshooter (screenshot capture).
+ *
+ * Used for web-vm and desktop sessions where Playwright controls a Chromium
+ * window that is itself running on a virtual X11 display. Native input
+ * bypasses Playwright's CDP layer so that actions land on browser chrome,
+ * desktop windows, and other UI at absolute display coordinates. Mouse clicks
+ * go to the topmost window at each coordinate; keyboard events go to the
+ * current X11 focus target without raising Chromium first.
+ *
+ * The display number comes from ``DISPLAY`` (pool VMs use ``:1``; the local
+ * desktop Docker image uses ``:99``).
+ */
+class DisplayHarness {
+  private readonly display: string;
+
+  constructor(display: string = resolveNativeDisplay()) {
+    this.display = display;
+  }
+
+  private async execDisplay(command: string, timeoutMs = 10_000): Promise<ExecResult> {
+    return executeCommand(
+      `DISPLAY=${this.display} ${command}`,
+      LOCAL_ROOT,
+      timeoutMs,
+    );
+  }
+
+  /** Capture the full virtual display as a base64-encoded PNG. */
+  async screenshot(): Promise<string> {
+    const dest = path.join(os.tmpdir(), `unity-display-${randomUUID()}.png`);
+    try {
+      const result = await this.execDisplay(
+        `xfce4-screenshooter -f -s "${dest}" 2>/dev/null || scrot "${dest}"`,
+        15_000,
+      );
+      if (result.exitCode !== 0 && !fs.existsSync(dest)) {
+        throw new Error(`Native screenshot failed (exit ${result.exitCode}): ${result.stderr}`);
+      }
+      const buf = fs.readFileSync(dest);
+      return buf.toString('base64');
+    } finally {
+      try { fs.unlinkSync(dest); } catch { /* best effort */ }
+    }
+  }
+
+  async click(x: number, y: number, button: 'left' | 'right' | 'middle' = 'left'): Promise<void> {
+    const btn = { left: 1, middle: 2, right: 3 }[button];
+    await this.execDisplay(`xdotool mousemove --sync ${x} ${y} click ${btn}`);
+  }
+
+  async doubleClick(x: number, y: number): Promise<void> {
+    await this.execDisplay(`xdotool mousemove --sync ${x} ${y} click --repeat 2 --delay 100 1`);
+  }
+
+  async drag(fromX: number, fromY: number, toX: number, toY: number): Promise<void> {
+    await this.execDisplay(
+      `xdotool mousemove --sync ${fromX} ${fromY} mousedown 1 ` +
+      `sleep 0.1 mousemove --sync ${toX} ${toY} mouseup 1`,
+    );
+  }
+
+  async scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
+    await this.execDisplay(`xdotool mousemove --sync ${x} ${y}`);
+    // xdotool: button 4 = scroll up, 5 = scroll down, 6 = left, 7 = right
+    const cmds: string[] = [];
+    if (deltaY !== 0) {
+      const btn = deltaY < 0 ? 4 : 5;
+      const n = Math.max(1, Math.ceil(Math.abs(deltaY) / 100));
+      cmds.push(`xdotool click --repeat ${n} --delay 50 ${btn}`);
+    }
+    if (deltaX !== 0) {
+      const btn = deltaX < 0 ? 6 : 7;
+      const n = Math.max(1, Math.ceil(Math.abs(deltaX) / 100));
+      cmds.push(`xdotool click --repeat ${n} --delay 50 ${btn}`);
+    }
+    for (const cmd of cmds) {
+      await this.execDisplay(cmd);
+    }
+  }
+
+  async type(text: string): Promise<void> {
+    const tmpFile = path.join(os.tmpdir(), `unity-type-${randomUUID()}.txt`);
+    try {
+      await fs.promises.writeFile(tmpFile, text, 'utf-8');
+      await this.execDisplay(
+        `xdotool type --clearmodifiers --delay 30 --file "${tmpFile}"`,
+        30_000,
+      );
+    } finally {
+      await fs.promises.unlink(tmpFile).catch(() => {});
+    }
+  }
+
+  async key(key: string): Promise<void> {
+    const xKey = XDOTOOL_KEY_MAP[key] ?? key;
+    await this.execDisplay(`xdotool key --clearmodifiers ${xKey}`);
+  }
+
+  async hotkey(keys: string[]): Promise<void> {
+    const xKeys = keys.map(k => XDOTOOL_MODIFIER_MAP[k] ?? XDOTOOL_KEY_MAP[k] ?? k);
+    await this.execDisplay(`xdotool key --clearmodifiers ${xKeys.join('+')}`);
+  }
+}
+
+// Dispatch a single action variant to a DisplayHarness.
+async function dispatchNativeAction(
+  harness: DisplayHarness,
+  action: any,
+  scale?: NativeObservationScale,
+): Promise<void> {
+  const mapPoint = (x: number, y: number) =>
+    (scale ? scaleObservationCoordsToDisplay(x, y, scale) : { x, y });
+
+  const v = action.variant as string;
+  switch (v) {
+    case 'mouse:click': {
+      const { x, y } = mapPoint(action.x, action.y);
+      await harness.click(x, y);
+      break;
+    }
+    case 'mouse:double_click': {
+      const { x, y } = mapPoint(action.x, action.y);
+      await harness.doubleClick(x, y);
+      break;
+    }
+    case 'mouse:right_click': {
+      const { x, y } = mapPoint(action.x, action.y);
+      await harness.click(x, y, 'right');
+      break;
+    }
+    case 'mouse:drag': {
+      const from = mapPoint(action.from.x, action.from.y);
+      const to = mapPoint(action.to.x, action.to.y);
+      await harness.drag(from.x, from.y, to.x, to.y);
+      break;
+    }
+    case 'mouse:scroll': {
+      const { x, y } = mapPoint(action.x, action.y);
+      await harness.scroll(x, y, action.deltaX ?? 0, action.deltaY ?? 0);
+      break;
+    }
+    case 'keyboard:type':
+      await harness.type(action.content);
+      break;
+    case 'keyboard:enter':
+      await harness.key('Return');
+      break;
+    case 'keyboard:tab':
+      await harness.key('Tab');
+      break;
+    case 'keyboard:backspace':
+      await harness.key('BackSpace');
+      break;
+    case 'keyboard:select_all':
+      await harness.hotkey(['ctrl', 'a']);
+      break;
+    case 'keyboard:key': {
+      const k = action.key as string;
+      if (k.includes('+')) {
+        await harness.hotkey(k.split('+').map((s: string) => s.trim()));
+      } else {
+        await harness.key(k);
+      }
+      break;
+    }
+    default:
+      throw new Error(`dispatchNativeAction: unhandled variant "${v}"`);
+  }
+}
+
+const NATIVE_ACTION_VARIANTS = new Set([
+  'mouse:click',
+  'mouse:double_click',
+  'mouse:right_click',
+  'mouse:drag',
+  'mouse:scroll',
+  'keyboard:type',
+  'keyboard:enter',
+  'keyboard:tab',
+  'keyboard:backspace',
+  'keyboard:select_all',
+  'keyboard:key',
+]);
 
 let _screenshotInFlight = 0;
 
@@ -1722,26 +1838,31 @@ app.post('/screenshot', isAgentReady, async (req: Request, res: Response) => {
   const session = activeSessions.get(sessionId)!;
   console.log(`[screenshot] START session=${sessionId} mode=${session.mode} in_flight=${_screenshotInFlight}`);
   try {
-    // Use harness screenshot + transformScreenshot for ALL modes. This ensures the
-    // screenshot coordinate space matches the click coordinate space (both go through
-    // the Playwright page). For desktop mode, this captures the noVNC page which
-    // renders the VM desktop with noVNC's own scaling — the same coordinate space
-    // that page.mouse.click() uses.
-    const connector = session.agent.require(BrowserConnector);
-    const harness = connector.getHarness();
-    const tHarness = Date.now();
-    console.log(`[screenshot] harness_acquired=${tHarness - t0}ms`);
-    const rawImage = await harness.screenshot();
-    const tCapture = Date.now();
-    console.log(`[screenshot] playwright_capture=${tCapture - tHarness}ms`);
-    const image = await connector.transformScreenshot(rawImage);
-    const base64Image = await image.toBase64();
-    const cursorPosition = harness.getCursorPosition();
-    const tEncode = Date.now();
-    console.log(`[screenshot] base64_encode=${tEncode - tCapture}ms b64_len=${base64Image.length} total=${tEncode - t0}ms`);
-
-    cacheScreenshot(sessionId, base64Image, cursorPosition);
-    res.json({ screenshot: base64Image, cursorPosition });
+    if (session.displayHarness) {
+      const tNative = Date.now();
+      const { observationB64 } = await captureNativeObservation(session);
+      const tCapture = Date.now();
+      console.log(`[screenshot] native_capture=${tCapture - tNative}ms b64_len=${observationB64.length} total=${tCapture - t0}ms`);
+      cacheScreenshot(sessionId, observationB64, null);
+      res.json({ screenshot: observationB64, cursorPosition: null });
+    } else {
+      // Playwright path: page viewport screenshot with DPR normalisation and
+      // optional aspect-ratio scaling for headless web sessions.
+      const connector = session.agent.require(BrowserConnector);
+      const harness = connector.getHarness();
+      const tHarness = Date.now();
+      console.log(`[screenshot] harness_acquired=${tHarness - t0}ms`);
+      const rawImage = await harness.screenshot();
+      const tCapture = Date.now();
+      console.log(`[screenshot] playwright_capture=${tCapture - tHarness}ms`);
+      const image = await connector.transformScreenshot(rawImage);
+      const base64Image = await image.toBase64();
+      const cursorPosition = harness.getCursorPosition();
+      const tEncode = Date.now();
+      console.log(`[screenshot] base64_encode=${tEncode - tCapture}ms b64_len=${base64Image.length} total=${tEncode - t0}ms`);
+      cacheScreenshot(sessionId, base64Image, cursorPosition);
+      res.json({ screenshot: base64Image, cursorPosition });
+    }
     _screenshotInFlight--;
     console.log(`[screenshot] DONE total=${Date.now() - t0}ms in_flight=${_screenshotInFlight}`);
   } catch (err) {
@@ -1758,14 +1879,20 @@ app.post('/screenshot/latest', isAgentReady, async (req: Request, res: Response)
     res.json({ screenshot: session.latestScreenshot, cursorPosition: session.latestCursorPosition });
   } else {
     try {
-      const connector = session.agent.require(BrowserConnector);
-      const harness = connector.getHarness();
-      const rawImage = await harness.screenshot();
-      const image = await connector.transformScreenshot(rawImage);
-      const screenshot = await image.toBase64();
-      const cursorPosition = harness.getCursorPosition();
-      cacheScreenshot(sessionId!, screenshot, cursorPosition);
-      res.json({ screenshot, cursorPosition });
+      if (session.displayHarness) {
+        const { observationB64 } = await captureNativeObservation(session);
+        cacheScreenshot(sessionId!, observationB64, null);
+        res.json({ screenshot: observationB64, cursorPosition: null });
+      } else {
+        const connector = session.agent.require(BrowserConnector);
+        const harness = connector.getHarness();
+        const rawImage = await harness.screenshot();
+        const image = await connector.transformScreenshot(rawImage);
+        const screenshot = await image.toBase64();
+        const cursorPosition = harness.getCursorPosition();
+        cacheScreenshot(sessionId!, screenshot, cursorPosition);
+        res.json({ screenshot, cursorPosition });
+      }
     } catch (err) {
       handleAgentError(err, res, 'screenshot_failed');
     }
@@ -1854,24 +1981,37 @@ async function getFullPageContentForExtraction(page: any): Promise<string> {
   // Get all iframe element handles
   const iframeHandles = await page.locator('iframe').elementHandles();
 
-  // Iterate through each iframe handle and expand inline
+  // Iterate through each iframe handle and expand inline.
+  //
+  // Best-effort per iframe: the inline expansion runs an in-page
+  // DOMParser/innerHTML write, which is (a) a live DOM *mutation* and (b) a
+  // Trusted Types sink. Sites that enforce Trusted Types (e.g. LinkedIn) throw
+  // at `parseFromString` — importantly BEFORE the `replaceChild`, so nothing is
+  // mutated. We must not let one iframe abort the whole extraction: catch, skip
+  // that iframe, and fall through to the passive `page.content()` below, which
+  // serializes `documentElement.outerHTML` in the isolated world (no mutation,
+  // no main-world script, not a Trusted Types sink).
   for (const iframeHandle of iframeHandles) {
-    const frame = await iframeHandle.contentFrame();
-    if (frame) {
-      const iframeContent = await frame.content();
-      await iframeHandle.evaluate((iframeNode: HTMLIFrameElement, { content }: { content: string }) => {
-        const div = document.createElement('div');
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(content, 'text/html');
-        while (doc.body.firstChild) {
-          div.appendChild(doc.body.firstChild);
-        }
-        const headElements = doc.head.querySelectorAll('style, link[rel="stylesheet"]');
-        headElements.forEach(el => div.appendChild(el.cloneNode(true)));
-        div.dataset.expandedFromIframe = 'true';
-        div.dataset.iframeSrc = iframeNode.getAttribute('src') || '';
-        iframeNode.parentNode?.replaceChild(div, iframeNode);
-      }, { content: iframeContent });
+    try {
+      const frame = await iframeHandle.contentFrame();
+      if (frame) {
+        const iframeContent = await frame.content();
+        await iframeHandle.evaluate((iframeNode: HTMLIFrameElement, { content }: { content: string }) => {
+          const div = document.createElement('div');
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(content, 'text/html');
+          while (doc.body.firstChild) {
+            div.appendChild(doc.body.firstChild);
+          }
+          const headElements = doc.head.querySelectorAll('style, link[rel="stylesheet"]');
+          headElements.forEach(el => div.appendChild(el.cloneNode(true)));
+          div.dataset.expandedFromIframe = 'true';
+          div.dataset.iframeSrc = iframeNode.getAttribute('src') || '';
+          iframeNode.parentNode?.replaceChild(div, iframeNode);
+        }, { content: iframeContent });
+      }
+    } catch (err) {
+      console.warn(`[content] iframe inline-expansion skipped (likely Trusted Types): ${err}`);
     }
   }
 
@@ -2001,10 +2141,193 @@ app.post('/content', isAgentReady, async (req: Request, res: Response) => {
 //
 // The ``ANTICAPTCHA_KEY`` must be set in agent-service's own ``.env``; it
 // is never accepted from the request body.
+// --- Arkose Labs / FunCaptcha solve (best-effort) ---
+//
+// LinkedIn's login checkpoint uses Arkose FunCaptcha (the puzzle-piece "verify
+// you're human"), NOT reCAPTCHA. AntiCaptcha supports it via a FunCaptchaTask,
+// but sitekey extraction + token injection are inherently more heuristic than
+// reCAPTCHA and Arkose Enterprise often binds the token to the solver's IP
+// (proxyless can fail). This handler is therefore BEST-EFFORT: callers treat a
+// non-'solved' result as "hand off to an operator". Extends the /captcha/solve
+// route; reCAPTCHA v2 remains the default path.
+async function solveArkoseFunCaptcha(
+  sessionId: string,
+  clientKey: string,
+  res: Response,
+  t0: number,
+): Promise<Response> {
+  let publicKey: string | null = null;
+  let taskId: number | null = null;
+  try {
+    const session = activeSessions.get(sessionId)!;
+    const page = session.agent.page;
+    const pageUrl: string = page.url();
+
+    // Extract the Arkose public key (pk) and, if present, the funcaptcha API
+    // JS subdomain. Probe common shapes: a data-pkey attribute, the enforcement
+    // config on window, script src, or the FunCaptcha iframe URL.
+    const probe: { publicKey: string | null; subdomain: string | null } =
+      await page.evaluate(() => {
+        const pkFromEl = (document.querySelector('[data-pkey]') as HTMLElement | null)
+          ?.getAttribute('data-pkey');
+        if (pkFromEl) return { publicKey: pkFromEl, subdomain: null };
+
+        const urls: string[] = [];
+        document.querySelectorAll('script[src]').forEach((s) => {
+          urls.push((s as HTMLScriptElement).getAttribute('src') || '');
+        });
+        document.querySelectorAll('iframe[src]').forEach((f) => {
+          urls.push((f as HTMLIFrameElement).getAttribute('src') || '');
+        });
+        let subdomain: string | null = null;
+        for (const raw of urls) {
+          if (!raw) continue;
+          try {
+            const u = new URL(raw, window.location.href);
+            if (/arkoselabs\.com|funcaptcha\.com|arkose/i.test(u.hostname)) {
+              if (/api\.arkoselabs|-api\./i.test(u.hostname)) subdomain = u.hostname;
+              const pk = u.searchParams.get('pk') || u.searchParams.get('public_key');
+              if (pk) return { publicKey: pk, subdomain };
+              const m = raw.match(/[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/i);
+              if (m) return { publicKey: m[0], subdomain };
+            }
+          } catch { /* skip */ }
+        }
+        const cfg: any = (window as any).ArkoseEnforcement || (window as any).arkose;
+        const pk = cfg?.config?.publicKey || cfg?.publicKey || null;
+        return { publicKey: pk, subdomain };
+      });
+
+    publicKey = probe.publicKey;
+    if (!publicKey) {
+      return res.status(400).json({
+        error: 'no_sitekey',
+        message: 'No Arkose/FunCaptcha public key was found on the current page.',
+      });
+    }
+
+    const task: Record<string, unknown> = {
+      type: 'FunCaptchaTaskProxyless',
+      websiteURL: pageUrl,
+      websitePublicKey: publicKey,
+    };
+    if (probe.subdomain) task.funcaptchaApiJSSubdomain = probe.subdomain;
+
+    const createResp = await fetch('https://api.anti-captcha.com/createTask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientKey, task }),
+    });
+    const createBody: any = await createResp.json().catch(() => ({}));
+    if (!createResp.ok || createBody?.errorId !== 0) {
+      console.error(
+        `[captcha/solve] arkose createTask failed pk=${publicKey} ` +
+        `httpStatus=${createResp.status} errorCode=${createBody?.errorCode}`,
+      );
+      return res.status(502).json({
+        error: 'anticaptcha_api_error',
+        message: `createTask failed: ${createBody?.errorCode || 'unknown'} - ${createBody?.errorDescription || ''}`,
+      });
+    }
+    taskId = createBody.taskId;
+    console.log(`[captcha/solve] arkose task_created task_id=${taskId} pk=${publicKey}`);
+
+    let token: string | null = null;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      await sleep(3000);
+      const pollResp = await fetch('https://api.anti-captcha.com/getTaskResult', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientKey, taskId }),
+      });
+      const pollBody: any = await pollResp.json().catch(() => ({}));
+      if (!pollResp.ok || pollBody?.errorId !== 0) {
+        return res.status(502).json({
+          error: 'anticaptcha_api_error',
+          message: `getTaskResult failed: ${pollBody?.errorCode || 'unknown'}`,
+        });
+      }
+      if (pollBody.status === 'ready') {
+        token = pollBody.solution?.token || null;
+        break;
+      }
+    }
+
+    if (!token) {
+      return res.status(504).json({
+        error: 'solve_timeout',
+        message: 'AntiCaptcha did not return a FunCaptcha token within ~4 minutes.',
+      });
+    }
+
+    // Inject the Arkose token: fill the known token fields and invoke any
+    // registered Arkose completion callback. Heuristic — Arkose integrations
+    // vary — hence best-effort.
+    const injected: boolean = await page.evaluate((tkn: string) => {
+      let set = false;
+      const selectors = [
+        'input[name="fc-token"]',
+        'input[name="verification-token"]',
+        'input[name="arkose-token"]',
+        '#FunCaptcha-Token',
+        'input#fc-token',
+      ];
+      for (const sel of selectors) {
+        document.querySelectorAll(sel).forEach((el) => {
+          (el as HTMLInputElement).value = tkn;
+          try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch { /* best-effort */ }
+          try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch { /* best-effort */ }
+          set = true;
+        });
+      }
+      try {
+        const ark: any = (window as any).arkose || (window as any).ArkoseEnforcement;
+        const cb = ark?.config?.onCompleted || ark?.onCompleted;
+        if (typeof cb === 'function') { cb({ token: tkn }); set = true; }
+      } catch { /* best-effort */ }
+      return set;
+    }, token);
+
+    let settledVia: 'networkidle' | 'timeout' = 'timeout';
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 15_000 });
+      settledVia = 'networkidle';
+    } catch { settledVia = 'timeout'; }
+
+    const solveTimeMs = Date.now() - t0;
+    console.log(
+      `[captcha/solve] arkose solved task_id=${taskId} pk=${publicKey} ` +
+      `solve_time_ms=${solveTimeMs} injected=${injected} settled_via=${settledVia}`,
+    );
+    return res.json({
+      status: injected ? 'solved' : 'token_uninjected',
+      solve_time_ms: solveTimeMs,
+      sitekey: publicKey,
+      variant: 'arkose',
+      task_id: taskId,
+      injected,
+      settled: settledVia !== 'timeout',
+      settled_via: settledVia,
+      note: 'Arkose/FunCaptcha solve is best-effort; verify the page advanced.',
+    });
+  } catch (err) {
+    console.error(
+      `[captcha/solve] arkose unexpected error task_id=${taskId} pk=${publicKey}: ` +
+      `${err instanceof Error ? err.message : err}`,
+    );
+    handleAgentError(err, res, 'captcha_solve_failed');
+    return res;
+  }
+}
+
 app.post('/captcha/solve', isAgentReady, async (req: Request, res: Response) => {
   const { sessionId, variant: variantRaw } = req.body;
-  const variant: 'v2_checkbox' | 'v2_invisible' =
-    variantRaw === 'v2_invisible' ? 'v2_invisible' : 'v2_checkbox';
+  const variant: 'v2_checkbox' | 'v2_invisible' | 'arkose' =
+    variantRaw === 'arkose'
+      ? 'arkose'
+      : variantRaw === 'v2_invisible'
+        ? 'v2_invisible'
+        : 'v2_checkbox';
 
   const clientKey = process.env.ANTICAPTCHA_KEY;
   if (!clientKey) {
@@ -2015,6 +2338,13 @@ app.post('/captcha/solve', isAgentReady, async (req: Request, res: Response) => 
   }
 
   const t0 = Date.now();
+
+  // Arkose/FunCaptcha (e.g. LinkedIn login) uses a distinct task type +
+  // injection path; reCAPTCHA v2 continues below.
+  if (variant === 'arkose') {
+    return await solveArkoseFunCaptcha(sessionId, clientKey, res, t0);
+  }
+
   let sitekey: string | null = null;
   let taskId: number | null = null;
 
@@ -2337,832 +2667,16 @@ app.post('/resume', isAgentReady, async (req: Request, res: Response) => {
   }
 });
 
-// --- Google Meet endpoints ---
-
-app.post('/googlemeet/join', auth, async (req: Request, res: Response) => {
-  const { meetUrl, displayName } = req.body;
-  if (!meetUrl) {
-    return res.status(400).json({ error: 'bad_request', message: 'meetUrl is required.' });
-  }
-
-  const name = displayName || 'Unity Assistant';
-  const sessionId = randomUUID();
-  const t0 = Date.now();
-  console.log(`[googlemeet/join] BEGIN sessionId=${sessionId} url=${meetUrl}`);
-
-  try {
-    const agent = await startGoogleMeetBrowser(meetUrl);
-
-    const result = await googleMeetJoinFlow(agent, name);
-    console.log(`[googlemeet/join] Join flow completed: status=${result.status}${result.status === 'error' ? ` reason="${result.reason}"` : ''} [${Date.now() - t0}ms]`);
-
-    if (result.status === 'error') {
-      await agent.stop().catch(() => {});
-      return res.status(400).json({
-        error: 'join_failed',
-        reason: result.reason,
-        message: `Could not join Google Meet: ${result.reason}`,
-      });
-    }
-
-    const sessionInfo: GoogleMeetSessionInfo = {
-      agent,
-      status: result.status,
-      meetUrl,
-      displayName: name,
-      createdAt: new Date(),
-      participants: [],
-      activeSpeaker: null,
-      pollIntervalId: null,
-      latestScreenshot: null,
-      presenting: false,
-      desktopTabPage: null,
-    };
-
-    // Start polling the DOM for meeting state and active speaker
-    sessionInfo.pollIntervalId = setInterval(() => {
-      googleMeetPollState(sessionId).then(() => {
-        const s = googleMeetSessions.get(sessionId);
-        if (s && (s.status === 'ended' || s.status === 'removed' || s.status === 'error')) {
-          if (s.pollIntervalId) clearInterval(s.pollIntervalId);
-          s.pollIntervalId = null;
-          console.log(`[googlemeet] Session ${sessionId} ended (status=${s.status}), polling stopped.`);
-        }
-      });
-    }, 1000);
-
-    googleMeetSessions.set(sessionId, sessionInfo);
-
-    console.log(`[googlemeet/join] DONE sessionId=${sessionId} status=${result.status} [${Date.now() - t0}ms]`);
-    res.json({ status: result.status, sessionId });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const stack = err instanceof Error ? err.stack : undefined;
-    console.error(`[googlemeet/join] EXCEPTION after ${Date.now() - t0}ms: ${message}`, stack ? `\n${stack}` : '');
-    res.status(500).json({ error: 'join_exception', message });
-  }
-});
-
-app.post('/googlemeet/leave', auth, async (req: Request, res: Response) => {
-  const { sessionId } = req.body;
-  if (!sessionId) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
-  }
-
-  const session = googleMeetSessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
-  }
-
-  try {
-    if (session.pollIntervalId) {
-      clearInterval(session.pollIntervalId);
-      session.pollIntervalId = null;
-    }
-
-    await clickLeaveButton(session, 'google_meet');
-
-    if (session.desktopTabPage) {
-      await session.desktopTabPage.close().catch(() => {});
-      session.desktopTabPage = null;
-    }
-    session.presenting = false;
-
-    await session.agent.stop();
-    session.status = 'ended';
-    googleMeetSessions.delete(sessionId);
-
-    console.log(`[googlemeet/leave] Session ${sessionId} stopped.`);
-    res.json({ status: 'left' });
-  } catch (err) {
-    console.error(`[googlemeet/leave] Error stopping session ${sessionId}:`, err);
-    googleMeetSessions.delete(sessionId);
-    const message = err instanceof Error ? err.message : String(err);
-    res.status(500).json({ error: 'leave_failed', message });
-  }
-});
-
-app.get('/googlemeet/sessions', auth, async (_req: Request, res: Response) => {
-  const sessions = Array.from(googleMeetSessions.entries()).map(([sessionId, session]) => ({
-    sessionId,
-    meetUrl: session.meetUrl,
-    status: session.status,
-    displayName: session.displayName,
-    createdAt: session.createdAt,
-  }));
-  res.json({ sessions });
-});
-
-app.get('/googlemeet/state', auth, async (req: Request, res: Response) => {
-  const sessionId = req.query.sessionId as string;
-  if (!sessionId) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId query parameter is required.' });
-  }
-
-  const session = googleMeetSessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
-  }
-
-  res.json({
-    status: session.status,
-    meetUrl: session.meetUrl,
-    displayName: session.displayName,
-    createdAt: session.createdAt,
-    participants: session.participants,
-    activeSpeaker: session.activeSpeaker,
-  });
-});
-
-app.get('/googlemeet/screenshot/latest', auth, async (req: Request, res: Response) => {
-  const sessionId = req.query.sessionId as string;
-  if (!sessionId) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId query parameter is required.' });
-  }
-
-  const session = googleMeetSessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
-  }
-
-  if (!session.latestScreenshot) {
-    return res.status(204).end();
-  }
-
-  res.json({ screenshot: session.latestScreenshot });
-});
-
-app.post('/googlemeet/present', auth, async (req: Request, res: Response) => {
-  const { sessionId, desktopUrl } = req.body;
-  if (!sessionId || !desktopUrl) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId and desktopUrl are required.' });
-  }
-
-  const session = googleMeetSessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
-  }
-  if (session.presenting) {
-    return res.json({ status: 'already_presenting' });
-  }
-
-  const t0 = Date.now();
-  console.log(`[googlemeet/present] BEGIN sessionId=${sessionId} desktopUrl=${desktopUrl}`);
-
-  try {
-    const context = session.agent.context;
-    const desktopTab = await context.newPage();
-    await desktopTab.goto(desktopUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    console.log(`[googlemeet/present] Desktop tab opened [${Date.now() - t0}ms]`);
-
-    // Switch back to the Meet tab for the LLM to click "Present now"
-    const meetPage = session.agent.page;
-    await meetPage.bringToFront();
-
-    await runMagnitudeLoop(session.agent, MEET_PRESENT_TAB_TASK, MEET_PRESENT_MAX_ITERATIONS, 'googlemeet/present');
-    console.log(`[googlemeet/present] Present flow completed [${Date.now() - t0}ms]`);
-
-    session.presenting = true;
-    session.desktopTabPage = desktopTab;
-
-    res.json({ status: 'presenting' });
-    console.log(`[googlemeet/present] DONE [${Date.now() - t0}ms]`);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[googlemeet/present] EXCEPTION after ${Date.now() - t0}ms: ${message}`);
-    res.status(500).json({ error: 'present_failed', message });
-  }
-});
-
-app.post('/googlemeet/stop-present', auth, async (req: Request, res: Response) => {
-  const { sessionId } = req.body;
-  if (!sessionId) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
-  }
-
-  const session = googleMeetSessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'session_not_found', message: `Google Meet session ${sessionId} not found.` });
-  }
-  if (!session.presenting) {
-    return res.json({ status: 'not_presenting' });
-  }
-
-  const t0 = Date.now();
-  console.log(`[googlemeet/stop-present] BEGIN sessionId=${sessionId}`);
-
-  try {
-    // Ensure Meet tab is in front for the LLM
-    await session.agent.page.bringToFront();
-
-    await runMagnitudeLoop(session.agent, MEET_STOP_PRESENT_TASK, MEET_PRESENT_MAX_ITERATIONS, 'googlemeet/stop-present');
-    console.log(`[googlemeet/stop-present] Stop flow completed [${Date.now() - t0}ms]`);
-
-    if (session.desktopTabPage) {
-      await session.desktopTabPage.close().catch(() => {});
-    }
-
-    session.presenting = false;
-    session.desktopTabPage = null;
-
-    res.json({ status: 'stopped' });
-    console.log(`[googlemeet/stop-present] DONE [${Date.now() - t0}ms]`);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[googlemeet/stop-present] EXCEPTION after ${Date.now() - t0}ms: ${message}`);
-    res.status(500).json({ error: 'stop_present_failed', message });
-  }
-});
-
-// =====================================================================
-// Microsoft Teams Meeting browser automation
-// ---------------------------------------------------------------------
-// Mirrors the Google Meet implementation above: a dedicated browser
-// session per meeting, configured with the same PulseAudio sinks/sources
-// used by the LiveKit audio bridge, with per-session DOM polling for
-// participants, active speaker, and meeting end detection.
-// =====================================================================
-
-const startTeamsMeetBrowser = async (meetUrl: string): Promise<BrowserAgent> => {
-  try {
-    const agent = await startBrowserAgent({
-      url: meetUrl,
-      browser: {
-        launchOptions: {
-          headless: false,
-          args: [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-            '--auto-select-desktop-capture-source="Entire screen"',
-            '--auto-select-tab-capture-source-by-title=Desktop',
-          ],
-          env: {
-            ...process.env,
-            PULSE_SINK: "agent_sink",
-            PULSE_SOURCE: "meet_mic",
-          },
-          downloadsPath: defaultBrowserPaths.downloadsPath || undefined,
-          tracesDir: defaultBrowserPaths.tracesDir || undefined,
-        },
-        contextOptions: {
-          viewport: null,
-          ignoreHTTPSErrors: true,
-          permissions: ['camera', 'microphone'],
-        },
-      },
-      narrate: true,
-      llm: getLlmConfig()
-    });
-    agent.context.setDefaultNavigationTimeout(90000);
-    console.log("✅ Teams Meet BrowserAgent started successfully.");
-    return agent;
-  } catch (err) {
-    console.error("❌ Failed to start Teams Meet BrowserAgent:", err);
-    throw err;
-  }
-};
-
-type TeamsMeetStatus = 'joining' | 'lobby' | 'active' | 'ended' | 'removed' | 'error';
-
-interface TeamsMeetParticipant {
-  name: string;
-  isSpeaking: boolean;
-}
-
-interface TeamsMeetSessionInfo {
-  agent: BrowserAgent;
-  status: TeamsMeetStatus;
-  meetUrl: string;
-  displayName: string;
-  createdAt: Date;
-  participants: TeamsMeetParticipant[];
-  activeSpeaker: string | null;
-  pollIntervalId: ReturnType<typeof setInterval> | null;
-  latestScreenshot: string | null;
-  presenting: boolean;
-  desktopTabPage: any | null;
-}
-
-const teamsMeetSessions = new Map<string, TeamsMeetSessionInfo>();
-
-type TeamsMeetJoinResult =
-  | { status: 'active' | 'lobby' }
-  | { status: 'error'; reason: string };
-
-// Teams pre-join UI varies across the consumer (teams.live.com) and business
-// (teams.microsoft.com) clients. The consumer UI exposes a name input, camera
-// preview + toggle, a "Computer audio" card with Microphone + Speaker dropdowns
-// and a mic mute toggle, and a "Join now" button — all on a single pre-join
-// dialog. Audio is therefore configured BEFORE clicking Join (matching the
-// Google Meet flow). The in-meeting device-settings path is kept as a fallback
-// for clients that skip the pre-join dialog entirely.
-
-const TEAMS_PREPARE_TASK =
-  `You are on a Microsoft Teams meeting entry flow, before the pre-join screen is fully ready.\n` +
-  `Teams may show either the consumer (teams.live.com) or business (teams.microsoft.com) UI.\n` +
-  `Complete these steps in order, skipping any that do not apply:\n` +
-  `1. If a "Continue on this browser" or "Join on the web instead" button is visible, click it.\n` +
-  `2. Dismiss any cookie banners, "Got it" buttons, or download-the-app prompts.\n` +
-  `3. Only if the page explicitly requires sign-in AND a "Join as a guest" / "Continue without an account" option exists, take that option. Otherwise ignore this step.\n` +
-  `4. Turn OFF the camera if its toggle is currently on. Leave the microphone toggle alone.\n` +
-  `Stop as soon as the pre-join screen (with a "Type your name" input and a "Join now" button) is visible and stable.\n` +
-  `Do NOT type into the name field — that is handled in a separate dedicated step.\n` +
-  `Do NOT click "Join now" or "Join meeting" — joining is handled in a separate later step.\n` +
-  `Do NOT open or touch the Microphone or Speaker dropdowns yet.\n` +
-  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
-  `If the page shows a fatal error like "this meeting has expired" or "invalid meeting link", do nothing — just stop.`;
-
-const TEAMS_FILL_NAME_TASK = (displayName: string) =>
-  `You are on the Microsoft Teams pre-join screen. There is a single-line text input labelled "Type your name" or "Enter name" — it is the ONLY thing you should interact with in this task.\n` +
-  `Important: if the input shows the words "Type your name" in grey/muted placeholder text and no real typed characters, the field is EMPTY and you MUST fill it. Do not assume it already contains a name just because those words are visible.\n` +
-  `Steps:\n` +
-  `1. Click inside the name input field to focus it.\n` +
-  `2. Press Control+A (the "keyboard:select_all" action) to select any existing content.\n` +
-  `3. Type exactly: ${displayName}\n` +
-  `Only mark the task done once the input visibly contains the typed text "${displayName}" in normal (non-placeholder) styling.\n` +
-  `Do NOT click "Join now" or "Join meeting".\n` +
-  `Do NOT toggle the camera, microphone, or any audio controls.\n` +
-  `Do NOT open the Microphone or Speaker dropdowns.`;
-
-const TEAMS_ENSURE_COMPUTER_AUDIO_TASK =
-  `You are on a Microsoft Teams pre-join screen. There is an audio selector with three options: "Computer audio", "Phone audio", and "Don't use audio".\n` +
-  `If the "Computer audio" radio is not already selected, click it.\n` +
-  `Do NOT click "Phone audio" or "Don't use audio".\n` +
-  `Do NOT click "Join now".`;
-
-const TEAMS_SELECT_MIC_TASK = (micLabel: string) =>
-  `You are on a Microsoft Teams pre-join screen, inside the "Computer audio" card.\n` +
-  `Click the Microphone dropdown (currently showing a device name like "Default" or similar).\n` +
-  `From the opened list, select the option whose name contains "${micLabel}".\n` +
-  `Once done, press the Escape key to dismiss it (do NOT click any other button).\n` +
-  `Do NOT toggle the mute switch.\n` +
-  `Do NOT click "Join now".`;
-
-const TEAMS_SELECT_SPEAKER_TASK = (speakerLabel: string) =>
-  `You are on a Microsoft Teams pre-join screen, inside the "Computer audio" card.\n` +
-  `Click the Speaker dropdown (currently showing a device name like "Default" or similar).\n` +
-  `From the opened list, select the option whose name contains "${speakerLabel}".\n` +
-  `Once done, press the Escape key to dismiss it (do NOT click any other button).\n` +
-  `Do NOT click "Join now".`;
-
-const TEAMS_ENSURE_MIC_UNMUTED_TASK =
-  `You are on a Microsoft Teams pre-join screen, inside the "Computer audio" card.\n` +
-  `Next to the selected Microphone there is a mute toggle switch.\n` +
-  `If the toggle is currently muted (off / grey / crossed-out icon), click it once to unmute.\n` +
-  `If the toggle is already unmuted (blue / on), do nothing.\n` +
-  `Do NOT click "Join now".`;
-
-const TEAMS_CLICK_JOIN_TASK = (displayName: string) =>
-  `You are on a Microsoft Teams meeting pre-join screen. The name and audio devices should already be configured.\n` +
-  `Click the "Join now" button (sometimes labelled "Join meeting") to enter the meeting.\n` +
-  `Safety net — only if, after clicking, the page surfaces a tooltip or inline error such as "Please enter a name before joining" (meaning the name field is still empty): click the "Type your name" input, press Control+A to select any existing content, type exactly "${displayName}", then click "Join now" again. Do NOT invent a different name such as "Guest" — always use "${displayName}".\n` +
-  `Ignore any warnings about camera/microphone not being found — those are expected.\n` +
-  `If the page shows a fatal error like "this meeting has expired" or "invalid meeting link", do nothing — just stop.`;
-
-const TEAMS_PRESENT_TAB_TASK =
-  `You are in an active Microsoft Teams meeting.\n` +
-  `Click the "Share" or "Share content" button (screen share icon in the meeting toolbar).\n` +
-  `Then select the "Browser tab" / "Microsoft Edge tab" / "Chrome tab" option from the share menu.\n` +
-  `A tab will be auto-selected — just confirm the selection if a dialog appears.\n` +
-  `Do NOT select "Screen", "Window", or "PowerPoint Live".`;
-
-const TEAMS_STOP_PRESENT_TASK =
-  `You are in an active Microsoft Teams meeting and currently sharing a tab.\n` +
-  `Click the "Stop sharing" or "Stop presenting" button to end the presentation.\n` +
-  `If there is no stop button visible, look for a "You are sharing" banner or bar and click stop there.`;
-
-const TEAMS_LEAVE_TASK =
-  `You are in an active Microsoft Teams meeting.\n` +
-  `Click the red "Leave" button (hangup / end-call icon) in the meeting controls bar.\n` +
-  `If a dropdown or confirmation appears with "Leave" and "End meeting" options, ` +
-  `click "Leave" — do NOT click "End meeting" for everyone.\n` +
-  `If the meeting has already ended (e.g. "You left the meeting" is visible), do nothing — just stop.`;
-
-// In-meeting fallback: only used when the pre-join audio configuration failed.
-// Consumer Teams typically exposes audio devices via a caret next to the mic
-// button; business Teams hides them behind "More (…) → Settings → Device settings".
-const TEAMS_AUDIO_SETTINGS_TASK =
-  `You are in an active Microsoft Teams meeting. The device settings panel is currently closed.\n` +
-  `Open it using whichever of these paths is available:\n` +
-  `  (a) Click the small caret/arrow next to the Microphone button in the meeting toolbar; a device menu should open.\n` +
-  `  (b) If (a) is not visible, click "More" / "..." in the meeting toolbar, then "Settings", then "Device settings".\n` +
-  `Once the device options are visible, stop. Do NOT close them.`;
-
-const TEAMS_PREPARE_MAX_ITERATIONS = 4;
-const TEAMS_FILL_NAME_MAX_ITERATIONS = 3;
-const TEAMS_JOIN_MAX_ITERATIONS = 3;
-const TEAMS_PRESENT_MAX_ITERATIONS = 3;
-// Single-click audio sub-steps run with a tight iteration cap.
-const TEAMS_AUDIO_STEP_MAX_ITERATIONS = 2;
-// The in-meeting settings-opener may need a couple of clicks to navigate menus.
-const TEAMS_AUDIO_OPEN_MAX_ITERATIONS = 3;
-
-async function teamsMeetJoinFlow(agent: BrowserAgent, displayName: string): Promise<TeamsMeetJoinResult> {
-  const page = agent.page;
-  await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
-
-  const pageUrl = page.url?.() ?? 'unknown';
-  console.log(`[teamsmeet/join] Page loaded: url=${pageUrl}`);
-
-  // Phase 1: pre-join prep (continue-in-browser, popups, camera off). Name
-  // entry is handled as its own dedicated task below — keeping PREPARE narrow
-  // avoids the LLM silently skipping name entry inside a multi-step checklist.
-  console.log('[teamsmeet/join] Phase 1: prepare...');
-  await runMagnitudeLoop(agent, TEAMS_PREPARE_TASK, TEAMS_PREPARE_MAX_ITERATIONS, 'teamsmeet/prepare');
-
-  // Phase 1a: fill the display name. Isolated as a single-purpose task so the
-  // LLM cannot conflate the placeholder text "Type your name" with a pre-filled
-  // value.
-  console.log('[teamsmeet/join] Phase 1a: filling display name...');
-  await runMagnitudeLoop(agent, TEAMS_FILL_NAME_TASK(displayName), TEAMS_FILL_NAME_MAX_ITERATIONS, 'teamsmeet/fill-name');
-
-  // Phase 1b: pre-join audio device configuration. The consumer Teams UI exposes
-  // mic/speaker dropdowns on the pre-join dialog itself, so we configure the
-  // virtual devices here — mirroring the Google Meet flow. Failures fall through
-  // to an in-meeting fallback after join.
-  console.log('[teamsmeet/join] Phase 1b: configuring pre-join audio devices...');
-  let preJoinAudioOk = true;
-  try {
-    await runMagnitudeLoop(agent, TEAMS_ENSURE_COMPUTER_AUDIO_TASK, TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/audio-computer');
-    await runMagnitudeLoop(agent, TEAMS_SELECT_MIC_TASK('agent_sink'), TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/select-mic');
-    await runMagnitudeLoop(agent, TEAMS_SELECT_SPEAKER_TASK('meet_sink'), TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/select-speaker');
-    await runMagnitudeLoop(agent, TEAMS_ENSURE_MIC_UNMUTED_TASK, TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/mic-unmuted');
-  } catch (err) {
-    preJoinAudioOk = false;
-    console.log(`[teamsmeet/join] Phase 1b: pre-join audio setup failed — will retry in-meeting: ${err}`);
-  }
-
-  // Phase 2: click join
-  console.log('[teamsmeet/join] Phase 2: clicking join...');
-  await runMagnitudeLoop(agent, TEAMS_CLICK_JOIN_TASK(displayName), TEAMS_JOIN_MAX_ITERATIONS, 'teamsmeet/click-join');
-
-  // Phase 2b (fallback): only runs if pre-join audio config threw. Business
-  // Teams sometimes skips the pre-join dialog entirely — in that case the
-  // in-meeting Settings → Device settings panel is our only route.
-  if (!preJoinAudioOk) {
-    await sleep(2500);
-    console.log('[teamsmeet/join] Phase 2b: pre-join audio failed — configuring via in-meeting Settings...');
-    try {
-      await runMagnitudeLoop(agent, TEAMS_AUDIO_SETTINGS_TASK, TEAMS_AUDIO_OPEN_MAX_ITERATIONS, 'teamsmeet/audio-open');
-      await runMagnitudeLoop(agent, TEAMS_SELECT_MIC_TASK('agent_sink'), TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/select-mic-fallback');
-      await runMagnitudeLoop(agent, TEAMS_SELECT_SPEAKER_TASK('meet_sink'), TEAMS_AUDIO_STEP_MAX_ITERATIONS, 'teamsmeet/select-speaker-fallback');
-    } catch (err) {
-      console.log(`[teamsmeet/join] Phase 2b: in-meeting audio fallback also failed — using defaults: ${err}`);
-    }
-  }
-
-  // Determine outcome by checking the page state after the agent finished
-  await sleep(1500);
-
-  // Active in-meeting indicators (Teams uses these across consumer + business UIs)
-  const meetingActive = await page.locator(
-    '[data-tid="hangup-button"], [data-tid="call-end"], [aria-label*="Leave" i], [aria-label*="Hang up" i], [data-tid="toggle-mute"]'
-  ).first().isVisible({ timeout: 5000 }).catch(() => false);
-  if (meetingActive) return { status: 'active' };
-
-  const inLobby = await page.locator(
-    'text=/waiting for|someone will let you in|when the meeting starts|admit you/i'
-  ).first().isVisible({ timeout: 3000 }).catch(() => false);
-  if (inLobby) return { status: 'lobby' };
-
-  const hasError = await page.locator(
-    'text=/this meeting has expired|invalid meeting|meeting not found|sign in to join|cannot join/i'
-  ).first().isVisible({ timeout: 1000 }).catch(() => false);
-  if (hasError) {
-    const errorMsg = await page.locator(
-      'text=/this meeting has expired|invalid meeting|meeting not found|sign in to join|cannot join/i'
-    ).first().textContent().catch(() => 'unknown');
-    return { status: 'error', reason: `teams_page_error: "${errorMsg}" (url=${pageUrl})` };
-  }
-
-  const hasJoinBtn = await page.locator(
-    'button:has-text("Join now"), button:has-text("Join meeting")'
-  ).first().isVisible({ timeout: 1000 }).catch(() => false);
-  if (hasJoinBtn) {
-    return { status: 'error', reason: `join_button_still_visible: Agent completed but join button was not clicked (url=${pageUrl})` };
-  }
-
-  // No definitive signal — assume we're waiting for admission
-  return { status: 'lobby' };
-}
-
-async function teamsMeetPollState(sessionId: string): Promise<void> {
-  const session = teamsMeetSessions.get(sessionId);
-  if (!session || session.status === 'ended' || session.status === 'error') return;
-
-  try {
-    const page = session.agent.page;
-
-    // Detect if meeting has ended / was kicked
-    const meetingEnded = await page.locator(
-      'text=/the meeting has ended|you left the meeting|you have been removed|removed from the meeting/i'
-    ).first().isVisible({ timeout: 500 }).catch(() => false);
-
-    if (meetingEnded) {
-      session.status = 'ended';
-      return;
-    }
-
-    // If we were in the lobby, check if we're admitted now
-    if (session.status === 'lobby') {
-      const admitted = await page.locator(
-        '[data-tid="hangup-button"], [data-tid="call-end"], [aria-label*="Leave" i], [aria-label*="Hang up" i]'
-      ).first().isVisible({ timeout: 500 }).catch(() => false);
-      if (admitted) session.status = 'active';
-
-      const denied = await page.locator(
-        'text=/not admitted|denied|sorry, but you were not admitted|not let in/i'
-      ).first().isVisible({ timeout: 500 }).catch(() => false);
-      if (denied) {
-        session.status = 'removed';
-        return;
-      }
-    }
-
-    // Scrape participants and active speaker from the DOM.
-    // Teams renders participant tiles inside the meeting stage with various
-    // data-tid attributes; the speaking indicator is typically a class or
-    // aria attribute on the tile container.
-    const participants: TeamsMeetParticipant[] = [];
-    let activeSpeaker: string | null = null;
-
-    const tileElements = await page.locator(
-      '[data-tid="participant-tile"], [data-tid="stream-content"], [data-cid="calling-participant-stream"]'
-    ).all().catch(() => []);
-
-    for (const el of tileElements) {
-      const name = await el.getAttribute('aria-label').catch(() => null)
-        || await el.getAttribute('data-tid-displayname').catch(() => null)
-        || await el.innerText().catch(() => null);
-      if (!name) continue;
-
-      const containerClasses = await el.evaluate(
-        (node: Element) => node.closest('[class]')?.className || ''
-      ).catch(() => '');
-      const ariaLive = await el.getAttribute('aria-live').catch(() => '') || '';
-      const isSpeaking = /speaking/i.test(containerClasses) ||
-        /speaking/i.test(ariaLive) ||
-        (await el.locator('[class*="speaking" i], [aria-label*="speaking" i]').first().isVisible({ timeout: 100 }).catch(() => false));
-
-      const cleanName = name.split('\n')[0].trim();
-      if (!cleanName) continue;
-      participants.push({ name: cleanName, isSpeaking });
-      if (isSpeaking) activeSpeaker = cleanName;
-    }
-
-    session.participants = participants;
-    session.activeSpeaker = activeSpeaker;
-
-    // Cache a screenshot of the Teams tab for non-blocking reads
-    try {
-      const raw = await session.agent.page.screenshot({ type: 'jpeg', quality: 85 });
-      session.latestScreenshot = Buffer.from(raw).toString('base64');
-    } catch {
-      // Screenshot may fail transiently; keep the previous cached value
-    }
-  } catch {
-    // Browser may have disconnected
-    session.status = 'error';
-  }
-}
-
-app.post('/teamsmeet/join', auth, async (req: Request, res: Response) => {
-  const { meetUrl, displayName } = req.body;
-  if (!meetUrl) {
-    return res.status(400).json({ error: 'bad_request', message: 'meetUrl is required.' });
-  }
-
-  const name = displayName || 'Unity Assistant';
-  const sessionId = randomUUID();
-  const t0 = Date.now();
-  console.log(`[teamsmeet/join] BEGIN sessionId=${sessionId} url=${meetUrl}`);
-
-  try {
-    const agent = await startTeamsMeetBrowser(meetUrl);
-
-    const result = await teamsMeetJoinFlow(agent, name);
-    console.log(`[teamsmeet/join] Join flow completed: status=${result.status}${result.status === 'error' ? ` reason="${result.reason}"` : ''} [${Date.now() - t0}ms]`);
-
-    if (result.status === 'error') {
-      await agent.stop().catch(() => {});
-      return res.status(400).json({
-        error: 'join_failed',
-        reason: result.reason,
-        message: `Could not join Teams meeting: ${result.reason}`,
-      });
-    }
-
-    const sessionInfo: TeamsMeetSessionInfo = {
-      agent,
-      status: result.status,
-      meetUrl,
-      displayName: name,
-      createdAt: new Date(),
-      participants: [],
-      activeSpeaker: null,
-      pollIntervalId: null,
-      latestScreenshot: null,
-      presenting: false,
-      desktopTabPage: null,
-    };
-
-    sessionInfo.pollIntervalId = setInterval(() => {
-      teamsMeetPollState(sessionId).then(() => {
-        const s = teamsMeetSessions.get(sessionId);
-        if (s && (s.status === 'ended' || s.status === 'removed' || s.status === 'error')) {
-          if (s.pollIntervalId) clearInterval(s.pollIntervalId);
-          s.pollIntervalId = null;
-          console.log(`[teamsmeet] Session ${sessionId} ended (status=${s.status}), polling stopped.`);
-        }
-      });
-    }, 1000);
-
-    teamsMeetSessions.set(sessionId, sessionInfo);
-
-    console.log(`[teamsmeet/join] DONE sessionId=${sessionId} status=${result.status} [${Date.now() - t0}ms]`);
-    res.json({ status: result.status, sessionId });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const stack = err instanceof Error ? err.stack : undefined;
-    console.error(`[teamsmeet/join] EXCEPTION after ${Date.now() - t0}ms: ${message}`, stack ? `\n${stack}` : '');
-    res.status(500).json({ error: 'join_exception', message });
-  }
-});
-
-app.post('/teamsmeet/leave', auth, async (req: Request, res: Response) => {
-  const { sessionId } = req.body;
-  if (!sessionId) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
-  }
-
-  const session = teamsMeetSessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'session_not_found', message: `Teams meeting session ${sessionId} not found.` });
-  }
-
-  try {
-    if (session.pollIntervalId) {
-      clearInterval(session.pollIntervalId);
-      session.pollIntervalId = null;
-    }
-
-    await clickLeaveButton(session, 'teams_meet');
-
-    if (session.desktopTabPage) {
-      await session.desktopTabPage.close().catch(() => {});
-      session.desktopTabPage = null;
-    }
-    session.presenting = false;
-
-    await session.agent.stop();
-    session.status = 'ended';
-    teamsMeetSessions.delete(sessionId);
-
-    console.log(`[teamsmeet/leave] Session ${sessionId} stopped.`);
-    res.json({ status: 'left' });
-  } catch (err) {
-    console.error(`[teamsmeet/leave] Error stopping session ${sessionId}:`, err);
-    teamsMeetSessions.delete(sessionId);
-    const message = err instanceof Error ? err.message : String(err);
-    res.status(500).json({ error: 'leave_failed', message });
-  }
-});
-
-app.get('/teamsmeet/sessions', auth, async (_req: Request, res: Response) => {
-  const sessions = Array.from(teamsMeetSessions.entries()).map(([sessionId, session]) => ({
-    sessionId,
-    meetUrl: session.meetUrl,
-    status: session.status,
-    displayName: session.displayName,
-    createdAt: session.createdAt,
-  }));
-  res.json({ sessions });
-});
-
-app.get('/teamsmeet/state', auth, async (req: Request, res: Response) => {
-  const sessionId = req.query.sessionId as string;
-  if (!sessionId) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId query parameter is required.' });
-  }
-
-  const session = teamsMeetSessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'session_not_found', message: `Teams meeting session ${sessionId} not found.` });
-  }
-
-  res.json({
-    status: session.status,
-    meetUrl: session.meetUrl,
-    displayName: session.displayName,
-    createdAt: session.createdAt,
-    participants: session.participants,
-    activeSpeaker: session.activeSpeaker,
-  });
-});
-
-app.get('/teamsmeet/screenshot/latest', auth, async (req: Request, res: Response) => {
-  const sessionId = req.query.sessionId as string;
-  if (!sessionId) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId query parameter is required.' });
-  }
-
-  const session = teamsMeetSessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'session_not_found', message: `Teams meeting session ${sessionId} not found.` });
-  }
-
-  if (!session.latestScreenshot) {
-    return res.status(204).end();
-  }
-
-  res.json({ screenshot: session.latestScreenshot });
-});
-
-app.post('/teamsmeet/present', auth, async (req: Request, res: Response) => {
-  const { sessionId, desktopUrl } = req.body;
-  if (!sessionId || !desktopUrl) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId and desktopUrl are required.' });
-  }
-
-  const session = teamsMeetSessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'session_not_found', message: `Teams meeting session ${sessionId} not found.` });
-  }
-  if (session.presenting) {
-    return res.json({ status: 'already_presenting' });
-  }
-
-  const t0 = Date.now();
-  console.log(`[teamsmeet/present] BEGIN sessionId=${sessionId} desktopUrl=${desktopUrl}`);
-
-  try {
-    const context = session.agent.context;
-    const desktopTab = await context.newPage();
-    await desktopTab.goto(desktopUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    console.log(`[teamsmeet/present] Desktop tab opened [${Date.now() - t0}ms]`);
-
-    // Switch back to the Teams tab for the LLM to click "Share"
-    const meetPage = session.agent.page;
-    await meetPage.bringToFront();
-
-    await runMagnitudeLoop(session.agent, TEAMS_PRESENT_TAB_TASK, TEAMS_PRESENT_MAX_ITERATIONS, 'teamsmeet/present');
-    console.log(`[teamsmeet/present] Present flow completed [${Date.now() - t0}ms]`);
-
-    session.presenting = true;
-    session.desktopTabPage = desktopTab;
-
-    res.json({ status: 'presenting' });
-    console.log(`[teamsmeet/present] DONE [${Date.now() - t0}ms]`);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[teamsmeet/present] EXCEPTION after ${Date.now() - t0}ms: ${message}`);
-    res.status(500).json({ error: 'present_failed', message });
-  }
-});
-
-app.post('/teamsmeet/stop-present', auth, async (req: Request, res: Response) => {
-  const { sessionId } = req.body;
-  if (!sessionId) {
-    return res.status(400).json({ error: 'bad_request', message: 'sessionId is required.' });
-  }
-
-  const session = teamsMeetSessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'session_not_found', message: `Teams meeting session ${sessionId} not found.` });
-  }
-  if (!session.presenting) {
-    return res.json({ status: 'not_presenting' });
-  }
-
-  const t0 = Date.now();
-  console.log(`[teamsmeet/stop-present] BEGIN sessionId=${sessionId}`);
-
-  try {
-    await session.agent.page.bringToFront();
-
-    await runMagnitudeLoop(session.agent, TEAMS_STOP_PRESENT_TASK, TEAMS_PRESENT_MAX_ITERATIONS, 'teamsmeet/stop-present');
-    console.log(`[teamsmeet/stop-present] Stop flow completed [${Date.now() - t0}ms]`);
-
-    if (session.desktopTabPage) {
-      await session.desktopTabPage.close().catch(() => {});
-    }
-
-    session.presenting = false;
-    session.desktopTabPage = null;
-
-    res.json({ status: 'stopped' });
-    console.log(`[teamsmeet/stop-present] DONE [${Date.now() - t0}ms]`);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[teamsmeet/stop-present] EXCEPTION after ${Date.now() - t0}ms: ${message}`);
-    res.status(500).json({ error: 'stop_present_failed', message });
-  }
-});
-
 // --- /exec endpoint: Execute shell commands (use /files first to upload files) ---
-app.post('/exec', auth, async (req: Request, res: Response) => {
-  const { command, cwd, timeout, shell_mode } = req.body;
-  const execId = randomUUID().slice(0, 8);
+const EXEC_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+app.post('/exec', requireExecEnabled, auth, async (req: Request, res: Response) => {
+  const { command, cwd, timeout, shell_mode, exec_id } = req.body;
+  // A caller that wants to steer the run supplies its own id, so it can
+  // address /exec/signal at it while this request is still blocking.
+  const execId = typeof exec_id === 'string' && EXEC_ID_PATTERN.test(exec_id)
+    ? exec_id
+    : randomUUID().slice(0, 8);
 
   if (!command || typeof command !== 'string') {
     return res.status(400).json({ error: 'bad_request', message: 'command is required and must be a string.' });
@@ -3177,7 +2691,13 @@ app.post('/exec', auth, async (req: Request, res: Response) => {
     await ensureDir(resolvedWorkDir);
 
     console.log(`[exec] Running command: ${command} (cwd: ${resolvedWorkDir}, timeout: ${execTimeout}ms, shell: ${shellMode}, execId: ${execId})`);
-    const result = await executeCommand(command, resolvedWorkDir, execTimeout, shellMode);
+    const result = await executeCommand(
+      command,
+      resolvedWorkDir,
+      execTimeout,
+      shellMode,
+      (proc) => registerExec(execId, proc),
+    );
 
     res.json({
       status: result.exitCode === 0 ? 'success' : 'error',
@@ -3197,6 +2717,24 @@ app.post('/exec', auth, async (req: Request, res: Response) => {
       execId,
     });
   }
+});
+
+app.post('/exec/signal', requireExecEnabled, auth, async (req: Request, res: Response) => {
+  const { exec_id, action } = req.body;
+
+  if (typeof exec_id !== 'string' || !EXEC_ID_PATTERN.test(exec_id)) {
+    return res.status(400).json({ error: 'bad_request', message: 'exec_id is required and must be a string.' });
+  }
+  if (action !== 'stop' && action !== 'pause' && action !== 'resume') {
+    return res.status(400).json({ error: 'bad_request', message: "action must be 'stop', 'pause', or 'resume'." });
+  }
+
+  const outcome = signalExec(exec_id, action);
+  console.log(`[exec] signal ${action} for ${exec_id}: ${outcome}`);
+  if (outcome === 'not_found') {
+    return res.status(404).json({ error: 'not_found', message: 'No running exec with that id.' });
+  }
+  res.json({ status: outcome, exec_id, action });
 });
 
 // --- /files endpoint: Unified file management (JSON + Multipart) ---
@@ -3408,7 +2946,14 @@ function handleAgentError(err: unknown, res: Response, defaultErrorType = 'unkno
       adaptable: agentErr.options.adaptable
     });
   } else {
-    const errorMessage = err instanceof Error ? err.message : String(err);
+    let errorMessage = err instanceof Error ? err.message : String(err);
+    if (errorMessage.includes('closed')) {
+      const lifecycleHint = formatLastBrowserLifecycleHint();
+      if (lifecycleHint) {
+        console.error(`[browser-lifecycle] ${lifecycleHint}`);
+        errorMessage = `${errorMessage} | ${lifecycleHint}`;
+      }
+    }
     console.error(`Unknown Error: ${errorMessage}`);
     res.status(500).json({
       error: defaultErrorType,

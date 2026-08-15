@@ -20,10 +20,23 @@ case "$1" in
         TARGET_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
         TARGET_HOME="$(eval echo "~$TARGET_USER")"
 
+        # URLs are baked at build time (main vs staging) in environment.conf.
+        # Its presence means a stamped build - the stamped URL always wins
+        # over a stray ~/.unity compose file below, otherwise a
+        # staging/production install would silently register against
+        # localhost. Local-stack auto-detect only applies to an unstamped
+        # (dev) build.
+        ENV_CONF="$APP_DIR/environment.conf"
+        STAMPED=0
+        if [ -f "$ENV_CONF" ]; then
+            STAMPED=1
+            . "$ENV_CONF"
+        fi
+
         COMPOSE_SELF_HOST=0
         AGENT_PORT=3000
         SELF_HOST_FLAG=0
-        if [ -f "$TARGET_HOME/.unity/docker-compose.yml" ]; then
+        if [ "$STAMPED" != "1" ] && [ -f "$TARGET_HOME/.unity/docker-compose.yml" ]; then
             COMPOSE_SELF_HOST=1
             AGENT_PORT=$SELF_HOST_AGENT_PORT
             SELF_HOST_FLAG=1
@@ -60,17 +73,15 @@ case "$1" in
             EXISTING_SFTP_TUNNEL_PORT=$(grep -oP '^SFTP_TUNNEL_PORT=\K.*' "$ENV_FILE" 2>/dev/null || true)
         fi
 
-        # URLs are baked at build time (main vs staging) in environment.conf
-        ENV_CONF="$APP_DIR/environment.conf"
-        if [ -f "$ENV_CONF" ]; then
-            . "$ENV_CONF"
-        fi
         if [ "$COMPOSE_SELF_HOST" = "1" ]; then
             ORCHESTRA_URL="$COMPOSE_SELF_HOST_ORCHESTRA_URL"
             UNITY_COMMS_URL="$COMPOSE_SELF_HOST_COMMS_URL"
-        else
-            ORCHESTRA_URL="${ORCHESTRA_URL:-https://api.unify.ai/v0}"
-            UNITY_COMMS_URL="${UNITY_COMMS_URL:-https://service.a.run.app}"
+        elif [ -z "${ORCHESTRA_URL:-}" ] || [ -z "${UNITY_COMMS_URL:-}" ]; then
+            # Fail loudly rather than silently registering against production
+            # when no backend URL resolved (a stamped build with a
+            # missing/corrupt environment.conf).
+            echo "ERROR: No backend URL configured (missing or empty $ENV_CONF)." >&2
+            exit 1
         fi
 
         cat > "$ENV_FILE" <<ENVFILE

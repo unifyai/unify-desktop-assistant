@@ -51,6 +51,12 @@ $script:SelfHostAgentPort = 13000
 $script:ComposeSelfHostOrchestraUrl = 'http://127.0.0.1:8000/v0'
 $script:ComposeSelfHostCommsUrl = 'http://127.0.0.1:8001'
 
+# Whether -OrchestraUrl/-UnityCommsUrl were passed explicitly on this
+# invocation, as opposed to being empty defaults. An explicit flag always
+# wins over local-stack auto-detect and the .env fallback further below.
+$script:OrchestraUrlExplicit = $PSBoundParameters.ContainsKey('OrchestraUrl')
+$script:UnityCommsUrlExplicit = $PSBoundParameters.ContainsKey('UnityCommsUrl')
+
 # Per-build backend URL defaults. build.ps1 stamps these for the target
 # environment (-Staging/main) at package time. In-repo they stay as the
 # @@...@@ sentinels, which we neutralize to '' so a dev run can't silently
@@ -1518,6 +1524,12 @@ function Apply-ComposeSelfHostMode {
     if (-not (Test-ComposeSelfHostPresent)) {
         return
     }
+    # An explicit -OrchestraUrl/-UnityCommsUrl always wins over local-stack
+    # auto-detect - otherwise a stamped staging/production build with a stray
+    # ~/.unity compose file would silently register against localhost.
+    if ($script:OrchestraUrlExplicit -or $script:UnityCommsUrlExplicit) {
+        return
+    }
     $script:SelfHostMode = $true
     Set-Variable -Name OrchestraUrl -Value $script:ComposeSelfHostOrchestraUrl -Scope Script
     Set-Variable -Name UnityCommsUrl -Value $script:ComposeSelfHostCommsUrl -Scope Script
@@ -1550,10 +1562,12 @@ function Explain-OrchestraConnectFailure {
 }
 
 function Get-AgentServicePort {
-    $port = Get-EnvValue -Key 'PORT'
-    if ($port -match '^\d+$') {
-        return [int]$port
-    }
+    # Derive from the mode actually in effect ($script:SelfHostMode for this
+    # run, falling back to the persisted .env SELF_HOST flag for -Start/-Stop).
+    # Do not read .env's PORT directly - it's a stale copy of whatever mode
+    # was in effect on a PREVIOUS run, so if the mode is later corrected
+    # (e.g. self-host -> cloud) a leftover PORT=13000 would keep outranking
+    # the mode actually in effect and desync from Register-Tunnel's port.
     if ($script:SelfHostMode -or (Get-EnvValue -Key 'SELF_HOST') -eq '1') {
         return $script:SelfHostAgentPort
     }
@@ -2529,14 +2543,18 @@ if ($Reconfigure) {
 
     # Settings only changes the API key - preserve the URLs baked at install,
     # otherwise Setup-AgentServiceEnv would reset them to the script defaults
-    # and break a staging/custom install.
+    # and break a staging/custom install. An explicit -OrchestraUrl/-UnityCommsUrl
+    # on this invocation always wins over both the local-stack auto-detect and
+    # the .env fallback below - otherwise a stale 127.0.0.1/SELF_HOST=1 .env
+    # from a prior run would keep winning on every later -Reconfigure regardless
+    # of the flags passed in.
     Apply-ComposeSelfHostMode
     if (-not (Test-ComposeSelfHostPresent)) {
         $existingOrch = Get-EnvValue -Key "ORCHESTRA_URL"
         $existingComms = Get-EnvValue -Key "UNITY_COMMS_URL"
-        if ($existingOrch) { $OrchestraUrl = $existingOrch }
-        if ($existingComms) { $UnityCommsUrl = $existingComms }
-        if ((Get-EnvValue -Key 'SELF_HOST') -eq '1') {
+        if (-not $script:OrchestraUrlExplicit -and $existingOrch) { $OrchestraUrl = $existingOrch }
+        if (-not $script:UnityCommsUrlExplicit -and $existingComms) { $UnityCommsUrl = $existingComms }
+        if ((Get-EnvValue -Key 'SELF_HOST') -eq '1' -and -not $script:OrchestraUrlExplicit -and -not $script:UnityCommsUrlExplicit) {
             $script:SelfHostMode = $true
             if (-not $existingOrch) { $OrchestraUrl = $script:ComposeSelfHostOrchestraUrl }
             if (-not $existingComms) { $UnityCommsUrl = $script:ComposeSelfHostCommsUrl }

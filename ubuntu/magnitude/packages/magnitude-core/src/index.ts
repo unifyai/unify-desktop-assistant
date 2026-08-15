@@ -22,6 +22,17 @@ export * from '@/common';
 export * from "@/telemetry";
 export { buildDefaultBrowserAgentOptions } from "@/ai/util";
 export { logger } from './logger';
+export {
+    BrowserLifecycleObserver,
+    collectRuntimeDiagnostics,
+    formatLastBrowserLifecycleHint,
+    getLastBrowserLifecycleEvent,
+} from '@/web/browserLifecycleDiagnostics';
+export type {
+    BrowserLifecycleEventKind,
+    BrowserLifecycleEventRecord,
+    RuntimeDiagnostics,
+} from '@/web/browserLifecycleDiagnostics';
 //export { ModelUsage } from '@/ai/modelHarness';
 
 setLogLevel('OFF');

@@ -23,6 +23,7 @@ import { computePHash, calculateHammingDistance, calculateCosineSimilarity } fro
 import { initializeVertexClient, getEmbeddingForImage } from '@/ai/vertexClient';
 import { yellowBright } from 'ansis';
 import fs from 'fs';
+import { formatLastBrowserLifecycleHint } from '@/web/browserLifecycleDiagnostics';
 import path from 'path';
 import sharp from 'sharp';
 import { Storage } from '@google-cloud/storage';
@@ -310,7 +311,17 @@ export class Agent {
                     memory.recordObservation(obs);
                 }
             } catch (error) {
-                logger.warn(`Agent: Error getting observations from connector ${connector.id}: ${error instanceof Error ? error.message : String(error)}`);
+                const message = error instanceof Error ? error.message : String(error);
+                const lifecycleHint = message.includes("closed")
+                    ? formatLastBrowserLifecycleHint()
+                    : null;
+                logger.warn(
+                    {
+                        connectorId: connector.id,
+                        lifecycleHint,
+                    },
+                    `Agent: Error getting observations from connector ${connector.id}: ${message}`,
+                );
             }
         }
     }
