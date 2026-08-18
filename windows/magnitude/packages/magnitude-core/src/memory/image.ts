@@ -34,7 +34,7 @@ export class Image {
         return new Image(sharp(Buffer.from(base64Data, 'base64')));
     }
 
-    async getFormat(): Promise<keyof typeof sharp.format> {
+    async getFormat(): Promise<keyof sharp.FormatEnum> {
         const format = (await this.img.clone().metadata()).format;
         if (!format) throw new Error("Unable to get image format");
         return format;
