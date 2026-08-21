@@ -21,6 +21,7 @@ import { isExecDisabled } from './execGuard';
 import multer from 'multer';
 import { jsonSchemaToZod } from './jsonSchemaToZod';
 import { getLlmConfig, resolveAgentServiceModel } from './llmConfig';
+import { registerLiveSession, unregisterSession } from './sessionRegistry';
 import {
   computeNativeObservationScale,
   NativeObservationScale,
@@ -114,8 +115,8 @@ function debugLog(line: string): void {
 //
 // Workspace root for file operations, command execution, and browser downloads.
 // Matches Unity's get_local_root() default of ~/Unity/Local.
-// Override via UNITY_LOCAL_ROOT env var.
-const LOCAL_ROOT = process.env.UNITY_LOCAL_ROOT || path.join(os.homedir(), 'Unity', 'Local');
+// Override via UNIFY_LOCAL_ROOT env var.
+const LOCAL_ROOT = process.env.UNIFY_LOCAL_ROOT || path.join(os.homedir(), 'Unity', 'Local');
 try { fs.mkdirSync(LOCAL_ROOT, { recursive: true }); } catch (_e) { /* ignore */ }
 const DEFAULT_EXEC_TIMEOUT = 60 * 60 * 1000; // 1 hour
 
@@ -433,8 +434,8 @@ setInterval(() => {
   for (const [sessionId, session] of activeSessions.entries()) {
     if (now - session.lastAccessed.getTime() > SESSION_TIMEOUT_MS) {
       console.log(`Cleaning up inactive session: ${sessionId}`);
+      unregisterSession(activeSessions, sessionId);
       session.agent.stop().catch((err: unknown) => console.error(`Error stopping session ${sessionId}:`, err));
-      activeSessions.delete(sessionId);
       broadcastSessionEvent(sessionId, 'timeout');
     }
   }
@@ -922,7 +923,7 @@ app.post('/start', async (req: Request, res: Response) => {
             console.error(`Error stopping old desktop session: ${err}`);
           }),
         );
-        activeSessions.delete(existingId);
+        unregisterSession(activeSessions, existingId);
         broadcastSessionEvent(existingId, 'replaced');
       }
     }
@@ -1076,7 +1077,7 @@ app.post('/start', async (req: Request, res: Response) => {
     const observationModel = resolveAgentServiceModel();
     const observationPolicy = resolveObservationScalingPolicy(observationModel);
 
-    activeSessions.set(sessionId, {
+    const sessionInfo: SessionInfo = {
       agent,
       mode,
       createdAt: new Date(),
@@ -1087,6 +1088,10 @@ app.post('/start', async (req: Request, res: Response) => {
       displayHarness,
       observationModel,
       observationPolicy,
+    };
+    registerLiveSession(activeSessions, sessionId, sessionInfo, () => {
+      console.error(`[browser-lifecycle] Removing disconnected session ${sessionId}`);
+      broadcastSessionEvent(sessionId, 'browser_disconnected');
     });
 
     console.log(`[start] DONE mode=${mode} sessionId=${sessionId} total=${Date.now() - t0}ms active_sessions=${activeSessions.size}`);
@@ -2624,8 +2629,8 @@ app.post('/stop', async (req: Request, res: Response) => {
   }
 
   try {
+    unregisterSession(activeSessions, sessionId);
     await session.agent.stop();
-    activeSessions.delete(sessionId);
     broadcastSessionEvent(sessionId, 'stop');
     res.json({ status: 'stopped' });
     console.log(`BrowserAgent stopped for session ${sessionId}.`);
