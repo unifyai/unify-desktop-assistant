@@ -1,6 +1,6 @@
 import { Image as BamlImage } from '@boundaryml/baml';
 import { StoredMedia } from './serde';
-import { Sharp } from 'sharp';
+import { Sharp, FormatEnum } from 'sharp';
 import sharp from 'sharp';
 
 export type ImageMediaType = `image/${string}`;//'png' | 'jpeg';
@@ -34,7 +34,7 @@ export class Image {
         return new Image(sharp(Buffer.from(base64Data, 'base64')));
     }
 
-    async getFormat(): Promise<keyof sharp.FormatEnum> {
+    async getFormat(): Promise<keyof FormatEnum> {
         const format = (await this.img.clone().metadata()).format;
         if (!format) throw new Error("Unable to get image format");
         return format;
